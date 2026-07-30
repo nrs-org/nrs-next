@@ -5,12 +5,22 @@
 //! is `V = sum f(x) . phi(c(x))`, `phi(c) = c^(q-1)` (Def. "the
 //! redundancy exponent q").
 //!
-//! The notes' worked examples are all same-signed masses; crowding here
-//! sums `|mass|` rather than signed mass so that `phi`'s fractional
-//! power is always applied to a nonnegative number (avoiding complex
-//! results), while the outer product `f(x) . phi(c(x))` keeps the
-//! cell's own sign — a negative impact still discounts by local
-//! crowding like everything else, it just contributes negatively.
+//! The notes' worked examples are all same-signed masses, so two things
+//! about mixed signs are modelling calls, not given:
+//!
+//! - Crowding sums `|mass|` rather than signed mass, so `phi`'s
+//!   fractional power is always applied to a nonnegative number
+//!   (avoiding complex results), while the outer product
+//!   `f(x) . phi(c(x))` keeps the cell's own sign.
+//! - A cell only crowds *same-signed* cells. A successful gut-punch
+//!   elsewhere and an unrelated failed gut-punch attempt are opposite
+//!   outcomes, not "the same value counted twice" — so a negative
+//!   atom must not discount a nearby positive one just for sharing an
+//!   anchor, or vice versa. Equivalently: positive and negative mass
+//!   live at mirrored, mutually non-redundant points, without actually
+//!   doubling the anchor space. This also means a pile of small
+//!   negatives saturates under `q` the same way a pile of small
+//!   positives does, rather than subtracting without bound.
 
 use crate::measure::Measure;
 use crate::types::{Contribution, KFeatMatrix, KSrcLevels, SourceId, Taxonomy};
@@ -71,6 +81,9 @@ pub(crate) fn value(
     for &(source_i, anchor_i, mass_i) in &cells {
         let mut crowding = 0.0;
         for &(source_j, anchor_j, mass_j) in &cells {
+            if mass_i.signum() != mass_j.signum() {
+                continue; // opposite valence: never mutually redundant
+            }
             let k =
                 k_feat.get(anchor_i, anchor_j) * k_src(source_i, source_j, taxonomy, k_src_levels);
             crowding += k * mass_j.abs();
@@ -94,6 +107,28 @@ mod tests {
     use super::*;
     use crate::types::AnchorId;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn opposite_sign_masses_do_not_crowd_each_other() {
+        let anchor = AnchorId("x".into());
+        let k_feat = KFeatMatrix::default();
+        let tax = Taxonomy::default();
+        // All levels 1.0 so any two distinct sources are as related as
+        // possible; this isolates the sign gate from k_src.
+        let levels = KSrcLevels { levels: [1.0; 5] };
+
+        let mut f = Measure::new();
+        f.insert((SourceId("pos".into()), anchor.clone()), 2.0);
+        f.insert((SourceId("neg".into()), anchor.clone()), -2.0);
+
+        let (_, contributions) = value(&f, &k_feat, &tax, &levels, 0.5);
+        for c in &contributions {
+            assert_eq!(
+                c.crowding, 2.0,
+                "opposite-sign cell must not add to crowding"
+            );
+        }
+    }
 
     #[test]
     fn identical_source_is_maximally_related() {
