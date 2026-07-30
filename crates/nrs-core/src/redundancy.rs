@@ -23,7 +23,7 @@
 //!   positives does, rather than subtracting without bound.
 
 use crate::measure::Measure;
-use crate::types::{Contribution, KFeatMatrix, KSrcLevels, SourceId, Taxonomy};
+use crate::types::{Contribution, Homogeneity, KFeatMatrix, KSrcLevels, SourceId, Taxonomy};
 
 fn ancestor_chain(taxonomy: &Taxonomy, id: &SourceId) -> Vec<SourceId> {
     let mut chain = vec![id.clone()];
@@ -61,14 +61,28 @@ fn k_src(a: &SourceId, b: &SourceId, taxonomy: &Taxonomy, levels: &KSrcLevels) -
     *levels.levels.last().unwrap()
 }
 
-/// `V(f) = sum_x f(x) . phi(c(x))`, and the per-cell breakdown behind
-/// it (source, anchor, mass, crowding, contribution).
+/// `V(f) = sum_x f(x) . phi(c(x))` (`Homogeneity::DegreeQ`, the
+/// default: notes Def. "the redundancy exponent q") or its degree-1
+/// alternate (`Homogeneity::Degree1`, notes §"Two knobs, and two
+/// honest subtleties"), plus the per-cell breakdown behind whichever
+/// is used (source, anchor, mass, crowding, contribution).
+///
+/// The two forms are not the same knob at different `q`: at `q = 1`
+/// they coincide exactly (both reduce to the redundancy-blind `sum
+/// mass`), but away from `q = 1`, `DegreeQ` scales as
+/// `intensity^q` under uniformly rescaling the *whole* measure, while
+/// `Degree1` scales as `intensity^1` (double every reaction, double
+/// the score) by construction, at the cost of discounting redundancy
+/// only *between* cells rather than within a single one — see
+/// `Degree1`'s match arm below for why that trade is forced, not
+/// chosen.
 pub(crate) fn value(
     f: &Measure,
     k_feat: &KFeatMatrix,
     taxonomy: &Taxonomy,
     k_src_levels: &KSrcLevels,
     q: f32,
+    homogeneity: Homogeneity,
 ) -> (f32, Vec<Contribution>) {
     let cells: Vec<(&SourceId, &crate::types::AnchorId, f32)> = f
         .iter()
@@ -88,8 +102,35 @@ pub(crate) fn value(
                 k_feat.get(anchor_i, anchor_j) * k_src(source_i, source_j, taxonomy, k_src_levels);
             crowding += k * mass_j.abs();
         }
-        let phi = crowding.powf(q - 1.0);
-        let contribution = mass_i * phi;
+        let contribution = match homogeneity {
+            Homogeneity::DegreeQ => mass_i * crowding.powf(q - 1.0),
+            Homogeneity::Degree1 => {
+                // Normalise crowding by this cell's own mass first (a
+                // scale-free "how surrounded am I, relative to my own
+                // size" ratio - always 1.0 for a cell with no other
+                // same-signed mass nearby), then apply the same
+                // q-shaped discount to *that*. Since the ratio is
+                // invariant to rescaling every mass in the measure by
+                // the same factor, this is exactly degree-1 overall,
+                // for any q.
+                //
+                // A lone, uncrowded cell therefore always contributes
+                // its own mass exactly linearly, whatever q is - not a
+                // simplification, but a hard consequence of exact
+                // degree-1 homogeneity: a measure supported at a
+                // single point can't be told apart from "uniformly
+                // rescale everything" (they're the same operation on
+                // one number), so no homogeneous-degree-1 functional
+                // can discount a lone cell the way `DegreeQ` does
+                // (Failure 1's "one waifu loved twice" is exactly this
+                // single-point case). Redundancy still bites, just
+                // only *between* cells: added neighbouring same-signed
+                // mass still discounts a cell's own contribution via
+                // this ratio.
+                let ratio = crowding / mass_i.abs();
+                mass_i * ratio.powf(q - 1.0)
+            }
+        };
         total += contribution;
         contributions.push(Contribution {
             source: source_i.clone(),
@@ -121,7 +162,7 @@ mod tests {
         f.insert((SourceId("pos".into()), anchor.clone()), 2.0);
         f.insert((SourceId("neg".into()), anchor.clone()), -2.0);
 
-        let (_, contributions) = value(&f, &k_feat, &tax, &levels, 0.5);
+        let (_, contributions) = value(&f, &k_feat, &tax, &levels, 0.5, Homogeneity::DegreeQ);
         for c in &contributions {
             assert_eq!(
                 c.crowding, 2.0,
@@ -176,13 +217,82 @@ mod tests {
         *same_cell
             .entry((source.clone(), anchor.clone()))
             .or_insert(0.0) += a;
-        let (v_same, _) = value(&same_cell, &k_feat, &tax, &levels, q);
+        let (v_same, _) = value(&same_cell, &k_feat, &tax, &levels, q, Homogeneity::DegreeQ);
 
         let mut distinct_cells: BTreeMap<_, _> = BTreeMap::new();
         distinct_cells.insert((SourceId("s1".into()), anchor.clone()), a);
         distinct_cells.insert((SourceId("s2".into()), anchor.clone()), a);
-        let (v_distinct, _) = value(&distinct_cells, &k_feat, &tax, &levels, q);
+        let (v_distinct, _) = value(
+            &distinct_cells,
+            &k_feat,
+            &tax,
+            &levels,
+            q,
+            Homogeneity::DegreeQ,
+        );
 
         assert!(v_same < v_distinct, "{v_same} should be < {v_distinct}");
+    }
+
+    fn two_related_cells(a: f32, anchor: &AnchorId) -> Measure {
+        let mut f = Measure::new();
+        f.insert((SourceId("s1".into()), anchor.clone()), a);
+        f.insert((SourceId("s2".into()), anchor.clone()), a);
+        f
+    }
+
+    #[test]
+    fn degree1_and_degreeq_agree_at_q_one() {
+        let k_feat = KFeatMatrix::default();
+        let tax = Taxonomy::default();
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let anchor = AnchorId("x".into());
+        let f = two_related_cells(3.0, &anchor);
+
+        let (v_q, _) = value(&f, &k_feat, &tax, &levels, 1.0, Homogeneity::DegreeQ);
+        let (v_1, _) = value(&f, &k_feat, &tax, &levels, 1.0, Homogeneity::Degree1);
+        assert!((v_q - v_1).abs() < 1e-5, "{v_q} vs {v_1}");
+    }
+
+    #[test]
+    fn degree1_scales_exactly_linearly() {
+        let k_feat = KFeatMatrix::default();
+        let tax = Taxonomy::default();
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let anchor = AnchorId("x".into());
+        let f = two_related_cells(3.0, &anchor);
+        let scaled = two_related_cells(3.0 * 7.0, &anchor);
+
+        let (v, _) = value(&f, &k_feat, &tax, &levels, 0.5, Homogeneity::Degree1);
+        let (v_scaled, _) = value(&scaled, &k_feat, &tax, &levels, 0.5, Homogeneity::Degree1);
+        assert!(
+            (v_scaled - 7.0 * v).abs() < 1e-3,
+            "{v_scaled} vs {}",
+            7.0 * v
+        );
+    }
+
+    #[test]
+    fn degree1_lone_cell_is_exactly_its_own_mass() {
+        // Hard consequence of exact degree-1 homogeneity, not a
+        // shortcut: a measure supported at one point can't be told
+        // apart from "uniformly rescale everything".
+        let k_feat = KFeatMatrix::default();
+        let tax = Taxonomy::default();
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let anchor = AnchorId("x".into());
+        let mut f = Measure::new();
+        f.insert((SourceId("s".into()), anchor), 5.0);
+
+        for &q in &[0.1f32, 0.5, 1.0, 2.0] {
+            let (v, _) = value(&f, &k_feat, &tax, &levels, q, Homogeneity::Degree1);
+            assert!((v - 5.0).abs() < 1e-5, "q={q}: {v}");
+        }
     }
 }

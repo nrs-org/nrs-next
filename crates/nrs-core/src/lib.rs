@@ -9,22 +9,9 @@ pub mod types;
 
 pub use types::*;
 
-fn require_degree_q(homogeneity: Homogeneity) {
-    // The degree-1 alternate form (notes ch. "The value kernel, up
-    // close" §"Two knobs, and two honest subtleties") is sketched but
-    // not pinned down there (an unspecified outer discount `g`); every
-    // proof this engine is tested against (splittability, the
-    // double-count bound) is stated in terms of the degree-q default,
-    // so only that form is implemented.
-    if homogeneity != Homogeneity::DegreeQ {
-        todo!("Homogeneity::Degree1 is underspecified in the notes (§7.2); not implemented")
-    }
-}
-
 /// INFRA.md §4.3, phases 1-4: build measures, solve relations, apply the
 /// one nonlinearity, calibrate.
 pub fn score(snap: &Snapshot, params: &Params) -> Scores {
-    require_degree_q(params.homogeneity);
     let built = measure::build_measures(snap);
     let resolved = solve::solve_relations(built, &snap.relations);
 
@@ -36,6 +23,7 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
             &snap.taxonomy,
             &params.k_src_levels,
             params.q,
+            params.homogeneity,
         );
         values.insert(entry.clone(), params.calibration.apply(v));
     }
@@ -45,7 +33,6 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
 /// Same contract as `score`, but returns one entry's per-`(source,
 /// anchor)` breakdown (INFRA.md §4.3 phase 3).
 pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation {
-    require_degree_q(params.homogeneity);
     let built = measure::build_measures(snap);
     let resolved = solve::solve_relations(built, &snap.relations);
 
@@ -57,6 +44,7 @@ pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation 
         &snap.taxonomy,
         &params.k_src_levels,
         params.q,
+        params.homogeneity,
     );
     let score = params.calibration.apply(value);
     Explanation {
