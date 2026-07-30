@@ -126,12 +126,15 @@ pub struct Palette {
     pub k_feat: KFeatMatrix,
 }
 
-/// Deepest-shared-ancestor taxonomy, derived from `Contains` relations
-/// rather than stored separately (INFRA.md §5.1): `parent` maps an
-/// entry to its immediate container, if any.
+/// Deepest-shared-ancestor taxonomy feeding `k_src` (INFRA.md §5.1),
+/// derived from `Contains`/franchise relations rather than stored
+/// separately: `parent` maps a source to its immediate container, if
+/// any. Keyed by `SourceId` (not `EntryId`) because `k_src` compares
+/// sources (characters/scenes/works), which needn't all be top-level
+/// scoreable entries.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Taxonomy {
-    pub parent: BTreeMap<EntryId, EntryId>,
+    pub parent: BTreeMap<SourceId, SourceId>,
 }
 
 /// The ~5 taxonomy-distance levels feeding `k_src` (INFRA.md §4.2).
@@ -155,6 +158,33 @@ pub enum Homogeneity {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Isotonic {
     pub knots: Vec<(f32, f32)>,
+}
+
+impl Isotonic {
+    /// `g(v)`: linear interpolation between the knots bracketing `v`,
+    /// clamped to the end knots' values outside their range. The
+    /// identity map if no knots are set.
+    pub fn apply(&self, v: f32) -> f32 {
+        let Some(&(first_x, first_y)) = self.knots.first() else {
+            return v;
+        };
+        if v <= first_x {
+            return first_y;
+        }
+        let &(last_x, last_y) = self.knots.last().unwrap();
+        if v >= last_x {
+            return last_y;
+        }
+        for pair in self.knots.windows(2) {
+            let (x0, y0) = pair[0];
+            let (x1, y1) = pair[1];
+            if v >= x0 && v <= x1 {
+                let t = if x1 > x0 { (v - x0) / (x1 - x0) } else { 0.0 };
+                return y0 + t * (y1 - y0);
+            }
+        }
+        v
+    }
 }
 
 /// `Theta` - the fitted knobs (INFRA.md §4.2).
