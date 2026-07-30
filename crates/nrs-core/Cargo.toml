@@ -1,0 +1,6 @@
+[package]
+name = "nrs-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
