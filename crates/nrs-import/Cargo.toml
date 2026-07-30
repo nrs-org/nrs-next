@@ -1,0 +1,7 @@
+[package]
+name = "nrs-import"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nrs-core = { path = "../nrs-core" }

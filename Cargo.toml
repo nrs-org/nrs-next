@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nrs-core",
+    "crates/nrs-import",
 ]
 
 [workspace.package]
