@@ -7,7 +7,6 @@ use nrs_core::*;
 fn params(q: f32) -> Params {
     Params {
         q,
-        sigma: 1.0,
         k_src_levels: KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         },

@@ -187,11 +187,15 @@ impl Isotonic {
     }
 }
 
-/// `Theta` - the fitted knobs (INFRA.md §4.2).
+/// `Theta` - the fitted knobs (INFRA.md §4.2). No kernel width here:
+/// `k_feat` and `k_src_levels` are already-realized lookup tables, not
+/// a distance formula, so there's nothing for a width to parameterize
+/// at this layer. A width belongs, if ever needed, to whatever
+/// offline process derives one of those tables from an anchor
+/// embedding — scoped to that step, not threaded through `score`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Params {
     pub q: f32,
-    pub sigma: f32,
     pub k_src_levels: KSrcLevels,
     pub k_feat: KFeatMatrix,
     pub homogeneity: Homogeneity,
