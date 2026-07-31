@@ -4,28 +4,27 @@
 //! This produces an intermediate representation (`ParsedDocument`), not
 //! `nrs-core` types directly — `snapshot.rs` does that conversion using
 //! `legacy.rs`'s formulas, and `roles.rs` handles `<role>`/`<musicvar>`
-//! music-credit weighting. Nothing is silently dropped: anything this
-//! parser can't turn into a concrete value (an unresolved `<def>`
-//! template variable, a `<script>`/`<def>`/`<ref>` escape hatch) is
-//! recorded in `ParsedDocument::warnings` rather than guessed at
-//! silently.
+//! music-credit weighting. `<include>` is resolved and `<def>`/`<ref>`
+//! macros are expanded (see `xtree.rs`) before entry parsing runs, so
+//! this module only ever sees an already-flattened, already-expanded
+//! tree. Nothing is silently dropped: anything this parser can't turn
+//! into a concrete value (an unresolved template variable, a
+//! `<script>` it doesn't understand) is recorded in
+//! `ParsedDocument::warnings` rather than guessed at silently.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use roxmltree::Node;
 use time::Date;
+
+use crate::xtree::{self, XNode};
 
 #[derive(Debug)]
 pub enum ImportError {
     Io(PathBuf, std::io::Error),
     Xml(PathBuf, roxmltree::Error),
-    Missing {
-        path: PathBuf,
-        context: String,
-        attribute: &'static str,
-    },
+    IncludeNotSupported(PathBuf),
 }
 
 impl std::fmt::Display for ImportError {
@@ -33,15 +32,11 @@ impl std::fmt::Display for ImportError {
         match self {
             ImportError::Io(p, e) => write!(f, "{}: {e}", p.display()),
             ImportError::Xml(p, e) => write!(f, "{}: {e}", p.display()),
-            ImportError::Missing {
-                path,
-                context,
-                attribute,
-            } => {
+            ImportError::IncludeNotSupported(p) => {
                 write!(
                     f,
-                    "{}: {context}: missing required attribute '{attribute}'",
-                    path.display()
+                    "{}: <include> needs filesystem access; use parse_file, not parse_str",
+                    p.display()
                 )
             }
         }
@@ -198,75 +193,92 @@ pub struct ParsedDocument {
 }
 
 /// Parse a document rooted at `path`, following `<include>` elements
-/// recursively (relative to the including file's directory). `today`
+/// recursively (relative to the including file's directory) and
+/// expanding `<def>`/`<ref>` macros, before entry parsing runs. `today`
 /// pins what the `"today"`/`"today+N"` date forms resolve to, so
 /// parsing is deterministic given a fixed reference date.
 pub fn parse_file(path: &Path, today: Date) -> Result<ParsedDocument, ImportError> {
-    let mut doc = ParsedDocument::default();
-    parse_file_into(path, today, &mut doc)?;
-    Ok(doc)
+    let mut nodes = Vec::new();
+    collect_document_nodes(path, true, &mut nodes)?;
+    Ok(build_document(nodes, today))
 }
 
 /// Parse XML text directly, with no filesystem access - `<include>`
-/// isn't resolvable in this mode (it errors as a missing file).
-/// Convenient for tests and for embedded/one-off snippets.
+/// errors in this mode. Convenient for tests and embedded snippets.
 pub fn parse_str(xml: &str, today: Date) -> Result<ParsedDocument, ImportError> {
-    let mut doc = ParsedDocument::default();
-    parse_text_into(xml, Path::new("<string>"), today, &mut doc)?;
-    Ok(doc)
+    let mut nodes = Vec::new();
+    collect_document_text(xml, Path::new("<string>"), false, &mut nodes)?;
+    Ok(build_document(nodes, today))
 }
 
-fn parse_file_into(path: &Path, today: Date, out: &mut ParsedDocument) -> Result<(), ImportError> {
+fn collect_document_nodes(
+    path: &Path,
+    allow_include: bool,
+    out: &mut Vec<XNode>,
+) -> Result<(), ImportError> {
     let text = fs::read_to_string(path).map_err(|e| ImportError::Io(path.to_path_buf(), e))?;
-    parse_text_into(&text, path, today, out)
+    collect_document_text(&text, path, allow_include, out)
 }
 
-fn parse_text_into(
+/// Reads the document's top-level children into `out`, inlining every
+/// `<include>` in place (so macro collection afterwards sees one
+/// flattened, whole-document node list).
+fn collect_document_text(
     text: &str,
     path: &Path,
-    today: Date,
-    out: &mut ParsedDocument,
+    allow_include: bool,
+    out: &mut Vec<XNode>,
 ) -> Result<(), ImportError> {
     let xml =
         roxmltree::Document::parse(text).map_err(|e| ImportError::Xml(path.to_path_buf(), e))?;
     let root = xml.root_element();
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
 
-    for child in root.children().filter(Node::is_element) {
-        match child.tag_name().name() {
-            "include" => {
-                let src = child.attribute("src").ok_or_else(|| ImportError::Missing {
-                    path: path.to_path_buf(),
-                    context: "include".into(),
-                    attribute: "src",
-                })?;
-                parse_file_into(&dir.join(src), today, out)?;
+    for child in root.children().filter(roxmltree::Node::is_element) {
+        if child.tag_name().name() == "include" {
+            if !allow_include {
+                return Err(ImportError::IncludeNotSupported(path.to_path_buf()));
             }
-            "entry" => parse_entry(child, path, today, &mut out.entries, &mut out.warnings)?,
-            other => out.warnings.push(format!(
-                "{}: unexpected top-level element <{other}>, skipped",
-                path.display()
-            )),
+            if let Some(src) = child.attribute("src") {
+                collect_document_nodes(&dir.join(src), allow_include, out)?;
+            }
+        } else {
+            out.push(xtree::from_roxmltree(child));
         }
     }
     Ok(())
 }
 
+fn build_document(nodes: Vec<XNode>, today: Date) -> ParsedDocument {
+    let mut warnings = Vec::new();
+    let mut macros = BTreeMap::new();
+    xtree::collect_macros(&nodes, &mut macros);
+    let expanded = xtree::expand_refs(nodes, &macros, &mut warnings);
+
+    let mut entries = Vec::new();
+    for node in &expanded {
+        match node.tag_name() {
+            "entry" => parse_entry(node, today, &mut entries, &mut warnings),
+            "def" => {} // already collected by collect_macros
+            other => warnings.push(format!("unexpected top-level element <{other}>, skipped")),
+        }
+    }
+    ParsedDocument { entries, warnings }
+}
+
 fn parse_entry(
-    node: Node,
-    path: &Path,
+    node: &XNode,
     today: Date,
     entries: &mut Vec<ParsedEntry>,
     warnings: &mut Vec<String>,
-) -> Result<(), ImportError> {
-    let id = node
-        .attribute("id")
-        .ok_or_else(|| ImportError::Missing {
-            path: path.to_path_buf(),
-            context: "entry".into(),
-            attribute: "id",
-        })?
-        .to_string();
+) {
+    let Some(id) = node.attribute("id") else {
+        warnings.push(
+            "<entry> missing required attribute 'id', entry (and any children) skipped".into(),
+        );
+        return;
+    };
+    let id = id.to_string();
     let title = node.attribute("title").unwrap_or("").to_string();
     let context_prefix = format!("entry {id}");
 
@@ -282,23 +294,20 @@ fn parse_entry(
         music_var: None,
     };
 
-    for child in node.children().filter(Node::is_element) {
-        let tag = child.tag_name().name();
+    for child in node.children() {
+        let tag = child.tag_name();
         match tag {
             "entry" => {
-                let child_id = child
-                    .attribute("id")
-                    .ok_or_else(|| ImportError::Missing {
-                        path: path.to_path_buf(),
-                        context: context_prefix.clone(),
-                        attribute: "id",
-                    })?
-                    .to_string();
-                entry.relations.push(ParsedRelation::Contains {
-                    to: child_id,
-                    factor: 1.0,
-                });
-                parse_entry(child, path, today, entries, warnings)?;
+                match child.attribute("id") {
+                    Some(child_id) => entry.relations.push(ParsedRelation::Contains {
+                        to: child_id.to_string(),
+                        factor: 1.0,
+                    }),
+                    None => warnings.push(format!(
+                        "{context_prefix}: nested <entry> missing required attribute 'id', skipped"
+                    )),
+                }
+                parse_entry(child, today, entries, warnings);
             }
             "source" => parse_source(child, &mut entry),
             "bestGirl" => entry.best_girl = child.attribute("name").map(String::from),
@@ -337,10 +346,8 @@ fn parse_entry(
                     feat: child.attribute("feat").map(|s| s == "true"),
                 });
             }
-            "queue" | "validatorSuppress" => {} // pure metadata
-            "script" | "def" | "ref" => warnings.push(format!(
-                "{context_prefix}: unsupported <{tag}> element, skipped (not interpretable)"
-            )),
+            "queue" | "validatorSuppress" | "def" => {} // pure metadata / already-expanded macro decl
+            "script" => handle_script(child, &context_prefix, warnings),
             _ => {
                 if let Some(kind) = parse_impact_kind(child, tag, today, &context_prefix, warnings)
                 {
@@ -352,19 +359,29 @@ fn parse_entry(
     }
 
     entries.push(entry);
-    Ok(())
 }
 
-fn parse_source(node: Node, entry: &mut ParsedEntry) {
+#[cfg(not(feature = "scripting"))]
+fn handle_script(_node: &XNode, context: &str, warnings: &mut Vec<String>) {
+    warnings.push(format!(
+        "{context}: <script> skipped (build with the \"scripting\" feature to run it)"
+    ));
+}
+
+#[cfg(feature = "scripting")]
+fn handle_script(node: &XNode, context: &str, warnings: &mut Vec<String>) {
+    if let Err(e) = crate::script::run_entry_script(node) {
+        warnings.push(format!("{context}: <script> failed: {e}"));
+    }
+}
+
+fn parse_source(node: &XNode, entry: &mut ParsedEntry) {
     // Priority order for a single (store, store_id): the dedicated
     // provider tags first, then a generic <urls><url .../></urls>
     // fallback (the common case for music entries, which mostly don't
     // have a dedicated tag).
     for provider in ["mal", "al", "adb", "ks", "vndb"] {
-        if let Some(child) = node
-            .children()
-            .find(|c| c.is_element() && c.tag_name().name() == provider)
-        {
+        if let Some(child) = node.children().find(|c| c.tag_name() == provider) {
             if let Some(id) = child.attribute("id") {
                 entry.store = provider.to_string();
                 entry.store_id = id.to_string();
@@ -372,10 +389,7 @@ fn parse_source(node: Node, entry: &mut ParsedEntry) {
             }
         }
     }
-    if let Some(vgmdb) = node
-        .children()
-        .find(|c| c.is_element() && c.tag_name().name() == "vgmdb")
-    {
+    if let Some(vgmdb) = node.children().find(|c| c.tag_name() == "vgmdb") {
         for key in ["product", "album", "artist", "track", "disc"] {
             if let Some(id) = vgmdb.attribute(key) {
                 entry.store = format!("vgmdb-{key}");
@@ -384,14 +398,8 @@ fn parse_source(node: Node, entry: &mut ParsedEntry) {
             }
         }
     }
-    if let Some(urls) = node
-        .children()
-        .find(|c| c.is_element() && c.tag_name().name() == "urls")
-    {
-        if let Some(url) = urls
-            .children()
-            .find(|c| c.is_element() && c.tag_name().name() == "url")
-        {
+    if let Some(urls) = node.children().find(|c| c.tag_name() == "urls") {
+        if let Some(url) = urls.children().find(|c| c.tag_name() == "url") {
             if let (Some(name), Some(src)) = (url.attribute("name"), url.attribute("src")) {
                 entry.store = format!("url-{name}");
                 entry.store_id = src.to_string();
@@ -403,16 +411,13 @@ fn parse_source(node: Node, entry: &mut ParsedEntry) {
 /// `<contains>` may nest further `<contains>` children, each
 /// multiplying its own `factor` (default `1.0`) into the parent's -
 /// e.g. `<contains factor="0.5"><contains id="X"/></contains>`.
-fn parse_contains(node: Node, inherited_factor: f32) -> Vec<(String, f32)> {
+fn parse_contains(node: &XNode, inherited_factor: f32) -> Vec<(String, f32)> {
     let factor = node.attribute("factor").map(parse_fraction).unwrap_or(1.0) * inherited_factor;
     let mut result = Vec::new();
     if let Some(id) = node.attribute("id") {
         result.push((id.to_string(), factor));
     }
-    for child in node
-        .children()
-        .filter(|c| c.is_element() && c.tag_name().name() == "contains")
-    {
+    for child in node.children().filter(|c| c.tag_name() == "contains") {
         result.extend(parse_contains(child, factor));
     }
     result
@@ -428,10 +433,10 @@ fn parse_fraction(s: &str) -> f32 {
     }
 }
 
-fn parse_contributors(node: Node, self_id: &str) -> Vec<(String, f32)> {
+fn parse_contributors(node: &XNode, self_id: &str) -> Vec<(String, f32)> {
     let contributors: Vec<(String, f32)> = node
         .children()
-        .filter(|c| c.is_element() && c.tag_name().name() == "contributor")
+        .filter(|c| c.tag_name() == "contributor")
         .filter_map(|c| {
             let id = c.attribute("id")?.to_string();
             let factor = c.attribute("factor").map(parse_fraction).unwrap_or(1.0);
@@ -446,7 +451,7 @@ fn parse_contributors(node: Node, self_id: &str) -> Vec<(String, f32)> {
 }
 
 fn parse_relation(
-    node: Node,
+    node: &XNode,
     tag: &str,
     context: &str,
     warnings: &mut Vec<String>,
@@ -476,20 +481,20 @@ fn parse_relation(
     }
 }
 
-fn req_f32(node: Node, name: &str, context: &str, warnings: &mut Vec<String>) -> Option<f32> {
+fn req_f32(node: &XNode, name: &str, context: &str, warnings: &mut Vec<String>) -> Option<f32> {
     match node.attribute(name).and_then(|s| s.parse().ok()) {
         Some(v) => Some(v),
         None => {
             warnings.push(format!(
                 "{context}: <{}> missing/unparseable required attribute '{name}', skipped",
-                node.tag_name().name()
+                node.tag_name()
             ));
             None
         }
     }
 }
 
-fn opt_f32(node: Node, name: &str, default: f32) -> f32 {
+fn opt_f32(node: &XNode, name: &str, default: f32) -> f32 {
     node.attribute(name)
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
@@ -547,8 +552,8 @@ fn parse_date(s: &str, today: Date) -> Option<Date> {
 /// any nested `<periods>` children, all summed (INFRA's
 /// `DatePeriod[]`). Returns `0.0` (with a warning) if nothing usable
 /// is present, rather than failing the whole entry.
-fn period_days(node: Node, today: Date, context: &str, warnings: &mut Vec<String>) -> f32 {
-    let one = |n: Node| -> Option<f32> {
+fn period_days(node: &XNode, today: Date, context: &str, warnings: &mut Vec<String>) -> f32 {
+    let one = |n: &XNode| -> Option<f32> {
         if let Some(len) = n.attribute("length") {
             return len.parse().ok();
         }
@@ -566,10 +571,7 @@ fn period_days(node: Node, today: Date, context: &str, warnings: &mut Vec<String
         total += d;
         found = true;
     }
-    for child in node
-        .children()
-        .filter(|c| c.is_element() && c.tag_name().name() == "periods")
-    {
+    for child in node.children().filter(|c| c.tag_name() == "periods") {
         if let Some(d) = one(child) {
             total += d;
             found = true;
@@ -578,20 +580,20 @@ fn period_days(node: Node, today: Date, context: &str, warnings: &mut Vec<String
     if !found {
         warnings.push(format!(
             "{context}: <{}> has no usable length/from/to (possibly an unresolved template value), treated as 0 days",
-            node.tag_name().name()
+            node.tag_name()
         ));
     }
     total
 }
 
 fn parse_impact_kind(
-    node: Node,
+    node: &XNode,
     tag: &str,
     today: Date,
     context: &str,
     warnings: &mut Vec<String>,
 ) -> Option<ImpactKind> {
-    let emotions = |n: Node| {
+    let emotions = |n: &XNode| {
         n.attribute("emotions")
             .map(parse_emotions)
             .unwrap_or_default()
@@ -696,13 +698,11 @@ fn parse_impact_kind(
                 })?,
         }),
         "regularImpact" => {
-            let score = node
-                .children()
-                .find(|c| c.is_element() && c.tag_name().name() == "score");
+            let score = node.children().find(|c| c.tag_name() == "score");
             let components: Vec<(String, f32)> = score
                 .into_iter()
                 .flat_map(|s| s.children())
-                .filter(|c| c.is_element() && c.tag_name().name() == "component")
+                .filter(|c| c.tag_name() == "component")
                 .filter_map(|c| {
                     let factor = c.attribute("factor")?.to_string();
                     let value: f32 = c.attribute("value")?.parse().ok()?;
@@ -1004,17 +1004,46 @@ mod tests {
         assert_eq!(mv.vocallyrics, None);
     }
 
+    #[cfg(not(feature = "scripting"))]
     #[test]
     fn script_element_warns_but_does_not_fail_parse() {
         let doc = parse_str(
             r#"<document>
-                <entry id="A-1" title="A"><script src="x.js" /><cry emotions="MU" /></entry>
+                <entry id="A-1" title="A"><script>1+1</script><cry emotions="MU" /></entry>
             </document>"#,
             today(),
         )
         .unwrap();
         assert_eq!(entry(&doc, "A-1").impacts.len(), 1);
         assert!(doc.warnings.iter().any(|w| w.contains("<script>")));
+    }
+
+    #[test]
+    fn def_ref_macro_is_expanded_before_entry_parsing() {
+        let doc = parse_str(
+            r#"<document>
+                <def name="Greet" vars="a_base:double,a_emotions:string">
+                    <nei base="a_base" emotions="a_emotions" />
+                </def>
+                <entry id="A-1" title="A">
+                    <ref name="Greet" a_base="0.6" a_emotions="AP" />
+                </entry>
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let a = entry(&doc, "A-1");
+        assert_eq!(a.impacts.len(), 1);
+        // ImpactKind::Nei::base stores the raw attribute value; the
+        // remap to [0,2] happens later in snapshot.rs's atoms_for.
+        assert_eq!(
+            a.impacts[0].kind,
+            ImpactKind::Nei {
+                base: 0.6,
+                blend: vec![("AP".into(), 1.0)]
+            }
+        );
     }
 
     #[test]

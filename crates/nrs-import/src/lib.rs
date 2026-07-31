@@ -7,8 +7,11 @@
 pub mod anchors;
 pub mod legacy;
 pub mod roles;
+#[cfg(feature = "scripting")]
+pub mod script;
 pub mod snapshot;
 pub mod xml;
+pub mod xtree;
 
 pub use legacy::*;
 pub use snapshot::build_snapshot;

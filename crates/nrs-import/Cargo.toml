@@ -7,3 +7,6 @@ edition.workspace = true
 nrs-core = { path = "../nrs-core" }
 roxmltree = "0.21.1"
 time = { version = "0.3.54", features = ["parsing", "macros"] }
+
+[features]
+scripting = []
