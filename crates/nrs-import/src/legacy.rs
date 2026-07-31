@@ -206,17 +206,29 @@ pub fn dropped(source: SourceId) -> Vec<Atom> {
     flat_atom(source, anchors::boredom(), -0.5)
 }
 
+/// `musicConsumedProgress`: `consumedProgress` with `boredom` fixed at
+/// `1.0` (`DAH_entry_progress.ts`).
+pub fn music_consumed_progress(source: SourceId, duration_minutes: f32) -> Vec<Atom> {
+    consumed(source, 1.0, duration_minutes)
+}
+
 // --- Relations ---------------------------------------------------------
 // `gateOpen` (old: ScalarMatrix(0.0)) is a zero-effect relation in the
 // old solve, and is dropped here rather than represented: an edge with
 // weight 0 contributes nothing, so omitting it is exactly equivalent.
 
 pub fn contains(from: nrs_core::EntryId, to: nrs_core::EntryId) -> Relation {
+    contains_weighted(from, to, 1.0)
+}
+
+/// `<contains factor="...">`: same as `contains`, but with an
+/// explicit fraction rather than the default full (`1.0`) borrow.
+pub fn contains_weighted(from: nrs_core::EntryId, to: nrs_core::EntryId, factor: f32) -> Relation {
     Relation {
         kind: RelKind::Contains,
         from,
         to,
-        transform: Transform::Scalar(1.0),
+        transform: Transform::Scalar(factor),
     }
 }
 
