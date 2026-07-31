@@ -11,8 +11,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use nrs_core::{
     AnchorId, Atom, Entry, EntryId, Homogeneity, Impact, ImpactId, Isotonic, KFeatMatrix,
-    KSrcLevels, Palette, Params, RelKind, Relation, Snapshot, SourceId, Taxonomy, TimeSupport,
-    Transform,
+    KSrcLevels, Palette, Params, RelKind, Relation, RelationScaling, Snapshot, SourceId, Taxonomy,
+    TimeSupport, Transform,
 };
 
 const ANCHORS: &[&str] = &[
@@ -129,6 +129,7 @@ fn params() -> Params {
         k_feat: KFeatMatrix::default(),
         homogeneity: Homogeneity::DegreeQ,
         calibration: Isotonic::default(),
+        relation_scaling: RelationScaling::Fixed,
     }
 }
 

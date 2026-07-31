@@ -103,7 +103,25 @@ pub(crate) fn value(
             crowding += k * mass_j.abs();
         }
         let contribution = match homogeneity {
-            Homogeneity::DegreeQ => mass_i * crowding.powf(q - 1.0),
+            Homogeneity::DegreeQ => {
+                // crowding >= |mass_i| always (the self term, K(i,i)=1),
+                // so in exact arithmetic mass_i * crowding^(q-1) is
+                // bounded by |mass_i|^q and -> 0 as mass_i -> 0 (q>0):
+                // never actually infinite. `inf`/`NaN` here can only be
+                // a float-underflow artifact (crowding computed as
+                // exactly 0, or as a subnormal tiny enough that raising
+                // it to a very negative power overflows f32) - most
+                // likely to bite with `RelationScaling::PowQ` at low q,
+                // which deliberately pushes diluted relation weights
+                // toward zero. Fall back to the true limit, 0, rather
+                // than propagate a spurious infinity.
+                let phi = crowding.powf(q - 1.0);
+                if phi.is_finite() {
+                    mass_i * phi
+                } else {
+                    0.0
+                }
+            }
             Homogeneity::Degree1 => {
                 // Normalise crowding by this cell's own mass first (a
                 // scale-free "how surrounded am I, relative to my own
@@ -127,8 +145,17 @@ pub(crate) fn value(
                 // only *between* cells: added neighbouring same-signed
                 // mass still discounts a cell's own contribution via
                 // this ratio.
+                // ratio >= 1 always, so for q<1 this stays <= 1
+                // (bounded); guarded the same way as DegreeQ above in
+                // case an extreme q or an underflowed mass_i pushes it
+                // past f32's range anyway.
                 let ratio = crowding / mass_i.abs();
-                mass_i * ratio.powf(q - 1.0)
+                let phi = ratio.powf(q - 1.0);
+                if phi.is_finite() {
+                    mass_i * phi
+                } else {
+                    0.0
+                }
             }
         };
         total += contribution;
@@ -168,6 +195,32 @@ mod tests {
                 c.crowding, 2.0,
                 "opposite-sign cell must not add to crowding"
             );
+        }
+    }
+
+    #[test]
+    fn vanishingly_tiny_mass_contributes_zero_not_infinity() {
+        // Simulates what RelationScaling::PowQ can produce at very low
+        // q: an isolated cell whose mass has been diluted down near
+        // f32's precision floor. The true limit as mass -> 0 is 0, not
+        // `inf` from crowding^(q-1) blowing up.
+        let anchor = AnchorId("x".into());
+        let k_feat = KFeatMatrix::default();
+        let tax = Taxonomy::default();
+        let levels = KSrcLevels { levels: [1.0; 5] };
+
+        for &tiny in &[1e-30f32, 1e-38, 1e-40, 1e-44] {
+            let mut f = Measure::new();
+            f.insert((SourceId("s".into()), anchor.clone()), tiny);
+            let (v, contributions) = value(&f, &k_feat, &tax, &levels, 0.1, Homogeneity::DegreeQ);
+            assert!(v.is_finite(), "tiny={tiny}: V={v}");
+            for c in &contributions {
+                assert!(
+                    c.contribution.is_finite(),
+                    "tiny={tiny}: contribution={}",
+                    c.contribution
+                );
+            }
         }
     }
 

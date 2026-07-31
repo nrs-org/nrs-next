@@ -23,7 +23,9 @@ use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
-use nrs_core::{EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, Snapshot};
+use nrs_core::{
+    EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, RelationScaling, Snapshot,
+};
 use serde::Deserialize;
 
 struct AppState {
@@ -83,6 +85,8 @@ struct ViewParams {
     sort: SortBy,
     #[serde(default)]
     dir: SortDir,
+    #[serde(default)]
+    rel: RelScaling,
 }
 
 fn default_q() -> f32 {
@@ -106,7 +110,32 @@ enum SortDir {
     Asc,
 }
 
-fn params() -> Params {
+/// Mirrors `nrs_core::RelationScaling` (kept as a separate app-local
+/// enum so `nrs-core` doesn't need a serde dependency for this).
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum RelScaling {
+    #[default]
+    Fixed,
+    Powq,
+}
+
+impl RelScaling {
+    fn to_core(self) -> RelationScaling {
+        match self {
+            RelScaling::Fixed => RelationScaling::Fixed,
+            RelScaling::Powq => RelationScaling::PowQ,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            RelScaling::Fixed => "fixed",
+            RelScaling::Powq => "powq",
+        }
+    }
+}
+
+fn params(rel: RelScaling) -> Params {
     Params {
         q: 0.6,
         k_src_levels: KSrcLevels {
@@ -115,6 +144,7 @@ fn params() -> Params {
         k_feat: KFeatMatrix::default(),
         homogeneity: Homogeneity::DegreeQ,
         calibration: Isotonic::default(),
+        relation_scaling: rel.to_core(),
     }
 }
 
@@ -125,8 +155,8 @@ struct Row<'a> {
     value: f32,
 }
 
-fn rows(snapshot: &Snapshot, q: f32, sort: SortBy, dir: SortDir) -> Vec<Row<'_>> {
-    let mut p = params();
+fn rows(snapshot: &Snapshot, q: f32, sort: SortBy, dir: SortDir, rel: RelScaling) -> Vec<Row<'_>> {
+    let mut p = params(rel);
     p.q = q.clamp(0.001, 4.0);
     let scores = nrs_core::score(snapshot, &p);
 
@@ -166,7 +196,7 @@ async fn index(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
-    let rows = rows(&state.snapshot, view.q, view.sort, view.dir);
+    let rows = rows(&state.snapshot, view.q, view.sort, view.dir, view.rel);
 
     let sort_link = |by: &str, label: &str| {
         let is_current = sort_by_name(view.sort) == by;
@@ -183,8 +213,9 @@ async fn index(
             " ▲"
         };
         format!(
-            "<a href=\"/?q={}&sort={by}&dir={next_dir}\">{label}{arrow}</a>",
-            view.q
+            "<a href=\"/?q={}&sort={by}&dir={next_dir}&rel={}\">{label}{arrow}</a>",
+            view.q,
+            view.rel.name(),
         )
     };
 
@@ -207,9 +238,15 @@ async fn index(
   td.store {{ color: #888; font-size: 0.85rem; }}
 </style></head><body>
 <h1>nrs scores</h1>
-<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}">download CSV</a></div>
+<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}">download CSV</a></div>
 <form method="get">
   <label>q (redundancy exponent): <input type="number" name="q" value="{}" step="any" min="0.001" max="4"></label>
+  <label>relation scaling:
+    <select name="rel">
+      <option value="fixed" {}>fixed (spec default)</option>
+      <option value="powq" {}>powq (w^(1/q), dampens diluted relations at low q)</option>
+    </select>
+  </label>
   <input type="hidden" name="sort" value="{}">
   <input type="hidden" name="dir" value="{}">
   <button type="submit">rerun</button>
@@ -221,7 +258,10 @@ async fn index(
         rows.len(),
         state.warnings.len(),
         view.q,
+        view.rel.name(),
         view.q,
+        if view.rel == RelScaling::Fixed { "selected" } else { "" },
+        if view.rel == RelScaling::Powq { "selected" } else { "" },
         sort_by_name(view.sort),
         sort_dir_name(view.dir),
         sort_link("id", "id"),
@@ -268,7 +308,7 @@ async fn scores_csv(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
-    let rows = rows(&state.snapshot, view.q, view.sort, view.dir);
+    let rows = rows(&state.snapshot, view.q, view.sort, view.dir, view.rel);
 
     let mut csv = String::from("id,title,store,value\n");
     for row in &rows {
@@ -362,7 +402,7 @@ mod tests {
     #[test]
     fn rows_sort_by_value_descending_by_default() {
         let snap = tiny_snapshot();
-        let r = rows(&snap, 0.6, SortBy::Value, SortDir::Desc);
+        let r = rows(&snap, 0.6, SortBy::Value, SortDir::Desc, RelScaling::Fixed);
         assert_eq!(r[0].id.0, "a"); // higher magnitude -> higher value
         assert_eq!(r[1].id.0, "b");
     }
@@ -370,7 +410,7 @@ mod tests {
     #[test]
     fn rows_sort_by_title_ascending() {
         let snap = tiny_snapshot();
-        let r = rows(&snap, 0.6, SortBy::Title, SortDir::Asc);
+        let r = rows(&snap, 0.6, SortBy::Title, SortDir::Asc, RelScaling::Fixed);
         assert_eq!(r[0].title, "Apple");
         assert_eq!(r[1].title, "Zebra");
     }

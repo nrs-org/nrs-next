@@ -13,6 +13,7 @@ fn params(q: f32) -> Params {
         k_feat: KFeatMatrix::default(),
         homogeneity: Homogeneity::DegreeQ,
         calibration: Isotonic::default(), // identity, so S_e == V_e
+        relation_scaling: RelationScaling::Fixed,
     }
 }
 
@@ -156,14 +157,11 @@ fn contains_flattens_to_the_same_score() {
     assert!((album - flat_v).abs() < 1e-4, "{album} vs {flat_v}");
 }
 
-/// Notes Prop. "the double-count is identified and vanishes with
-/// saturation": a mutual remix (fraction `r`) inside a container scores
-/// `V(C) = 2(1-r)^-q`, strictly between `2` (flattened, `q -> 0`) and
-/// `2/(1-r)` (the redundancy-blind `q = 1` corner, the old system).
-#[test]
-fn mutual_remix_container_matches_double_count_formula() {
-    let r = 0.2f32;
-    let snap = Snapshot {
+/// A mutual remix (fraction `r`) of `a` and `b`, both pooled into
+/// container `c` via `Contains` - the exact setup Prop. "the
+/// double-count is identified and vanishes with saturation" analyzes.
+fn mutual_remix_snapshot(r: f32) -> Snapshot {
+    Snapshot {
         entries: vec![entry("a"), entry("b"), entry("c")],
         impacts: vec![
             Impact {
@@ -205,7 +203,17 @@ fn mutual_remix_container_matches_double_count_formula() {
         ],
         palette: palette(),
         taxonomy: Taxonomy::default(),
-    };
+    }
+}
+
+/// Notes Prop. "the double-count is identified and vanishes with
+/// saturation": a mutual remix (fraction `r`) inside a container scores
+/// `V(C) = 2(1-r)^-q`, strictly between `2` (flattened, `q -> 0`) and
+/// `2/(1-r)` (the redundancy-blind `q = 1` corner, the old system).
+#[test]
+fn mutual_remix_container_matches_double_count_formula() {
+    let r = 0.2f32;
+    let snap = mutual_remix_snapshot(r);
 
     let c = EntryId("c".into());
     let mut previous = None;
@@ -226,6 +234,106 @@ fn mutual_remix_container_matches_double_count_formula() {
     // At q = 1 (redundancy-blind), V(C) is the old system's 2/(1-r).
     let at_one = score(&snap, &params(1.0)).values[&c];
     assert!((at_one - 2.0 / (1.0 - r)).abs() < 1e-3, "{at_one}");
+}
+
+/// `RelationScaling::PowQ`'s closed form on the same setup:
+/// `V(C) = 2(1 - r^(1/q))^-q`. Confirms it matches `Fixed` exactly at
+/// `q=1` (r^(1/1)=r, no change from the old system), matches the same
+/// `q->0` flattening limit, and - the point of the reparametrization -
+/// is `<= Fixed`'s value for every `q` in `(0, 1]` (proved as a
+/// separate theorem in redesign-tex's notes, right after Prop. "the
+/// double-count is identified and vanishes with saturation").
+#[test]
+fn powq_relation_scaling_matches_its_closed_form_and_never_exceeds_fixed() {
+    let r = 0.2f32;
+    let snap = mutual_remix_snapshot(r);
+    let c = EntryId("c".into());
+
+    for &q in &[0.05f32, 0.25, 0.5, 0.75, 1.0] {
+        let mut p = params(q);
+        p.relation_scaling = RelationScaling::PowQ;
+        let v = score(&snap, &p).values[&c];
+        let r_prime = r.powf(1.0 / q);
+        let expected = 2.0 * (1.0 - r_prime).powf(-q);
+        assert!((v - expected).abs() < 1e-2, "q={q}: {v} vs {expected}");
+
+        let mut fixed_p = params(q);
+        fixed_p.relation_scaling = RelationScaling::Fixed;
+        let v_fixed = score(&snap, &fixed_p).values[&c];
+        assert!(
+            v <= v_fixed + 1e-4,
+            "q={q}: PowQ {v} should be <= Fixed {v_fixed}"
+        );
+    }
+
+    // Exact match at q=1 (r^(1/1) = r, identical to Fixed).
+    let mut p1 = params(1.0);
+    p1.relation_scaling = RelationScaling::PowQ;
+    let v1 = score(&snap, &p1).values[&c];
+    let mut fixed_p1 = params(1.0);
+    fixed_p1.relation_scaling = RelationScaling::Fixed;
+    let v1_fixed = score(&snap, &fixed_p1).values[&c];
+    assert!((v1 - v1_fixed).abs() < 1e-3, "{v1} vs {v1_fixed}");
+
+    // Same q -> 0 flattening limit as Fixed.
+    let mut p0 = params(1e-4);
+    p0.relation_scaling = RelationScaling::PowQ;
+    let near_zero = score(&snap, &p0).values[&c];
+    assert!((near_zero - 2.0).abs() < 1e-2, "{near_zero}");
+}
+
+/// `Contains`'s weight (1.0) must be unaffected by `PowQ` at any `q`
+/// (`1^x = 1`) - only genuinely-diluted relations are meant to be
+/// touched, confirmed directly against `contains_flattens_to_the_same_score`'s
+/// setup with PowQ turned on.
+#[test]
+fn powq_leaves_full_weight_contains_unaffected() {
+    let grouped = Snapshot {
+        entries: vec![entry("track1"), entry("track2"), entry("album")],
+        impacts: vec![
+            Impact {
+                id: ImpactId("i1".into()),
+                target: EntryId("track1".into()),
+                atoms: vec![moment("char1", "gut-punch", 1.0)],
+            },
+            Impact {
+                id: ImpactId("i2".into()),
+                target: EntryId("track2".into()),
+                atoms: vec![moment("char2", "cozy-warmth", 1.5)],
+            },
+        ],
+        relations: vec![
+            Relation {
+                kind: RelKind::Contains,
+                from: EntryId("album".into()),
+                to: EntryId("track1".into()),
+                transform: Transform::Scalar(1.0),
+            },
+            Relation {
+                kind: RelKind::Contains,
+                from: EntryId("album".into()),
+                to: EntryId("track2".into()),
+                transform: Transform::Scalar(1.0),
+            },
+        ],
+        palette: palette(),
+        taxonomy: Taxonomy::default(),
+    };
+
+    let album = EntryId("album".into());
+    for &q in &[0.05f32, 0.3, 0.6, 1.0, 1.5] {
+        let mut fixed_p = params(q);
+        fixed_p.relation_scaling = RelationScaling::Fixed;
+        let mut powq_p = params(q);
+        powq_p.relation_scaling = RelationScaling::PowQ;
+
+        let v_fixed = score(&grouped, &fixed_p).values[&album];
+        let v_powq = score(&grouped, &powq_p).values[&album];
+        assert!(
+            (v_fixed - v_powq).abs() < 1e-4,
+            "q={q}: {v_fixed} vs {v_powq}"
+        );
+    }
 }
 
 /// Same claim as `contains_flattens_to_the_same_score`, two hops deep:

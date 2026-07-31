@@ -13,7 +13,8 @@ pub use types::*;
 /// one nonlinearity, calibrate.
 pub fn score(snap: &Snapshot, params: &Params) -> Scores {
     let built = measure::build_measures(snap);
-    let resolved = solve::solve_relations(built, &snap.relations);
+    let resolved =
+        solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
 
     let mut values = std::collections::BTreeMap::new();
     for (entry, f) in &resolved {
@@ -34,7 +35,8 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
 /// anchor)` breakdown (INFRA.md §4.3 phase 3).
 pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation {
     let built = measure::build_measures(snap);
-    let resolved = solve::solve_relations(built, &snap.relations);
+    let resolved =
+        solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
 
     let empty = measure::Measure::new();
     let f = resolved.get(&entry).unwrap_or(&empty);

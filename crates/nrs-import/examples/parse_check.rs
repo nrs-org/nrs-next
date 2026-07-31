@@ -63,6 +63,7 @@ fn main() {
         k_feat: nrs_core::KFeatMatrix::default(),
         homogeneity: nrs_core::Homogeneity::DegreeQ,
         calibration: nrs_core::Isotonic::default(),
+        relation_scaling: nrs_core::RelationScaling::Fixed,
     };
     let scores = nrs_core::score(&snapshot, &params);
     let non_finite = scores.values.values().filter(|v| !v.is_finite()).count();

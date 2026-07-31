@@ -187,6 +187,38 @@ impl Isotonic {
     }
 }
 
+/// How a relation's raw transform weight (`Transform`'s scalar(s) —
+/// e.g. `killedBy`'s ~0.04 dilution) relates to the redundancy
+/// exponent `q`.
+///
+/// Under `Fixed`, a relation-borrowed atom's contribution once
+/// isolated is `(w*m)^q`; as `q -> 0`, `x^q -> 1` for *any* fixed
+/// `x > 0`, so the weight `w` washes out almost entirely no matter
+/// how small it is — a heavily-diluted relation ends up contributing
+/// close to full presence credit at low `q`. `PowQ` reparametrizes
+/// the weight as `w^(1/q)` before the relation solve, so the isolated
+/// contribution becomes `(m*w^(1/q))^q = m^q * w` — `w` comes out
+/// exactly linearly, for every `q`, matching what the dilution factor
+/// was semantically supposed to mean throughout the whole range, not
+/// just at `q=1`. `Contains`'s weight (`1.0`) is unaffected at any
+/// `q` under either mode (`1^x = 1`), so only genuinely-diluted
+/// relations (remix, killedBy, featureMusic) are touched.
+///
+/// `Fixed` is the default and matches INFRA.md/the redesign notes'
+/// original spec exactly (including Prop. "the double-count is
+/// identified and vanishes with saturation"'s closed form). `PowQ` is
+/// a deliberate amendment on top of that spec to fix the low-q
+/// pathology above; redesign-tex's notes prove `PowQ`'s `V(C) <=`
+/// `Fixed`'s `V(C)` for `q <= 1` (the saturation/breadth regime) — the
+/// reparametrization doesn't just fix the pathology, it provably
+/// tightens the same double-count bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelationScaling {
+    #[default]
+    Fixed,
+    PowQ,
+}
+
 /// `Theta` - the fitted knobs (INFRA.md §4.2). No kernel width here:
 /// `k_feat` and `k_src_levels` are already-realized lookup tables, not
 /// a distance formula, so there's nothing for a width to parameterize
@@ -200,6 +232,7 @@ pub struct Params {
     pub k_feat: KFeatMatrix,
     pub homogeneity: Homogeneity,
     pub calibration: Isotonic,
+    pub relation_scaling: RelationScaling,
 }
 
 /// `score`'s output: public scale `S_e` per entry.

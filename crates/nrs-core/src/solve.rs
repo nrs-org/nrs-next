@@ -18,31 +18,55 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::measure::Measure;
-use crate::types::{AnchorId, EntryId, Relation, SourceId, Transform};
+use crate::types::{AnchorId, EntryId, Relation, RelationScaling, SourceId, Transform};
 
 type Node = (EntryId, AnchorId);
 
+/// `RelationScaling::PowQ`: replace a raw weight `w` with `w^(1/q)`,
+/// so that `w` comes out exactly linearly in an isolated borrowed
+/// atom's contribution after the top nonlinearity, for every `q` (see
+/// `RelationScaling`'s docs). Guards against `w <= 0` or `q <= 0`
+/// (fractional powers of a non-positive base are undefined/complex)
+/// by leaving the weight unscaled — relation weights are meant to be
+/// borrow fractions in `(0, 1]`, so this never triggers on real data.
+fn scale_weight(w: f32, q: f32, scaling: RelationScaling) -> f32 {
+    match scaling {
+        RelationScaling::Fixed => w,
+        RelationScaling::PowQ => {
+            if w > 0.0 && q > 0.0 {
+                w.powf(1.0 / q)
+            } else {
+                w
+            }
+        }
+    }
+}
+
 /// One relation's transform, expanded into `(dst_anchor_on_borrower,
-/// src_anchor_on_lender, weight)` edges. `Transport`'s map is keyed
-/// `(src_anchor, dst_anchor)`: mass moves *from* `src_anchor` (on the
-/// lender) *to* `dst_anchor` (on the borrower).
+/// src_anchor_on_lender, weight)` edges, with `weight` already put
+/// through `scale_weight`. `Transport`'s map is keyed `(src_anchor,
+/// dst_anchor)`: mass moves *from* `src_anchor` (on the lender) *to*
+/// `dst_anchor` (on the borrower).
 fn transform_edges(
     transform: &Transform,
     active_anchors: &BTreeSet<AnchorId>,
+    q: f32,
+    scaling: RelationScaling,
 ) -> Vec<(AnchorId, AnchorId, f32)> {
+    let scale = |w: f32| scale_weight(w, q, scaling);
     match transform {
         Transform::Scalar(c) => active_anchors
             .iter()
-            .map(|a| (a.clone(), a.clone(), *c))
+            .map(|a| (a.clone(), a.clone(), scale(*c)))
             .collect(),
         Transform::Regional(map) => map
             .iter()
             .filter(|(_, w)| **w != 0.0)
-            .map(|(a, w)| (a.clone(), a.clone(), *w))
+            .map(|(a, w)| (a.clone(), a.clone(), scale(*w)))
             .collect(),
         Transform::Transport(map) => map
             .iter()
-            .map(|((src, dst), w)| (dst.clone(), src.clone(), *w))
+            .map(|((src, dst), w)| (dst.clone(), src.clone(), scale(*w)))
             .collect(),
     }
 }
@@ -181,10 +205,15 @@ fn solve_dense(mat: &[Vec<f32>], rhs: &[Vec<f32>]) -> Vec<Vec<f32>> {
 }
 
 /// Phase 2: resolve `(I - M) f = f_const` and return every entry's
-/// fully-borrowed measure.
+/// fully-borrowed measure. `q`/`scaling` only affect how a raw
+/// relation weight is reinterpreted (`RelationScaling::PowQ`); under
+/// the default `Fixed`, this phase is exactly as `q`-independent as
+/// INFRA.md's phase split intends.
 pub(crate) fn solve_relations(
     measures: BTreeMap<EntryId, Measure>,
     relations: &[Relation],
+    q: f32,
+    scaling: RelationScaling,
 ) -> BTreeMap<EntryId, Measure> {
     let active_anchors: BTreeSet<AnchorId> = measures
         .values()
@@ -203,7 +232,7 @@ pub(crate) fn solve_relations(
     }
     for relation in relations {
         for (dst_anchor, src_anchor, weight) in
-            transform_edges(&relation.transform, &active_anchors)
+            transform_edges(&relation.transform, &active_anchors, q, scaling)
         {
             if weight == 0.0 {
                 continue;

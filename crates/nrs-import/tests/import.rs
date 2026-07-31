@@ -15,6 +15,7 @@ fn params() -> Params {
         k_feat: KFeatMatrix::default(),
         homogeneity: Homogeneity::DegreeQ,
         calibration: Isotonic::default(),
+        relation_scaling: RelationScaling::Fixed,
     }
 }
 
