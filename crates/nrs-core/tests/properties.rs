@@ -600,3 +600,106 @@ fn borrow_only_entry_gets_exactly_the_scaled_source_value() {
     let receiver = score(&snap, &params(1.0)).values[&EntryId("receiver".into())];
     assert!((receiver - 2.0).abs() < 1e-5, "{receiver}");
 }
+
+/// redesign-tex Theorem "dilution survives to the breadth limit": with
+/// `K` owned, mutually non-redundant atoms and `N` atoms borrowed at a
+/// common dilution `w` (also mutually non-redundant, from `N`
+/// distinct one-atom sources), `V -> K + N` under `Fixed` and
+/// `V -> K + w*N` under `PowQ` as `q -> 0+`.
+#[test]
+fn breadth_limit_matches_k_plus_n_fixed_and_k_plus_wn_powq() {
+    let k = 2;
+    let n = 5;
+    let w = 0.1f32;
+
+    let mut entries = vec![entry("owner"), entry("borrower")];
+    let mut impacts = vec![Impact {
+        id: ImpactId("io1".into()),
+        target: EntryId("owner".into()),
+        atoms: vec![moment("owner-src", "owner-anchor-1", 3.0)],
+    }];
+    // A second owned atom at a distinct source/anchor (k=2 total).
+    impacts.push(Impact {
+        id: ImpactId("io2".into()),
+        target: EntryId("owner".into()),
+        atoms: vec![moment("owner-src2", "owner-anchor-2", 5.0)],
+    });
+    assert_eq!(k, 2);
+
+    let mut relations = Vec::new();
+    for i in 0..n {
+        let src_id = format!("src{i}");
+        entries.push(entry(&src_id));
+        impacts.push(Impact {
+            id: ImpactId(format!("is{i}")),
+            target: EntryId(src_id.clone()),
+            atoms: vec![moment(
+                &format!("src-src-{i}"),
+                &format!("src-anchor-{i}"),
+                (i + 1) as f32,
+            )],
+        });
+        relations.push(Relation {
+            kind: RelKind::KilledBy,
+            from: EntryId("borrower".into()),
+            to: EntryId(src_id),
+            transform: Transform::Scalar(w),
+        });
+    }
+
+    let snap = Snapshot {
+        entries,
+        impacts,
+        relations,
+        palette: palette(),
+        taxonomy: Taxonomy::default(),
+    };
+
+    let owner = EntryId("owner".into());
+    let borrower = EntryId("borrower".into());
+    // Not q -> 0 literally: PowQ's own reparametrized weight w^(1/q)
+    // is an f32 intermediate, and for q much below this it underflows
+    // to exact 0.0 before ever reaching the redundancy functional
+    // (e.g. at q=1e-4, 0.1^(1/1e-4) = 0.1^10000, far past f32's ~1e-45
+    // floor) - silently losing the small-but-nonzero true limit rather
+    // than approximating it. q=0.1 is comfortably inside the range
+    // already validated against the real dataset (nrs-app) and still
+    // small enough to show clear convergence toward the theorem's
+    // predicted limits.
+    let q = 0.1;
+
+    let mut fixed_p = params(q);
+    fixed_p.relation_scaling = RelationScaling::Fixed;
+    let v_owner = score(&snap, &fixed_p).values[&owner];
+    let v_borrower_fixed = score(&snap, &fixed_p).values[&borrower];
+
+    let mut powq_p = params(q);
+    powq_p.relation_scaling = RelationScaling::PowQ;
+    let v_borrower_powq = score(&snap, &powq_p).values[&borrower];
+
+    // Not yet at the q->0 limit, but trending the right way: Fixed's
+    // borrower is already closer to N=5 than to 0, PowQ's borrower is
+    // already closer to w*N=0.5 than to N=5.
+    assert!(
+        v_borrower_fixed > 3.0,
+        "borrower/fixed should trend toward N=5: {v_borrower_fixed}"
+    );
+    assert!(
+        v_borrower_powq < 1.0,
+        "borrower/powq should trend toward w*N=0.5: {v_borrower_powq}"
+    );
+
+    // The rank-swap corollary: N=5 > K=2, so Fixed's dilution-blind
+    // breadth limit lets the borrower (each connection only 10%
+    // strength) overtake the owner - the exact instability the PowQ
+    // knob was added to fix. w*N=0.5 < K=2, so PowQ preserves the
+    // sensible ordering.
+    assert!(
+        v_borrower_fixed > v_owner,
+        "Fixed should let breadth overtake depth here: {v_borrower_fixed} vs {v_owner}"
+    );
+    assert!(
+        v_borrower_powq < v_owner,
+        "PowQ should preserve the sensible ordering: {v_borrower_powq} vs {v_owner}"
+    );
+}
