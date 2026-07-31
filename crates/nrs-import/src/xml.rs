@@ -260,12 +260,50 @@ fn build_document(nodes: Vec<XNode>, today: Date) -> ParsedDocument {
     let mut engine = ScriptEngine::new();
     for node in &expanded {
         match node.tag_name() {
-            "entry" => parse_entry(node, today, &mut entries, &mut warnings, &mut engine),
+            "entry" => parse_entry(node, today, &mut entries, &mut warnings, &mut engine, None),
             "def" => {} // already collected by collect_macros
             other => warnings.push(format!("unexpected top-level element <{other}>, skipped")),
         }
     }
+    warn_duplicate_entry_ids(&entries, &mut warnings);
     ParsedDocument { entries, warnings }
+}
+
+/// A genuine duplicate `<entry id="...">` declaration (the same id
+/// authored twice, e.g. a shared cross-franchise track re-declared in
+/// two different files) silently collides downstream exactly like an
+/// unresolved `$` placeholder would: `nrs_core`'s `Snapshot.entries`
+/// keys everything by `EntryId`, so two declarations of one id merge
+/// into a single measure. Not something to guess a fix for - just
+/// make it visible.
+fn warn_duplicate_entry_ids(entries: &[ParsedEntry], warnings: &mut Vec<String>) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in entries {
+        *counts.entry(e.id.as_str()).or_default() += 1;
+    }
+    for (id, count) in counts {
+        if count > 1 {
+            warnings.push(format!(
+                "entry id '{id}' is declared {count} times; all declarations will be merged into one entry"
+            ));
+        }
+    }
+}
+
+/// `transformId` (`nrsml/parse.ts`): a `$` in an id is a positional
+/// placeholder, not a real id - e.g. `<entry id="$-1">` for an
+/// unnamed track - and is only unique *within its containing entry*.
+/// Every `$` gets replaced with the id of the nearest enclosing
+/// `<entry>` before the string is used anywhere (as a declaration or
+/// as a reference), which is what actually makes it globally unique.
+/// A top-level entry (no enclosing entry) leaves `$` untouched,
+/// matching the real engine's guard - moot in practice since
+/// top-level entries always carry a real external id.
+fn transform_id(id: &str, current_entry_id: Option<&str>) -> String {
+    match current_entry_id {
+        Some(cur) => id.replace('$', cur),
+        None => id.to_string(),
+    }
 }
 
 fn parse_entry(
@@ -274,14 +312,15 @@ fn parse_entry(
     entries: &mut Vec<ParsedEntry>,
     warnings: &mut Vec<String>,
     engine: &mut ScriptEngine,
+    parent_entry_id: Option<&str>,
 ) {
-    let Some(id) = node.attribute("id") else {
+    let Some(raw_id) = node.attribute("id") else {
         warnings.push(
             "<entry> missing required attribute 'id', entry (and any children) skipped".into(),
         );
         return;
     };
-    let id = id.to_string();
+    let id = transform_id(raw_id, parent_entry_id);
     let title = node.attribute("title").unwrap_or("").to_string();
     let context_prefix = format!("entry {id}");
 
@@ -308,20 +347,23 @@ fn parse_entry(
         match tag {
             "entry" => {
                 match child.attribute("id") {
-                    Some(child_id) => entry.relations.push(ParsedRelation::Contains {
-                        to: child_id.to_string(),
-                        factor: 1.0,
-                    }),
+                    Some(raw_child_id) => {
+                        let child_id = transform_id(raw_child_id, Some(&id));
+                        entry.relations.push(ParsedRelation::Contains {
+                            to: child_id,
+                            factor: 1.0,
+                        });
+                    }
                     None => warnings.push(format!(
                         "{context_prefix}: nested <entry> missing required attribute 'id', skipped"
                     )),
                 }
-                parse_entry(child, today, entries, warnings, engine);
+                parse_entry(child, today, entries, warnings, engine, Some(&id));
             }
             "source" => parse_source(child, &mut entry),
             "bestGirl" => entry.best_girl = child.attribute("name").map(String::from),
             "contains" => {
-                for (to, factor) in parse_contains(child, 1.0) {
+                for (to, factor) in parse_contains(child, 1.0, &id) {
                     entry
                         .relations
                         .push(ParsedRelation::Contains { to, factor });
@@ -331,7 +373,7 @@ fn parse_entry(
                 if let Some(role_id) = child.attribute("id") {
                     let roles_expr = child.attribute("roles").unwrap_or("").to_string();
                     entry.roles.push(ParsedRole {
-                        id: role_id.to_string(),
+                        id: transform_id(role_id, Some(&id)),
                         roles_expr,
                     });
                 } else {
@@ -341,7 +383,7 @@ fn parse_entry(
                 }
             }
             "remix" | "featureMusic" | "killedBy" => {
-                if let Some(relation) = parse_relation(child, tag, &context_prefix, warnings) {
+                if let Some(relation) = parse_relation(child, tag, &id, &context_prefix, warnings) {
                     entry.relations.push(relation);
                 }
             }
@@ -405,14 +447,18 @@ fn parse_source(node: &XNode, entry: &mut ParsedEntry) {
 /// `<contains>` may nest further `<contains>` children, each
 /// multiplying its own `factor` (default `1.0`) into the parent's -
 /// e.g. `<contains factor="0.5"><contains id="X"/></contains>`.
-fn parse_contains(node: &XNode, inherited_factor: f32) -> Vec<(String, f32)> {
+fn parse_contains(
+    node: &XNode,
+    inherited_factor: f32,
+    current_entry_id: &str,
+) -> Vec<(String, f32)> {
     let factor = node.attribute("factor").map(parse_fraction).unwrap_or(1.0) * inherited_factor;
     let mut result = Vec::new();
     if let Some(id) = node.attribute("id") {
-        result.push((id.to_string(), factor));
+        result.push((transform_id(id, Some(current_entry_id)), factor));
     }
     for child in node.children().filter(|c| c.tag_name() == "contains") {
-        result.extend(parse_contains(child, factor));
+        result.extend(parse_contains(child, factor, current_entry_id));
     }
     result
 }
@@ -442,7 +488,7 @@ fn parse_contributors(
         .children()
         .filter(|c| c.tag_name() == "contributor")
         .filter_map(|c| {
-            let id = c.attribute("id")?.to_string();
+            let id = transform_id(c.attribute("id")?, Some(self_id));
             let factor = c.attribute("factor").map(parse_fraction).unwrap_or(1.0);
             Some((id, factor))
         })
@@ -458,11 +504,12 @@ fn parse_contributors(
 fn parse_relation(
     node: &XNode,
     tag: &str,
+    current_entry_id: &str,
     context: &str,
     warnings: &mut Vec<String>,
 ) -> Option<ParsedRelation> {
     let to = match node.attribute("id") {
-        Some(id) => id.to_string(),
+        Some(id) => transform_id(id, Some(current_entry_id)),
         None => {
             warnings.push(format!(
                 "{context}: <{tag}> missing required attribute 'id', skipped"
@@ -1068,5 +1115,47 @@ mod tests {
     fn duration_minutes_parses_mm_ss_and_hh_mm_ss() {
         assert_eq!(parse_duration_minutes("5:42"), Some(5.0 + 42.0 / 60.0));
         assert_eq!(parse_duration_minutes("1:05:42"), Some(65.0 + 42.0 / 60.0));
+    }
+
+    #[test]
+    fn transform_id_replaces_dollar_with_enclosing_entry() {
+        assert_eq!(transform_id("$-1", Some("M-ALBUM")), "M-ALBUM-1");
+        assert_eq!(transform_id("M-MAL-123", Some("M-ALBUM")), "M-MAL-123");
+        assert_eq!(transform_id("$-1", None), "$-1");
+    }
+
+    #[test]
+    fn dollar_id_scoped_to_containing_entry_end_to_end() {
+        let doc = parse_str(
+            r#"<document>
+                <entry id="M-ALBUM-A" title="Album A">
+                    <entry id="$-1" title="Track A1" />
+                </entry>
+                <entry id="M-ALBUM-B" title="Album B">
+                    <entry id="$-1" title="Track B1" />
+                </entry>
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert!(doc.entries.iter().any(|e| e.id == "M-ALBUM-A-1"));
+        assert!(doc.entries.iter().any(|e| e.id == "M-ALBUM-B-1"));
+        // No entry should keep the raw, unresolved "$-1".
+        assert!(!doc.entries.iter().any(|e| e.id == "$-1"));
+    }
+
+    #[test]
+    fn duplicate_entry_id_declaration_warns() {
+        let doc = parse_str(
+            r#"<document>
+                <entry id="M-1" title="First declaration" />
+                <entry id="M-1" title="Second declaration" />
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        assert_eq!(doc.entries.len(), 2);
+        assert!(doc.warnings.iter().any(|w| w.contains("declared 2 times")));
     }
 }

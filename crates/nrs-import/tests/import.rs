@@ -132,7 +132,14 @@ fn role_credit_generates_a_weighted_contains_relation() {
     assert!(warnings.is_empty(), "{warnings:?}");
 
     let artist = EntryId("M-ARTIST".into());
-    let track = EntryId("$-1".into());
+    // "$-1" is a positional placeholder, unique only within its
+    // containing entry - transformId replaces "$" with the enclosing
+    // entry's id ("M-ALBUM"), giving "M-ALBUM-1".
+    let track = EntryId("M-ALBUM-1".into());
+    assert!(
+        snapshot.entries.iter().any(|e| e.id == track),
+        "track id should be resolved to M-ALBUM-1"
+    );
     let role_relation = snapshot
         .relations
         .iter()
@@ -199,4 +206,58 @@ fn script_split_contributors_reach_the_snapshot() {
     }
     assert!(scores.values[&a] != 0.0);
     assert!(scores.values[&v] != 0.0);
+}
+
+/// The exact real-data bug: `$-N` positional track ids are reused
+/// across every album that has an N-th track (e.g. "$-1" alone
+/// appears 28 times in one real franchise file's worth of albums).
+/// Two different albums' `$-1` tracks must resolve to two distinct
+/// entries, not collide into one merged measure.
+#[test]
+fn dollar_placeholder_ids_are_scoped_to_their_containing_entry() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="M-ALBUM-A" title="Album A">
+                <entry id="$-1" title="Track A1">
+                    <music base="0.9" />
+                </entry>
+            </entry>
+            <entry id="M-ALBUM-B" title="Album B">
+                <entry id="$-1" title="Track B1">
+                    <music base="0.1" />
+                </entry>
+            </entry>
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+    let track_a = EntryId("M-ALBUM-A-1".into());
+    let track_b = EntryId("M-ALBUM-B-1".into());
+    assert!(
+        doc.entries.iter().any(|e| e.id == track_a.0),
+        "M-ALBUM-A's $-1 should resolve to M-ALBUM-A-1"
+    );
+    assert!(
+        doc.entries.iter().any(|e| e.id == track_b.0),
+        "M-ALBUM-B's $-1 should resolve to M-ALBUM-B-1"
+    );
+
+    let (snapshot, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // Two entries, two impacts, two distinct scores - not merged into
+    // one shared "$-1" measure.
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .filter(|e| e.id == track_a || e.id == track_b)
+            .count(),
+        2
+    );
+    assert_eq!(snapshot.impacts.len(), 2);
+
+    let scores = score(&snapshot, &params());
+    assert!(scores.values[&track_a] > scores.values[&track_b]);
 }
