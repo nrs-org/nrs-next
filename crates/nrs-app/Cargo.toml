@@ -1,0 +1,12 @@
+[package]
+name = "nrs-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nrs-core = { path = "../nrs-core" }
+nrs-import = { path = "../nrs-import", features = ["scripting"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+time = { version = "0.3", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
