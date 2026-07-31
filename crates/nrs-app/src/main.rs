@@ -209,7 +209,7 @@ async fn index(
 <h1>nrs scores</h1>
 <div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}">download CSV</a></div>
 <form method="get">
-  <label>q (redundancy exponent): <input type="number" name="q" value="{}" step="0.05" min="0.001" max="4"></label>
+  <label>q (redundancy exponent): <input type="number" name="q" value="{}" step="any" min="0.001" max="4"></label>
   <input type="hidden" name="sort" value="{}">
   <input type="hidden" name="dir" value="{}">
   <button type="submit">rerun</button>
