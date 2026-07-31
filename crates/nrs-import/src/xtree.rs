@@ -20,6 +20,8 @@
 //! that.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct XNode {
@@ -27,6 +29,11 @@ pub struct XNode {
     attrs: BTreeMap<String, String>,
     children: Vec<XNode>,
     text: String,
+    /// The directory of the XML file this node was parsed from -
+    /// needed only to resolve `<script src="../relative.js">` paths
+    /// (mirrors `<include>`'s own path resolution). `Arc` because
+    /// every node from one file shares the identical path.
+    source_dir: Arc<Path>,
 }
 
 impl XNode {
@@ -43,9 +50,14 @@ impl XNode {
     pub fn text(&self) -> &str {
         &self.text
     }
+    /// Directory of the source file this node was parsed from, for
+    /// resolving `<script src="...">` relative paths.
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
+    }
 }
 
-pub fn from_roxmltree(node: roxmltree::Node) -> XNode {
+pub fn from_roxmltree(node: roxmltree::Node, source_dir: &Arc<Path>) -> XNode {
     let tag = node.tag_name().name().to_string();
     let attrs = node
         .attributes()
@@ -55,7 +67,7 @@ pub fn from_roxmltree(node: roxmltree::Node) -> XNode {
     let mut text = String::new();
     for child in node.children() {
         if child.is_element() {
-            children.push(from_roxmltree(child));
+            children.push(from_roxmltree(child, source_dir));
         } else if let Some(t) = child.text() {
             text.push_str(t);
         }
@@ -65,7 +77,12 @@ pub fn from_roxmltree(node: roxmltree::Node) -> XNode {
         attrs,
         children,
         text,
+        source_dir: source_dir.clone(),
     }
+}
+
+pub fn arc_dir(path: &Path) -> Arc<Path> {
+    Arc::from(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +137,7 @@ fn substitute_children(
                     .collect(),
                 children: substitute_children(&node.children, vars, ref_children),
                 text: substitute_string(&node.text, vars),
+                source_dir: node.source_dir.clone(),
             });
         }
     }
@@ -179,12 +197,14 @@ fn expand_refs_depth(
                     attrs,
                     children,
                     text,
+                    source_dir,
                 } = node;
                 vec![XNode {
                     tag,
                     attrs,
                     children: expand_refs_depth(children, macros, warnings, depth + 1),
                     text,
+                    source_dir,
                 }]
             }
         })
@@ -197,10 +217,11 @@ mod tests {
 
     fn parse(xml: &str) -> Vec<XNode> {
         let doc = roxmltree::Document::parse(xml).unwrap();
+        let dir = arc_dir(Path::new("test.xml"));
         doc.root_element()
             .children()
             .filter(roxmltree::Node::is_element)
-            .map(from_roxmltree)
+            .map(|n| from_roxmltree(n, &dir))
             .collect()
     }
 

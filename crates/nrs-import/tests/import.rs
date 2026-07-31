@@ -159,3 +159,44 @@ fn role_credit_generates_a_weighted_contains_relation() {
         "artist should have borrowed a nonzero share"
     );
 }
+
+/// End-to-end through build_snapshot: the exact Koikake.xml pattern
+/// (a <script> inside an <aei> splitting the impact's contribution
+/// between the entry itself and a fixed external id) must produce two
+/// real Impacts, one per contributor, both scoring finitely.
+#[cfg(feature = "scripting")]
+#[test]
+fn script_split_contributors_reach_the_snapshot() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="A-MAL-1" title="A">
+                <aei base="0.5" emotions="MP">
+                    <script>
+                        this.value[0].contributors.set(this.parent.entry.value.id, this.root.context.api.newScalarMatrix(0.7));
+                        this.value[0].contributors.set("V-VNDB-1", this.root.context.api.newScalarMatrix(0.3));
+                    </script>
+                </aei>
+            </entry>
+            <entry id="V-VNDB-1" title="V" />
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+    let (snapshot, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(snapshot.impacts.len(), 2);
+
+    let a = EntryId("A-MAL-1".into());
+    let v = EntryId("V-VNDB-1".into());
+    assert!(snapshot.impacts.iter().any(|i| i.target == a));
+    assert!(snapshot.impacts.iter().any(|i| i.target == v));
+
+    let scores = score(&snapshot, &params());
+    for (entry, value) in &scores.values {
+        assert!(value.is_finite(), "{entry:?} scored {value}");
+    }
+    assert!(scores.values[&a] != 0.0);
+    assert!(scores.values[&v] != 0.0);
+}

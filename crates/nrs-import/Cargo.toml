@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+boa_engine = { version = "0.21.1", optional = true }
 nrs-core = { path = "../nrs-core" }
 roxmltree = "0.21.1"
+serde_json = { version = "1.0.151", optional = true }
 time = { version = "0.3.54", features = ["parsing", "macros"] }
 
 [features]
-scripting = []
+scripting = ["dep:boa_engine", "dep:serde_json"]

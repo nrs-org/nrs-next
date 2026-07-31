@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use time::Date;
 
+use crate::script::ScriptEngine;
 use crate::xtree::{self, XNode};
 
 #[derive(Debug)]
@@ -232,7 +233,7 @@ fn collect_document_text(
     let xml =
         roxmltree::Document::parse(text).map_err(|e| ImportError::Xml(path.to_path_buf(), e))?;
     let root = xml.root_element();
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = xtree::arc_dir(path);
 
     for child in root.children().filter(roxmltree::Node::is_element) {
         if child.tag_name().name() == "include" {
@@ -243,7 +244,7 @@ fn collect_document_text(
                 collect_document_nodes(&dir.join(src), allow_include, out)?;
             }
         } else {
-            out.push(xtree::from_roxmltree(child));
+            out.push(xtree::from_roxmltree(child, &dir));
         }
     }
     Ok(())
@@ -256,9 +257,10 @@ fn build_document(nodes: Vec<XNode>, today: Date) -> ParsedDocument {
     let expanded = xtree::expand_refs(nodes, &macros, &mut warnings);
 
     let mut entries = Vec::new();
+    let mut engine = ScriptEngine::new();
     for node in &expanded {
         match node.tag_name() {
-            "entry" => parse_entry(node, today, &mut entries, &mut warnings),
+            "entry" => parse_entry(node, today, &mut entries, &mut warnings, &mut engine),
             "def" => {} // already collected by collect_macros
             other => warnings.push(format!("unexpected top-level element <{other}>, skipped")),
         }
@@ -271,6 +273,7 @@ fn parse_entry(
     today: Date,
     entries: &mut Vec<ParsedEntry>,
     warnings: &mut Vec<String>,
+    engine: &mut ScriptEngine,
 ) {
     let Some(id) = node.attribute("id") else {
         warnings.push(
@@ -294,6 +297,12 @@ fn parse_entry(
         music_var: None,
     };
 
+    // Entry-scope <script> children run once, in document order,
+    // sharing one `local` object across them - independent of where
+    // they sit among the other children (real scripts don't depend on
+    // this exact interleaving; see script.rs's module docs).
+    engine.run_entry_scripts(node, &id, warnings);
+
     for child in node.children() {
         let tag = child.tag_name();
         match tag {
@@ -307,7 +316,7 @@ fn parse_entry(
                         "{context_prefix}: nested <entry> missing required attribute 'id', skipped"
                     )),
                 }
-                parse_entry(child, today, entries, warnings);
+                parse_entry(child, today, entries, warnings, engine);
             }
             "source" => parse_source(child, &mut entry),
             "bestGirl" => entry.best_girl = child.attribute("name").map(String::from),
@@ -346,12 +355,11 @@ fn parse_entry(
                     feat: child.attribute("feat").map(|s| s == "true"),
                 });
             }
-            "queue" | "validatorSuppress" | "def" => {} // pure metadata / already-expanded macro decl
-            "script" => handle_script(child, &context_prefix, warnings),
+            "queue" | "validatorSuppress" | "def" | "script" => {} // pure metadata / already-expanded macro decl / already run above
             _ => {
                 if let Some(kind) = parse_impact_kind(child, tag, today, &context_prefix, warnings)
                 {
-                    let contributors = parse_contributors(child, &id);
+                    let contributors = parse_contributors(child, &id, engine, warnings);
                     entry.impacts.push(ParsedImpact { kind, contributors });
                 }
             }
@@ -359,20 +367,6 @@ fn parse_entry(
     }
 
     entries.push(entry);
-}
-
-#[cfg(not(feature = "scripting"))]
-fn handle_script(_node: &XNode, context: &str, warnings: &mut Vec<String>) {
-    warnings.push(format!(
-        "{context}: <script> skipped (build with the \"scripting\" feature to run it)"
-    ));
-}
-
-#[cfg(feature = "scripting")]
-fn handle_script(node: &XNode, context: &str, warnings: &mut Vec<String>) {
-    if let Err(e) = crate::script::run_entry_script(node) {
-        warnings.push(format!("{context}: <script> failed: {e}"));
-    }
 }
 
 fn parse_source(node: &XNode, entry: &mut ParsedEntry) {
@@ -433,8 +427,18 @@ fn parse_fraction(s: &str) -> f32 {
     }
 }
 
-fn parse_contributors(node: &XNode, self_id: &str) -> Vec<(String, f32)> {
-    let contributors: Vec<(String, f32)> = node
+/// `<contributor>` tags and `<script>`-set contributors share one map
+/// in the real engine (`impacts[0].contributors`, mutated by both in
+/// document order) - seed from `<contributor>` tags, let scripts add
+/// to/overwrite that, then fall back to the identity self-contributor
+/// only if the combined result is still empty, matching `acceptImpact`.
+fn parse_contributors(
+    node: &XNode,
+    self_id: &str,
+    engine: &mut ScriptEngine,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, f32)> {
+    let seed: Vec<(String, f32)> = node
         .children()
         .filter(|c| c.tag_name() == "contributor")
         .filter_map(|c| {
@@ -443,6 +447,7 @@ fn parse_contributors(node: &XNode, self_id: &str) -> Vec<(String, f32)> {
             Some((id, factor))
         })
         .collect();
+    let contributors = engine.run_impact_scripts(node, self_id, &seed, warnings);
     if contributors.is_empty() {
         vec![(self_id.to_string(), 1.0)]
     } else {
