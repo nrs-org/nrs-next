@@ -8,14 +8,16 @@
 //! silently dropped, since those indicate a real data or parsing
 //! problem rather than an intentional discard.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nrs_core::{
-    AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Palette, Snapshot, SourceId, Taxonomy,
+    AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Palette, RelKind, Relation, Snapshot,
+    SourceId, Taxonomy,
 };
 
 use crate::anchors;
 use crate::legacy;
+use crate::roles;
 use crate::xml::{ImpactKind, ParsedDocument, ParsedRelation};
 
 fn anchor_for_code(code: &str) -> Option<AnchorId> {
@@ -278,6 +280,67 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
                 continue;
             }
             relations.push(built);
+        }
+
+        if !parsed.roles.is_empty() {
+            // Multiple <role> tags for the same id merge (their terms
+            // concatenate, and weight_vector sums duplicate atomic
+            // roles) rather than overwriting each other.
+            let mut by_id: BTreeMap<&str, Vec<roles::RoleTerm>> = BTreeMap::new();
+            for role in &parsed.roles {
+                match roles::parse_role_expression(&role.roles_expr) {
+                    Ok(terms) => by_id.entry(role.id.as_str()).or_default().extend(terms),
+                    Err(e) => warnings.push(format!(
+                        "{context}: role expression '{}' for '{}': {e}",
+                        role.roles_expr, role.id
+                    )),
+                }
+            }
+
+            let mentions_feat = by_id
+                .values()
+                .any(|terms| roles::mentions_image_feat(terms));
+            let title_has_feat = parsed.title.contains("feat.") || parsed.title.contains("ft.");
+            let mut vars = roles::MusicVars {
+                feat: mentions_feat || title_has_feat,
+                ..Default::default()
+            };
+            if let Some(mv) = parsed.music_var {
+                if let Some(v) = mv.vocallyrics {
+                    vars.vocallyrics = v;
+                }
+                if let Some(v) = mv.lyricsmusic {
+                    vars.lyricsmusic = v;
+                }
+                if let Some(v) = mv.emolyrics {
+                    vars.emolyrics = v;
+                }
+                if let Some(v) = mv.arrange {
+                    vars.arrange = v;
+                }
+                if let Some(v) = mv.instperform {
+                    vars.instperform = v;
+                }
+                if let Some(v) = mv.feat {
+                    vars.feat = v;
+                }
+            }
+
+            for (contributor_id, terms) in by_id {
+                if !known_ids.contains(contributor_id) {
+                    warnings.push(format!(
+                        "{context}: role credit target '{contributor_id}' is not a known entry, dropped"
+                    ));
+                    continue;
+                }
+                let transform = roles::vector_to_transform(roles::weight_vector(&terms, &vars));
+                relations.push(Relation {
+                    kind: RelKind::Contains,
+                    from: EntryId(contributor_id.to_string()),
+                    to: EntryId(parsed.id.clone()),
+                    transform,
+                });
+            }
         }
     }
 

@@ -105,3 +105,57 @@ fn include_resolves_relative_to_the_including_file() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Shaped like the real `Cue.xml`: a track crediting an artist with
+/// `vocal+image`, both nested inside an album/franchise. The artist
+/// must end up borrowing a role-weighted (not full) share of the
+/// track via an auto-generated Contains relation, and the whole thing
+/// must still score finitely.
+#[test]
+fn role_credit_generates_a_weighted_contains_relation() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="M-ARTIST" title="AiRBLUE" />
+            <entry id="M-ALBUM" title="Album">
+                <entry id="$-1" title="Track">
+                    <music base="0.7" />
+                    <role id="M-ARTIST" roles="vocal+image" />
+                </entry>
+            </entry>
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+    let (snapshot, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let artist = EntryId("M-ARTIST".into());
+    let track = EntryId("$-1".into());
+    let role_relation = snapshot
+        .relations
+        .iter()
+        .find(|r| r.kind == RelKind::Contains && r.from == artist && r.to == track)
+        .expect("role-generated relation");
+
+    // vocal+image is not a full (Scalar(1.0)) borrow - it must be a
+    // genuine, non-trivial per-anchor weighting.
+    match &role_relation.transform {
+        Transform::Regional(map) => assert!(!map.is_empty()),
+        Transform::Scalar(v) => assert!(
+            (*v - 1.0).abs() > 1e-6,
+            "expected a partial credit, got full 1.0"
+        ),
+        Transform::Transport(_) => panic!("role weights should never produce a Transport"),
+    }
+
+    let scores = score(&snapshot, &params());
+    for (entry, value) in &scores.values {
+        assert!(value.is_finite(), "{entry:?} scored {value}");
+    }
+    assert!(
+        scores.values[&artist] != 0.0,
+        "artist should have borrowed a nonzero share"
+    );
+}

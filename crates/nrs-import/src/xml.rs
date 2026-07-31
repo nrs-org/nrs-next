@@ -3,18 +3,12 @@
 //!
 //! This produces an intermediate representation (`ParsedDocument`), not
 //! `nrs-core` types directly — `snapshot.rs` does that conversion using
-//! `legacy.rs`'s formulas. Nothing is silently dropped: anything this
+//! `legacy.rs`'s formulas, and `roles.rs` handles `<role>`/`<musicvar>`
+//! music-credit weighting. Nothing is silently dropped: anything this
 //! parser can't turn into a concrete value (an unresolved `<def>`
-//! template variable, a `<script>`/`<def>`/`<ref>` escape hatch, a
-//! `<role>`/`<musicvar>` music-credit annotation) is recorded in
-//! `ParsedDocument::warnings` rather than guessed at silently.
-//!
-//! Known, deliberate gap: `<role>` (per-contributor fractional credit,
-//! e.g. `roles="vocal+image"`) is parsed and carried (`ParsedEntry::roles`)
-//! but not converted to a weight — the composite role calculus
-//! (`DAH_entry_roles.ts`) is a large feature of its own, out of scope
-//! here. Every entry/impact/relation with roles present is warned
-//! about explicitly.
+//! template variable, a `<script>`/`<def>`/`<ref>` escape hatch) is
+//! recorded in `ParsedDocument::warnings` rather than guessed at
+//! silently.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -69,8 +63,22 @@ pub struct ParsedEntry {
     pub best_girl: Option<String>,
     pub impacts: Vec<ParsedImpact>,
     pub relations: Vec<ParsedRelation>,
-    /// Unconverted per-contributor role credit (see module docs).
+    /// Per-contributor role credit (`roles.rs` converts this into
+    /// auto-generated `Contains` relations toward each credited id).
     pub roles: Vec<ParsedRole>,
+    pub music_var: Option<ParsedMusicVar>,
+}
+
+/// `<musicvar>`: overrides to `roles::MusicVars`'s defaults. `None`
+/// fields fall back to the computed default.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ParsedMusicVar {
+    pub vocallyrics: Option<f32>,
+    pub lyricsmusic: Option<f32>,
+    pub emolyrics: Option<f32>,
+    pub arrange: Option<f32>,
+    pub instperform: Option<f32>,
+    pub feat: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +279,7 @@ fn parse_entry(
         impacts: Vec::new(),
         relations: Vec::new(),
         roles: Vec::new(),
+        music_var: None,
     };
 
     for child in node.children().filter(Node::is_element) {
@@ -303,13 +312,14 @@ fn parse_entry(
             "role" => {
                 if let Some(role_id) = child.attribute("id") {
                     let roles_expr = child.attribute("roles").unwrap_or("").to_string();
-                    warnings.push(format!(
-                        "{context_prefix}: <role id=\"{role_id}\" roles=\"{roles_expr}\"/> carried but not converted (role weight calculus unimplemented)"
-                    ));
                     entry.roles.push(ParsedRole {
                         id: role_id.to_string(),
                         roles_expr,
                     });
+                } else {
+                    warnings.push(format!(
+                        "{context_prefix}: <role> missing required attribute 'id', skipped"
+                    ));
                 }
             }
             "remix" | "featureMusic" | "killedBy" => {
@@ -317,7 +327,17 @@ fn parse_entry(
                     entry.relations.push(relation);
                 }
             }
-            "musicvar" | "queue" | "validatorSuppress" => {} // pure metadata / role-calculus inputs only
+            "musicvar" => {
+                entry.music_var = Some(ParsedMusicVar {
+                    vocallyrics: child.attribute("vocallyrics").and_then(|s| s.parse().ok()),
+                    lyricsmusic: child.attribute("lyricsmusic").and_then(|s| s.parse().ok()),
+                    emolyrics: child.attribute("emolyrics").and_then(|s| s.parse().ok()),
+                    arrange: child.attribute("arrange").and_then(|s| s.parse().ok()),
+                    instperform: child.attribute("instperform").and_then(|s| s.parse().ok()),
+                    feat: child.attribute("feat").map(|s| s == "true"),
+                });
+            }
+            "queue" | "validatorSuppress" => {} // pure metadata
             "script" | "def" | "ref" => warnings.push(format!(
                 "{context_prefix}: unsupported <{tag}> element, skipped (not interpretable)"
             )),
@@ -950,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn role_is_carried_and_warned_about() {
+    fn role_is_carried() {
         let doc = parse_str(
             r#"<document>
                 <entry id="A-1" title="A"><role id="M-2" roles="vocal+image" /></entry>
@@ -966,7 +986,22 @@ mod tests {
                 roles_expr: "vocal+image".into()
             }]
         );
-        assert!(doc.warnings.iter().any(|w| w.contains("not converted")));
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+    }
+
+    #[test]
+    fn musicvar_is_parsed() {
+        let doc = parse_str(
+            r#"<document>
+                <entry id="A-1" title="A"><musicvar feat="true" arrange="0.75" /></entry>
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        let mv = entry(&doc, "A-1").music_var.unwrap();
+        assert_eq!(mv.feat, Some(true));
+        assert_eq!(mv.arrange, Some(0.75));
+        assert_eq!(mv.vocallyrics, None);
     }
 
     #[test]

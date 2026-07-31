@@ -26,7 +26,7 @@ fn main() {
     let role_count: usize = doc.entries.iter().map(|e| e.roles.len()).sum();
 
     println!(
-        "entries: {}  impacts: {}  relations: {}  roles(unconverted): {}  warnings: {}",
+        "entries: {}  impacts: {}  relations: {}  role credits: {}  warnings: {}",
         doc.entries.len(),
         impact_count,
         relation_count,

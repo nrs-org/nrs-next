@@ -6,6 +6,7 @@
 
 pub mod anchors;
 pub mod legacy;
+pub mod roles;
 pub mod snapshot;
 pub mod xml;
 
