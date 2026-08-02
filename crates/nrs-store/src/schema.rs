@@ -33,7 +33,7 @@ CREATE INDEX idx_impact_atom_impact ON impact_atom(impact);
 
 CREATE TABLE relation (
     id        TEXT PRIMARY KEY,
-    kind      TEXT NOT NULL,            -- contains | remix | feature_music | killed_by
+    kind      TEXT NOT NULL,            -- contains | credit | remix | feature_music | killed_by
     from_e    TEXT NOT NULL REFERENCES entry(id),
     to_e      TEXT NOT NULL REFERENCES entry(id),
     transform TEXT NOT NULL             -- JSON: Scalar | Regional | Transport

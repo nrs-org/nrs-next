@@ -220,6 +220,38 @@ fn opening_a_file_path_creates_schema_and_persists() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn every_relkind_round_trips_through_its_text_column() {
+    let mut store = Store::open_in_memory().unwrap();
+    let a = store.add_entry("music", "a", None).unwrap();
+    let b = store.add_entry("music", "b", None).unwrap();
+
+    for kind in [
+        RelKind::Contains,
+        RelKind::Credit,
+        RelKind::Remix,
+        RelKind::FeatureMusic,
+        RelKind::KilledBy,
+    ] {
+        store
+            .add_relation(kind, &a, &b, &Transform::Scalar(0.5))
+            .unwrap();
+    }
+
+    let (snap, _) = store.load_snapshot().unwrap();
+    let kinds: Vec<RelKind> = snap.relations.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds.len(), 5);
+    for kind in [
+        RelKind::Contains,
+        RelKind::Credit,
+        RelKind::Remix,
+        RelKind::FeatureMusic,
+        RelKind::KilledBy,
+    ] {
+        assert!(kinds.contains(&kind), "{kind:?} did not round-trip");
+    }
+}
+
 fn tempdir_path() -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("nrs-store-test-{}", ulid::Ulid::new()));

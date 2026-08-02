@@ -85,6 +85,34 @@ fn parses_and_scores_a_franchise_shaped_document() {
     assert!(scores.values[&franchise] != 0.0);
 }
 
+/// The two works share the franchise as their nested-Contains container,
+/// so `derive_taxonomy` must place them as siblings under it -- and that
+/// must actually change scoring (k_src going live for the franchise's
+/// `nei`, which borrows from both), not just sit unused in the Snapshot.
+#[test]
+fn contains_relations_populate_taxonomy_and_change_scoring() {
+    let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
+    let (snapshot, conversion_warnings) = build_snapshot(&doc);
+    assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
+
+    let franchise = SourceId("F-VGMDB-1018".into());
+    let work_a = SourceId("A-MAL-2167".into());
+    let work_b = SourceId("A-MAL-4181".into());
+    assert_eq!(snapshot.taxonomy.parent.get(&work_a), Some(&franchise));
+    assert_eq!(snapshot.taxonomy.parent.get(&work_b), Some(&franchise));
+
+    let mut without_taxonomy = snapshot.clone();
+    without_taxonomy.taxonomy = Taxonomy::default();
+
+    let with = score(&snapshot, &params());
+    let without = score(&without_taxonomy, &params());
+    let franchise_entry = EntryId("F-VGMDB-1018".into());
+    assert_ne!(
+        with.values[&franchise_entry], without.values[&franchise_entry],
+        "k_src should be live now that Contains-derived taxonomy is populated"
+    );
+}
+
 /// Roadmap phase 3's "-> nrs.db" half (INFRA.md §12): the same franchise
 /// fixture, written into a store and reloaded, must score identically to
 /// scoring the freshly-built in-memory `Snapshot` directly.
@@ -133,10 +161,11 @@ fn include_resolves_relative_to_the_including_file() {
 /// Shaped like the real `Cue.xml`: a track crediting an artist with
 /// `vocal+image`, both nested inside an album/franchise. The artist
 /// must end up borrowing a role-weighted (not full) share of the
-/// track via an auto-generated Contains relation, and the whole thing
-/// must still score finitely.
+/// track via an auto-generated Credit relation (not Contains -- role
+/// credits aren't structural containment, see `RelKind`'s doc comment),
+/// and the whole thing must still score finitely.
 #[test]
-fn role_credit_generates_a_weighted_contains_relation() {
+fn role_credit_generates_a_weighted_credit_relation() {
     let doc = parse_str(
         r#"<document>
             <entry id="M-ARTIST" title="AiRBLUE" />
@@ -167,7 +196,7 @@ fn role_credit_generates_a_weighted_contains_relation() {
     let role_relation = snapshot
         .relations
         .iter()
-        .find(|r| r.kind == RelKind::Contains && r.from == artist && r.to == track)
+        .find(|r| r.kind == RelKind::Credit && r.from == artist && r.to == track)
         .expect("role-generated relation");
 
     // vocal+image is not a full (Scalar(1.0)) borrow - it must be a

@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 
 use nrs_core::{
     Anchor, AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, KFeatMatrix, Palette,
-    Params, Relation, Snapshot, SourceId, Taxonomy, TimeSupport,
+    Params, Relation, Snapshot, SourceId, TimeSupport,
 };
 
 use crate::error::Result;
@@ -15,17 +15,17 @@ use crate::relkind::rel_kind_from_str;
 use crate::Store;
 
 impl Store {
-    /// Loads the whole scoring substrate. `taxonomy` is left empty
-    /// (`Taxonomy::default()`): deriving deepest-shared-ancestor from
-    /// `Contains` relations isn't implemented anywhere yet — `nrs-import`'s
-    /// `build_snapshot` leaves it empty too — so this stays in parity
-    /// rather than inventing derivation the rest of the system doesn't do.
+    /// Loads the whole scoring substrate. `taxonomy` is derived from the
+    /// loaded `Contains` relations (`nrs_core::derive_taxonomy`) rather
+    /// than stored — INFRA.md §5.1: "the taxonomy for `k_src`... needs
+    /// no separate table".
     pub fn load_snapshot(&self) -> Result<(Snapshot, Params)> {
         let entries = self.load_entries()?;
         let impacts = self.load_impacts()?;
         let relations = self.load_relations()?;
         let palette = self.load_palette()?;
         let params = self.load_params(&palette.k_feat)?;
+        let taxonomy = nrs_core::derive_taxonomy(&relations);
 
         Ok((
             Snapshot {
@@ -33,7 +33,7 @@ impl Store {
                 impacts,
                 relations,
                 palette,
-                taxonomy: Taxonomy::default(),
+                taxonomy,
             },
             params,
         ))

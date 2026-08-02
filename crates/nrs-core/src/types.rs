@@ -69,11 +69,27 @@ pub enum TimeSupport {
     Tail { peak: f32, lambda: f32, cutoff: f32 },
 }
 
-/// Relation kinds (INFRA.md §5.1 `relation.kind`).
+/// Relation kinds (INFRA.md §5.1 `relation.kind`). Not read by the
+/// scoring math itself (`measure`/`solve`/`redundancy` only ever look at
+/// `from`/`to`/`transform`) — this is a semantic label for downstream
+/// consumers like [`crate::derive_taxonomy`] and any future audit/explain
+/// UI, not part of the redundancy computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RelKind {
+    /// Genuine structural containment: a franchise/album nested around
+    /// its works/tracks (nested XML entries or an explicit `<contains>`
+    /// tag). Taxonomically load-bearing — `derive_taxonomy` builds the
+    /// `k_src` ancestor tree from exactly these.
     Contains,
+    /// A contributor (artist, writer, ...) borrowing a share of a work
+    /// they're credited on. Same borrow mechanics as `Contains` (the
+    /// `transform` is solved identically either way — see `solve.rs`),
+    /// but *not* structural containment: a prolific contributor can have
+    /// many of these pointing at unrelated works, so `derive_taxonomy`
+    /// ignores them rather than treating a contributor as every credited
+    /// work's taxonomic parent.
+    Credit,
     Remix,
     FeatureMusic,
     KilledBy,

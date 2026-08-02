@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use nrs_core::{
     AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Palette, RelKind, Relation, Snapshot,
-    SourceId, Taxonomy,
+    SourceId,
 };
 
 use crate::anchors;
@@ -335,7 +335,7 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
                 }
                 let transform = roles::vector_to_transform(roles::weight_vector(&terms, &vars));
                 relations.push(Relation {
-                    kind: RelKind::Contains,
+                    kind: RelKind::Credit,
                     from: EntryId(contributor_id.to_string()),
                     to: EntryId(parsed.id.clone()),
                     transform,
@@ -344,6 +344,7 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
         }
     }
 
+    let taxonomy = nrs_core::derive_taxonomy(&relations);
     let snapshot = Snapshot {
         entries,
         impacts,
@@ -352,7 +353,7 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
             anchors: Vec::new(),
             k_feat: Default::default(),
         },
-        taxonomy: Taxonomy::default(),
+        taxonomy,
     };
     (snapshot, warnings)
 }

@@ -7,11 +7,13 @@ mod linalg;
 mod measure;
 mod redundancy;
 mod solve;
+mod taxonomy;
 pub mod types;
 
 use rayon::prelude::*;
 
 pub use audit::{audit_monotonicity, AuditReport, InsertionMargin};
+pub use taxonomy::derive_taxonomy;
 pub use types::*;
 
 /// INFRA.md §4.3, phases 1-4: build measures, solve relations, apply the
