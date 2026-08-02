@@ -29,12 +29,18 @@ type Node = (EntryId, AnchorId);
 /// (fractional powers of a non-positive base are undefined/complex)
 /// by leaving the weight unscaled — relation weights are meant to be
 /// borrow fractions in `(0, 1]`, so this never triggers on real data.
-fn scale_weight(w: f32, q: f32, scaling: RelationScaling) -> f32 {
+fn scale_weight(w: f32, q: f32, scaling: RelationScaling) -> f64 {
+    // In f64: `w^(1/q)` at low q drives a borrow weight far below f32's
+    // ~1e-38 floor (e.g. 0.04^(1/0.05) ≈ 1e-33, and chains multiply
+    // those together during the solve), where f32 would flush it to an
+    // exact zero and silently drop the borrow. f64's ~1e-308 range keeps
+    // it a real number until the final quantisation back to f32.
+    let w = f64::from(w);
     match scaling {
         RelationScaling::Fixed => w,
         RelationScaling::PowQ => {
             if w > 0.0 && q > 0.0 {
-                w.powf(1.0 / q)
+                w.powf(1.0 / f64::from(q))
             } else {
                 w
             }
@@ -52,7 +58,7 @@ fn transform_edges(
     active_anchors: &BTreeSet<AnchorId>,
     q: f32,
     scaling: RelationScaling,
-) -> Vec<(AnchorId, AnchorId, f32)> {
+) -> Vec<(AnchorId, AnchorId, f64)> {
     let scale = |w: f32| scale_weight(w, q, scaling);
     match transform {
         Transform::Scalar(c) => active_anchors
@@ -86,7 +92,7 @@ fn intern(node: Node, index: &mut BTreeMap<Node, usize>, nodes: &mut Vec<Node>) 
 /// points to) means: if there is an edge `u -> v`, `v`'s component
 /// appears no later than `u`'s. That is exactly "resolve dependencies
 /// before dependents", so no separate topological sort is needed.
-fn tarjan_sccs(adj: &BTreeMap<usize, BTreeMap<usize, f32>>, node_count: usize) -> Vec<Vec<usize>> {
+fn tarjan_sccs(adj: &BTreeMap<usize, BTreeMap<usize, f64>>, node_count: usize) -> Vec<Vec<usize>> {
     struct State {
         counter: usize,
         index: Vec<Option<usize>>,
@@ -96,7 +102,7 @@ fn tarjan_sccs(adj: &BTreeMap<usize, BTreeMap<usize, f32>>, node_count: usize) -
         sccs: Vec<Vec<usize>>,
     }
 
-    fn strongconnect(v: usize, adj: &BTreeMap<usize, BTreeMap<usize, f32>>, st: &mut State) {
+    fn strongconnect(v: usize, adj: &BTreeMap<usize, BTreeMap<usize, f64>>, st: &mut State) {
         st.index[v] = Some(st.counter);
         st.lowlink[v] = st.counter;
         st.counter += 1;
@@ -150,11 +156,11 @@ fn tarjan_sccs(adj: &BTreeMap<usize, BTreeMap<usize, f32>>, node_count: usize) -
 /// away as a contraction) is left as a zero contribution rather than
 /// panicking.
 #[allow(clippy::needless_range_loop)] // row/col indices into two matrices at once
-fn solve_dense(mat: &[Vec<f32>], rhs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+fn solve_dense(mat: &[Vec<f64>], rhs: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let k = mat.len();
     let m = rhs.first().map_or(0, Vec::len);
-    let mut a: Vec<Vec<f32>> = mat.to_vec();
-    let mut b: Vec<Vec<f32>> = rhs.to_vec();
+    let mut a: Vec<Vec<f64>> = mat.to_vec();
+    let mut b: Vec<Vec<f64>> = rhs.to_vec();
 
     for col in 0..k {
         let mut pivot_row = col;
@@ -187,7 +193,7 @@ fn solve_dense(mat: &[Vec<f32>], rhs: &[Vec<f32>]) -> Vec<Vec<f32>> {
         }
     }
 
-    let mut x = vec![vec![0.0f32; m]; k];
+    let mut x = vec![vec![0.0f64; m]; k];
     for row in (0..k).rev() {
         for c in 0..m {
             let mut sum = b[row][c];
@@ -223,7 +229,7 @@ pub(crate) fn solve_relations(
     let mut node_index: BTreeMap<Node, usize> = BTreeMap::new();
     let mut nodes: Vec<Node> = Vec::new();
     // adjacency[u] = { v: accumulated weight of edges u -> v }
-    let mut adj: BTreeMap<usize, BTreeMap<usize, f32>> = BTreeMap::new();
+    let mut adj: BTreeMap<usize, BTreeMap<usize, f64>> = BTreeMap::new();
 
     for (entry, measure) in &measures {
         for (_, anchor) in measure.keys() {
@@ -251,13 +257,15 @@ pub(crate) fn solve_relations(
         }
     }
 
-    // Own (pre-relation) mass at each node, broken out by source.
-    let mut resolved: Vec<BTreeMap<SourceId, f32>> = vec![BTreeMap::new(); nodes.len()];
+    // Own (pre-relation) mass at each node, broken out by source. Carried
+    // in f64 through the whole borrow solve; only quantised back to the
+    // measure's f32 at the very end.
+    let mut resolved: Vec<BTreeMap<SourceId, f64>> = vec![BTreeMap::new(); nodes.len()];
     for (i, (entry, anchor)) in nodes.iter().enumerate() {
         if let Some(measure) = measures.get(entry) {
             for ((source, a), mass) in measure {
                 if a == anchor {
-                    resolved[i].insert(source.clone(), *mass);
+                    resolved[i].insert(source.clone(), f64::from(*mass));
                 }
             }
         }
@@ -267,8 +275,8 @@ pub(crate) fn solve_relations(
         let k = scc.len();
         let local: BTreeMap<usize, usize> = scc.iter().enumerate().map(|(l, &g)| (g, l)).collect();
 
-        let mut internal = vec![vec![0.0f32; k]; k];
-        let mut rhs_map: Vec<BTreeMap<SourceId, f32>> =
+        let mut internal = vec![vec![0.0f64; k]; k];
+        let mut rhs_map: Vec<BTreeMap<SourceId, f64>> =
             (0..k).map(|l| resolved[scc[l]].clone()).collect();
 
         for (l, &g) in scc.iter().enumerate() {
@@ -293,14 +301,14 @@ pub(crate) fn solve_relations(
             set.into_iter().collect()
         };
 
-        let mat: Vec<Vec<f32>> = (0..k)
+        let mat: Vec<Vec<f64>> = (0..k)
             .map(|i| {
                 (0..k)
                     .map(|j| (if i == j { 1.0 } else { 0.0 }) - internal[i][j])
                     .collect()
             })
             .collect();
-        let rhs: Vec<Vec<f32>> = rhs_map
+        let rhs: Vec<Vec<f64>> = rhs_map
             .iter()
             .map(|row| {
                 sources
@@ -330,10 +338,17 @@ pub(crate) fn solve_relations(
         .collect();
     for (i, (entry, anchor)) in nodes.into_iter().enumerate() {
         for (source, mass) in &resolved[i] {
-            if *mass != 0.0 {
+            // Quantise the f64 solve result back to the measure's f32. A
+            // borrow smaller than f32's floor collapses to 0 here, but by
+            // now it is genuinely negligible (its downstream contribution
+            // `~mass^q` is also vanishing); the point of the f64 solve was
+            // to keep it a real number *through* the elimination so it
+            // wasn't lost to a premature underflow mid-computation.
+            let mass = *mass as f32;
+            if mass != 0.0 {
                 out.entry(entry.clone())
                     .or_default()
-                    .insert((source.clone(), anchor.clone()), *mass);
+                    .insert((source.clone(), anchor.clone()), mass);
             }
         }
     }

@@ -145,12 +145,38 @@ pub struct KSrcLevels {
     pub levels: [f32; 5],
 }
 
-/// Degree-1 vs degree-q homogeneity of the redundancy functional
-/// (notes §7.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which redundancy functional to score with. The first two are the
+/// per-cell additive forms (notes §7.2, degree-1 vs degree-q
+/// homogeneity); `Spectral` is the bounded-slope spectral value
+/// (redesign-tex `spectral-bounded-slope.tex`), a structurally
+/// different construction that reads the spectrum of the mass-weighted
+/// kernel rather than a per-cell crowding sum.
+///
+/// `Eq` is intentionally not derived: `Spectral` carries an `f32`
+/// tuning constant, and `Params` (its only embedder) needs only
+/// `PartialEq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Homogeneity {
     Degree1,
     DegreeQ,
+    /// Score via the eigenvalues `sigma_k` of the mass-weighted kernel
+    /// `G = M^{1/2} K M^{1/2}` with the concave, bounded-origin-slope
+    /// gauge `g(t) = beta * ln(1 + t/beta)`: `V = sum_k g(sigma_k)`.
+    ///
+    /// Unlike `DegreeQ` this is unconditionally monotone and exactly
+    /// splitting-invariant; unlike the Schatten spectral form it stays
+    /// finite under fixed-spread refinement, because `g` has finite
+    /// slope at the origin. It gives up exact degree-1 homogeneity
+    /// (which `DegreeQ` also lacks) — provably the price of that
+    /// convergence (see the note's impossibility theorem).
+    ///
+    /// `beta` is the saturation scale, in mass units: `beta -> inf`
+    /// recovers the kernel-blind `sum |mass|`, smaller `beta` sharpens
+    /// the redundancy discount. Overall output scale is left to the
+    /// downstream `calibration`, so there is no separate `alpha`.
+    Spectral {
+        beta: f32,
+    },
 }
 
 /// Monotone calibration `g`: piecewise-linear through sorted `(v, s)`

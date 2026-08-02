@@ -2,11 +2,14 @@
 //! `score`/`explain` are the entire contract, everything else is the
 //! plain data they take and return.
 
+mod audit;
+mod linalg;
 mod measure;
 mod redundancy;
 mod solve;
 pub mod types;
 
+pub use audit::{audit_monotonicity, AuditReport, InsertionMargin};
 pub use types::*;
 
 /// INFRA.md §4.3, phases 1-4: build measures, solve relations, apply the

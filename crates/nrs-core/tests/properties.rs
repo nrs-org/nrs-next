@@ -467,6 +467,61 @@ fn explain_agrees_with_score_and_contributions_sum_to_value() {
     );
 }
 
+/// The `Homogeneity::Spectral` mode is wired through the whole public
+/// pipeline (build → solve → value → calibrate), and its `explain`
+/// breakdown obeys the same contract: contributions sum to the value,
+/// and `score` agrees with `explain`.
+#[test]
+fn spectral_mode_flows_through_score_and_explain() {
+    let e = EntryId("e".into());
+    let mut taxonomy = Taxonomy::default();
+    taxonomy
+        .parent
+        .insert(SourceId("char1".into()), SourceId("parent".into()));
+    taxonomy
+        .parent
+        .insert(SourceId("char2".into()), SourceId("parent".into()));
+
+    let snap = Snapshot {
+        entries: vec![entry("e")],
+        impacts: vec![Impact {
+            id: ImpactId("i".into()),
+            target: e.clone(),
+            atoms: vec![
+                moment("char1", "gut-punch", 2.0),
+                moment("char2", "gut-punch", 3.0),
+            ],
+        }],
+        relations: vec![],
+        palette: palette(),
+        taxonomy,
+    };
+
+    let mut p = params(0.5);
+    p.homogeneity = Homogeneity::Spectral { beta: 2.0 };
+
+    let explanation = explain(&snap, &p, e.clone());
+    assert_eq!(explanation.contributions.len(), 2);
+    let summed: f32 = explanation
+        .contributions
+        .iter()
+        .map(|c| c.contribution)
+        .sum();
+    assert!(
+        (summed - explanation.value).abs() < 1e-5,
+        "{summed} vs {}",
+        explanation.value
+    );
+    assert!(explanation.value > 0.0, "V={}", explanation.value);
+
+    let scored = score(&snap, &p).values[&e];
+    assert!(
+        (scored - explanation.value).abs() < 1e-5,
+        "{scored} vs {}",
+        explanation.value
+    );
+}
+
 /// Coincident opposite-signed atoms merge to net zero mass (they're
 /// literally the same cell), which must drop out of both `explain`'s
 /// breakdown and `score`'s output cleanly — no NaNs or leftover
@@ -701,5 +756,49 @@ fn breadth_limit_matches_k_plus_n_fixed_and_k_plus_wn_powq() {
     assert!(
         v_borrower_powq < v_owner,
         "PowQ should preserve the sensible ordering: {v_borrower_powq} vs {v_owner}"
+    );
+}
+
+/// The relation solve runs in f64 internally (quantised to the measure's
+/// f32 only at the boundary), so a `PowQ` borrow at low q — whose scaled
+/// weight `w^(1/q)` and the products it feeds through Gaussian
+/// elimination sink well below f32's precision comfort zone — still
+/// resolves to its analytic mass instead of being degraded by
+/// single-precision rounding. Here `0.5^10 * 4 ≈ 3.9e-3` is small but
+/// f32-representable, and must come out exactly.
+#[test]
+fn powq_low_q_borrow_resolves_to_its_analytic_mass() {
+    let w = 0.5f32;
+    let q = 0.1f32;
+    let src_mass = 4.0f32;
+    let snap = Snapshot {
+        entries: vec![entry("source_entry"), entry("receiver")],
+        impacts: vec![Impact {
+            id: ImpactId("i".into()),
+            target: EntryId("source_entry".into()),
+            atoms: vec![moment("s", "x", src_mass)],
+        }],
+        relations: vec![Relation {
+            kind: RelKind::Remix,
+            from: EntryId("receiver".into()),
+            to: EntryId("source_entry".into()),
+            transform: Transform::Scalar(w),
+        }],
+        palette: palette(),
+        taxonomy: Taxonomy::default(),
+    };
+    let mut p = params(q);
+    p.relation_scaling = RelationScaling::PowQ;
+    let ex = explain(&snap, &p, EntryId("receiver".into()));
+    assert_eq!(
+        ex.contributions.len(),
+        1,
+        "receiver should hold one borrowed cell"
+    );
+    let expected = w.powf(1.0 / q) * src_mass; // 0.5^10 * 4
+    let got = ex.contributions[0].mass;
+    assert!(
+        (got - expected).abs() / expected < 1e-4,
+        "borrowed mass {got}, expected {expected}"
     );
 }

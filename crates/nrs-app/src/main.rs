@@ -87,10 +87,38 @@ struct ViewParams {
     dir: SortDir,
     #[serde(default)]
     rel: RelScaling,
+    #[serde(default)]
+    mode: Mode,
+    #[serde(default = "default_beta")]
+    beta: f32,
 }
 
 fn default_q() -> f32 {
     0.6
+}
+
+fn default_beta() -> f32 {
+    2.0
+}
+
+/// Which redundancy functional to score with. `q` still applies under
+/// both (it drives the relation borrow-solve, and is `DegreeQ`'s
+/// exponent); `beta` only bites under `Spectral`.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    #[default]
+    Degreeq,
+    Spectral,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Degreeq => "degreeq",
+            Mode::Spectral => "spectral",
+        }
+    }
 }
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq)]
@@ -135,14 +163,20 @@ impl RelScaling {
     }
 }
 
-fn params(rel: RelScaling) -> Params {
+fn params(rel: RelScaling, mode: Mode, beta: f32) -> Params {
+    let homogeneity = match mode {
+        Mode::Degreeq => Homogeneity::DegreeQ,
+        Mode::Spectral => Homogeneity::Spectral {
+            beta: beta.clamp(1e-3, 1e6),
+        },
+    };
     Params {
         q: 0.6,
         k_src_levels: KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         },
         k_feat: KFeatMatrix::default(),
-        homogeneity: Homogeneity::DegreeQ,
+        homogeneity,
         calibration: Isotonic::default(),
         relation_scaling: rel.to_core(),
     }
@@ -155,8 +189,17 @@ struct Row<'a> {
     value: f32,
 }
 
-fn rows(snapshot: &Snapshot, q: f32, sort: SortBy, dir: SortDir, rel: RelScaling) -> Vec<Row<'_>> {
-    let mut p = params(rel);
+#[allow(clippy::too_many_arguments)] // one flat view-state struct's worth of knobs
+fn rows(
+    snapshot: &Snapshot,
+    q: f32,
+    sort: SortBy,
+    dir: SortDir,
+    rel: RelScaling,
+    mode: Mode,
+    beta: f32,
+) -> Vec<Row<'_>> {
+    let mut p = params(rel, mode, beta);
     p.q = q.clamp(0.001, 4.0);
     let scores = nrs_core::score(snapshot, &p);
 
@@ -196,7 +239,15 @@ async fn index(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
-    let rows = rows(&state.snapshot, view.q, view.sort, view.dir, view.rel);
+    let rows = rows(
+        &state.snapshot,
+        view.q,
+        view.sort,
+        view.dir,
+        view.rel,
+        view.mode,
+        view.beta,
+    );
 
     let sort_link = |by: &str, label: &str| {
         let is_current = sort_by_name(view.sort) == by;
@@ -213,9 +264,11 @@ async fn index(
             " ▲"
         };
         format!(
-            "<a href=\"/?q={}&sort={by}&dir={next_dir}&rel={}\">{label}{arrow}</a>",
+            "<a href=\"/?q={}&sort={by}&dir={next_dir}&rel={}&mode={}&beta={}\">{label}{arrow}</a>",
             view.q,
             view.rel.name(),
+            view.mode.name(),
+            view.beta,
         )
     };
 
@@ -238,9 +291,16 @@ async fn index(
   td.store {{ color: #888; font-size: 0.85rem; }}
 </style></head><body>
 <h1>nrs scores</h1>
-<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}">download CSV</a></div>
+<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}&mode={}&beta={}">download CSV</a></div>
 <form method="get">
+  <label>mode:
+    <select name="mode">
+      <option value="degreeq" {}>degreeq (V = &Sigma; m&middot;c^(q-1))</option>
+      <option value="spectral" {}>spectral (V = &Sigma; &beta;&middot;ln(1+&sigma;/&beta;), monotone)</option>
+    </select>
+  </label>
   <label>q (redundancy exponent): <input type="number" name="q" value="{}" step="any" min="0.001" max="4"></label>
+  <label>&beta; (spectral saturation): <input type="number" name="beta" value="{}" step="any" min="0.001"></label>
   <label>relation scaling:
     <select name="rel">
       <option value="fixed" {}>fixed (spec default)</option>
@@ -259,7 +319,12 @@ async fn index(
         state.warnings.len(),
         view.q,
         view.rel.name(),
+        view.mode.name(),
+        view.beta,
+        if view.mode == Mode::Degreeq { "selected" } else { "" },
+        if view.mode == Mode::Spectral { "selected" } else { "" },
         view.q,
+        view.beta,
         if view.rel == RelScaling::Fixed { "selected" } else { "" },
         if view.rel == RelScaling::Powq { "selected" } else { "" },
         sort_by_name(view.sort),
@@ -308,7 +373,15 @@ async fn scores_csv(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
-    let rows = rows(&state.snapshot, view.q, view.sort, view.dir, view.rel);
+    let rows = rows(
+        &state.snapshot,
+        view.q,
+        view.sort,
+        view.dir,
+        view.rel,
+        view.mode,
+        view.beta,
+    );
 
     let mut csv = String::from("id,title,store,value\n");
     for row in &rows {
@@ -402,7 +475,15 @@ mod tests {
     #[test]
     fn rows_sort_by_value_descending_by_default() {
         let snap = tiny_snapshot();
-        let r = rows(&snap, 0.6, SortBy::Value, SortDir::Desc, RelScaling::Fixed);
+        let r = rows(
+            &snap,
+            0.6,
+            SortBy::Value,
+            SortDir::Desc,
+            RelScaling::Fixed,
+            Mode::Degreeq,
+            2.0,
+        );
         assert_eq!(r[0].id.0, "a"); // higher magnitude -> higher value
         assert_eq!(r[1].id.0, "b");
     }
@@ -410,8 +491,34 @@ mod tests {
     #[test]
     fn rows_sort_by_title_ascending() {
         let snap = tiny_snapshot();
-        let r = rows(&snap, 0.6, SortBy::Title, SortDir::Asc, RelScaling::Fixed);
+        let r = rows(
+            &snap,
+            0.6,
+            SortBy::Title,
+            SortDir::Asc,
+            RelScaling::Fixed,
+            Mode::Degreeq,
+            2.0,
+        );
         assert_eq!(r[0].title, "Apple");
         assert_eq!(r[1].title, "Zebra");
+    }
+
+    #[test]
+    fn spectral_mode_produces_finite_ordered_values() {
+        let snap = tiny_snapshot();
+        let r = rows(
+            &snap,
+            0.6,
+            SortBy::Value,
+            SortDir::Desc,
+            RelScaling::Fixed,
+            Mode::Spectral,
+            2.0,
+        );
+        assert!(r.iter().all(|row| row.value.is_finite()));
+        // Entry "a" (mass 5) still outranks "b" (mass 1) under spectral.
+        assert_eq!(r[0].id.0, "a");
+        assert!(r[0].value > r[1].value);
     }
 }

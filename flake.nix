@@ -22,6 +22,8 @@
           clippy
           sqlite
           pkg-config
+          uv
+          python3
         ];
 
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

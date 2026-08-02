@@ -120,45 +120,59 @@ fn generate_snapshot(n_leaf_entries: usize) -> Snapshot {
     }
 }
 
-fn params() -> Params {
+fn params(homogeneity: Homogeneity) -> Params {
     Params {
         q: 0.6,
         k_src_levels: KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         },
         k_feat: KFeatMatrix::default(),
-        homogeneity: Homogeneity::DegreeQ,
+        homogeneity,
         calibration: Isotonic::default(),
         relation_scaling: RelationScaling::Fixed,
     }
 }
 
+/// The two scoring functionals, benchmarked on identical snapshots: the
+/// per-cell additive `DegreeQ` (O(cells^2) per entry) vs the spectral
+/// `Spectral` (an eigendecomposition per entry per sign class).
+const MODES: &[(&str, Homogeneity)] = &[
+    ("degreeq", Homogeneity::DegreeQ),
+    ("spectral", Homogeneity::Spectral { beta: 2.0 }),
+];
+
 fn bench_score(c: &mut Criterion) {
     let mut group = c.benchmark_group("score");
-    let p = params();
     // 1600 matches the real dataset's rough entry count.
     for &n in &[100usize, 400, 1600] {
         let snapshot = generate_snapshot(n);
-        group.bench_with_input(BenchmarkId::from_parameter(n), &snapshot, |b, snap| {
-            b.iter(|| nrs_core::score(std::hint::black_box(snap), std::hint::black_box(&p)));
-        });
+        for &(name, homogeneity) in MODES {
+            let p = params(homogeneity);
+            group.bench_with_input(BenchmarkId::new(name, n), &snapshot, |b, snap| {
+                b.iter(|| nrs_core::score(std::hint::black_box(snap), std::hint::black_box(&p)));
+            });
+        }
     }
     group.finish();
 }
 
 fn bench_explain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("explain");
     let snapshot = generate_snapshot(1600);
-    let p = params();
     let target = snapshot.entries[snapshot.entries.len() / 2].id.clone();
-    c.bench_function("explain/1600", |b| {
-        b.iter(|| {
-            nrs_core::explain(
-                std::hint::black_box(&snapshot),
-                std::hint::black_box(&p),
-                target.clone(),
-            )
+    for &(name, homogeneity) in MODES {
+        let p = params(homogeneity);
+        group.bench_function(BenchmarkId::new(name, 1600), |b| {
+            b.iter(|| {
+                nrs_core::explain(
+                    std::hint::black_box(&snapshot),
+                    std::hint::black_box(&p),
+                    target.clone(),
+                )
+            });
         });
-    });
+    }
+    group.finish();
 }
 
 criterion_group!(benches, bench_score, bench_explain);
