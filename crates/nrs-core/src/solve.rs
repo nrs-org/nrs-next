@@ -290,9 +290,13 @@ pub(crate) fn solve_relations(
     for relation in relations {
         let from_entry = entries.intern(&relation.from);
         let to_entry = entries.intern(&relation.to);
-        for (dst_anchor, src_anchor, weight) in
-            transform_edges(&relation.transform, &active_anchors, &mut anchors, q, scaling)
-        {
+        for (dst_anchor, src_anchor, weight) in transform_edges(
+            &relation.transform,
+            &active_anchors,
+            &mut anchors,
+            q,
+            scaling,
+        ) {
             if weight == 0.0 {
                 continue;
             }

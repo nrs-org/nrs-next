@@ -36,7 +36,7 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
         .par_iter()
         .map(|&(entry, f)| {
             let mut src_index = redundancy::SourceIndex::new();
-            let (v, _) = redundancy::value(
+            let v = redundancy::value_scalar(
                 f,
                 &params.k_feat,
                 &snap.taxonomy,

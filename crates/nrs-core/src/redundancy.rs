@@ -24,9 +24,9 @@
 
 use std::collections::HashMap;
 
-use crate::linalg::householder_ql_eigen;
 #[cfg(feature = "faer-eigen")]
 use crate::linalg::faer_eigen;
+use crate::linalg::{householder_ql_eigen, householder_ql_eigenvalues};
 use crate::measure::Measure;
 use crate::types::{
     AnchorId, Contribution, Homogeneity, KFeatMatrix, KSrcLevels, SourceId, Taxonomy,
@@ -91,6 +91,17 @@ impl SourceIndex {
     /// distance-to-level mapping is a modelling choice pending `nrs-fit`
     /// (roadmap phase 6); this only needs to be monotone in "how far
     /// apart".
+    ///
+    /// Any combined distance `>= levels.len()` maps to the same last
+    /// ("unrelated") level as no match at all (the `.min(levels.len() -
+    /// 1)` clamp below), so the search below only ever needs to look
+    /// that far into each chain — bounding what would otherwise be a
+    /// full ancestor-chain scan (root-to-leaf, potentially much deeper
+    /// than `levels.len()` for a nested taxonomy) to a fixed, small
+    /// worst case. This matters once `spectral_class` stops skipping
+    /// `k_src` for most cross-anchor pairs (a populated `k_feat`), the
+    /// only production caller that's genuinely hot: `bucket_crowding`'s
+    /// depth-histogram trick already avoids calling this at all.
     pub(crate) fn k_src(
         &mut self,
         a: &SourceId,
@@ -105,8 +116,10 @@ impl SourceIndex {
         let ib = self.ensure_chain(taxonomy, b);
         let chain_a = self.chains[ia].as_ref().unwrap();
         let chain_b = self.chains[ib].as_ref().unwrap();
-        for (da, &node) in chain_a.iter().enumerate() {
-            if let Some(db) = chain_b.iter().position(|&n| n == node) {
+        let max_dist = levels.levels.len();
+        for (da, &node) in chain_a.iter().take(max_dist).enumerate() {
+            let searchable = &chain_b[..chain_b.len().min(max_dist - da)];
+            if let Some(db) = searchable.iter().position(|&n| n == node) {
                 let dist = da + db;
                 let idx = dist.saturating_sub(1).min(levels.levels.len() - 1);
                 return levels.levels[idx];
@@ -191,7 +204,10 @@ fn bucket_crowding(
                 let Some(&node) = chain_i.get(da) else {
                     break;
                 };
-                let hist = depth_hist.get(&node).copied().unwrap_or([0.0; MAX_K_SRC_DIST + 1]);
+                let hist = depth_hist
+                    .get(&node)
+                    .copied()
+                    .unwrap_or([0.0; MAX_K_SRC_DIST + 1]);
                 for db in 0..=(MAX_K_SRC_DIST - da) {
                     if da == 0 && db == 0 {
                         continue; // j == i, already the self term above
@@ -217,6 +233,117 @@ fn bucket_crowding(
         .collect()
 }
 
+type DepthHist = [f64; MAX_K_SRC_DIST + 1];
+
+/// The `depth_hist[node][e]` table `bucket_crowding` builds inline,
+/// factored out so `cross_bucket_crowding` below can build one from a
+/// source set *other* than the one it queries against.
+fn build_depth_hist(
+    sources: &[(&SourceId, f64)],
+    idx: &mut SourceIndex,
+    taxonomy: &Taxonomy,
+) -> HashMap<u32, DepthHist> {
+    let mut hist: HashMap<u32, DepthHist> = HashMap::with_capacity(sources.len() * 2);
+    for &(s, m) in sources {
+        let chain = idx.chain(taxonomy, s);
+        for (e, &node) in chain.iter().take(MAX_K_SRC_DIST + 1).enumerate() {
+            hist.entry(node).or_insert([0.0; MAX_K_SRC_DIST + 1])[e] += m;
+        }
+    }
+    hist
+}
+
+/// `sum_j k_src(i, j) * mass_j` for the source owning `chain`, against
+/// whatever source set `hist` (from `build_depth_hist`) was built
+/// from — the query half of `bucket_crowding`'s trick, generalized to
+/// a histogram that need not include `chain`'s own source at all.
+/// `total_mass` is `hist`'s full mass, for the saturated tail.
+///
+/// Distance 0 (`da == db == 0`) means `hist` genuinely contains the
+/// *same* `SourceId` `chain` belongs to — not a "this is me" case to
+/// special-case away, since caller and histogram can be entirely
+/// different cells (e.g. one atom's blend split across two anchors
+/// for the same source) — so it's scored at the exact `k_src(i,i) =
+/// 1.0` (`SourceIndex::k_src`'s own shortcut), not the `levels[dist -
+/// 1]` lookup every other distance uses.
+fn crowding_from_hist(
+    chain: &[u32],
+    hist: &HashMap<u32, DepthHist>,
+    total_mass: f64,
+    levels: &KSrcLevels,
+) -> f64 {
+    let saturated_level = f64::from(*levels.levels.last().unwrap());
+    let mut crowding = 0.0;
+    let mut accounted = 0.0;
+    let mut prev_hist: Option<DepthHist> = None;
+    for da in 0..=MAX_K_SRC_DIST {
+        let Some(&node) = chain.get(da) else {
+            break;
+        };
+        let node_hist = hist
+            .get(&node)
+            .copied()
+            .unwrap_or([0.0; MAX_K_SRC_DIST + 1]);
+        for db in 0..=(MAX_K_SRC_DIST - da) {
+            let claimed_by_shallower = if db >= 1 {
+                prev_hist.map_or(0.0, |h| h[db - 1])
+            } else {
+                0.0
+            };
+            let exact = (node_hist[db] - claimed_by_shallower).max(0.0);
+            if exact > 0.0 {
+                let dist = da + db;
+                let weight = if dist == 0 {
+                    1.0
+                } else {
+                    f64::from(levels.levels[dist.saturating_sub(1).min(levels.levels.len() - 1)])
+                };
+                crowding += weight * exact;
+                accounted += exact;
+            }
+        }
+        prev_hist = Some(node_hist);
+    }
+    let saturated = (total_mass - accounted).max(0.0);
+    crowding + saturated_level * saturated
+}
+
+/// Cross-anchor analogue of `bucket_crowding`: given two same-sign
+/// buckets on *different* anchors joined by a nonzero `k_feat` weight,
+/// returns `(crowding felt by `a` due to `b`, crowding felt by `b` due
+/// to `a`)` — same depth-histogram trick, just built from the other
+/// side instead of from the queried set itself, in `O((|a|+|b|) *
+/// MAX_K_SRC_DIST^2)` rather than the naive `O(|a|*|b|)`.
+fn cross_bucket_crowding(
+    a: &[(&SourceId, f64)],
+    b: &[(&SourceId, f64)],
+    idx: &mut SourceIndex,
+    taxonomy: &Taxonomy,
+    levels: &KSrcLevels,
+) -> (Vec<f64>, Vec<f64>) {
+    let total_a: f64 = a.iter().map(|&(_, m)| m).sum();
+    let total_b: f64 = b.iter().map(|&(_, m)| m).sum();
+    let hist_a = build_depth_hist(a, idx, taxonomy);
+    let hist_b = build_depth_hist(b, idx, taxonomy);
+
+    let crowd_a = a
+        .iter()
+        .map(|&(s, _)| {
+            let chain = idx.chain(taxonomy, s).to_vec();
+            crowding_from_hist(&chain, &hist_b, total_b, levels)
+        })
+        .collect();
+    let crowd_b = b
+        .iter()
+        .map(|&(s, _)| {
+            let chain = idx.chain(taxonomy, s).to_vec();
+            crowding_from_hist(&chain, &hist_a, total_a, levels)
+        })
+        .collect();
+
+    (crowd_a, crowd_b)
+}
+
 /// Self-inclusive, same-signed crowding `c_i = sum_j K(i,j) * |m_j|` for
 /// every cell in `cells`, in the same order — the shared crowding pass
 /// behind both `DegreeQ`'s value and `Spectral`'s per-cell breakdown
@@ -225,11 +352,14 @@ fn bucket_crowding(
 /// Split into two parts: same-anchor pairs (where `k_feat` is always the
 /// constant `1.0` diagonal, `KFeatMatrix::get`'s `a == b` fast path) go
 /// through `bucket_crowding`'s `O(bucket * MAX_K_SRC_DIST)` aggregation;
-/// any cross-anchor pairs with an explicitly configured nonzero `k_feat`
+/// cross-anchor pairs with an explicitly configured nonzero `k_feat`
 /// weight (sparse "only non-default pairs" by `KFeatMatrix`'s own
-/// contract, and empty in the live data today — `nrs-fit` hasn't landed)
-/// fall back to a direct pairwise addition on top, so this stays exact
-/// for any `k_feat`, not just today's empty one.
+/// contract) are handled per configured anchor pair via
+/// `cross_bucket_crowding`, so the cost scales with how many pairs are
+/// actually configured (a handful, from `nrs-fit`) rather than with
+/// `cells.len()^2` — the naive all-pairs fallback this replaced turned
+/// out to be a real 3-4x `score()` regression the moment `k_feat`
+/// stopped being empty (see `kfeat_covariance`'s perf note).
 /// A same-sign, same-anchor bucket entry: `(source, |mass|, original
 /// index into `cells`)`.
 type BucketEntry<'a> = (&'a SourceId, f64, usize);
@@ -258,18 +388,25 @@ fn all_crowdings(
         }
     }
 
-    if !k_feat.pairs.is_empty() {
-        for (i, &(source_i, anchor_i, mass_i)) in cells.iter().enumerate() {
-            for &(source_j, anchor_j, mass_j) in cells {
-                if anchor_i == anchor_j || mass_i.signum() != mass_j.signum() {
-                    continue; // same-anchor pairs are already covered above
-                }
-                let kf = k_feat.get(anchor_i, anchor_j);
-                if kf == 0.0 {
-                    continue;
-                }
-                let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
-                crowding[i] += f64::from(k) * f64::from(mass_j.abs());
+    for ((anchor_a, anchor_b), &kf) in &k_feat.pairs {
+        if kf == 0.0 {
+            continue;
+        }
+        for sign in [true, false] {
+            let (Some(bucket_a), Some(bucket_b)) = (
+                buckets.get(&(sign, anchor_a)),
+                buckets.get(&(sign, anchor_b)),
+            ) else {
+                continue;
+            };
+            let a: Vec<(&SourceId, f64)> = bucket_a.iter().map(|&(s, m, _)| (s, m)).collect();
+            let b: Vec<(&SourceId, f64)> = bucket_b.iter().map(|&(s, m, _)| (s, m)).collect();
+            let (crowd_a, crowd_b) = cross_bucket_crowding(&a, &b, idx, taxonomy, k_src_levels);
+            for (&(_, _, i), c) in bucket_a.iter().zip(&crowd_a) {
+                crowding[i] += f64::from(kf) * c;
+            }
+            for (&(_, _, i), c) in bucket_b.iter().zip(&crowd_b) {
+                crowding[i] += f64::from(kf) * c;
             }
         }
     }
@@ -372,6 +509,59 @@ pub(crate) fn value(
     (total, contributions)
 }
 
+/// Anchor-id-to-compact-index resolution for `k_feat`, built once per
+/// `spectral_value` call and reused across both sign classes:
+/// `KFeatMatrix::get`'s `BTreeMap<(AnchorId, AnchorId), f32>` has no
+/// borrowed-key query path for a tuple, so every lookup on the raw
+/// matrix clones both `AnchorId` `String`s — free to skip when `pairs`
+/// is empty (`get`'s own fast path), but `spectral_class`'s `G` build
+/// calls it for every cross-anchor cell pair, `O(cells^2)` per entry;
+/// once `pairs` is actually populated that clone cost dominates.
+/// Building this once per entry (not once per `score()` call — the
+/// index itself is tiny, `O(pairs.len())`, versus the per-entry `G`
+/// build it feeds) turns every later lookup into plain array indexing.
+struct KFeatIndex {
+    index: HashMap<AnchorId, u32>,
+    /// `n * n`, row-major; only anchors that appear in `k_feat.pairs`
+    /// are indexed at all (any other anchor can't have a nonzero
+    /// weight with anything, by `KFeatMatrix`'s own sparse contract).
+    matrix: Vec<f32>,
+    n: usize,
+}
+
+impl KFeatIndex {
+    fn build(k_feat: &KFeatMatrix) -> Self {
+        let mut index: HashMap<AnchorId, u32> = HashMap::new();
+        for (a, b) in k_feat.pairs.keys() {
+            let next = index.len() as u32;
+            index.entry(a.clone()).or_insert(next);
+            let next = index.len() as u32;
+            index.entry(b.clone()).or_insert(next);
+        }
+        let n = index.len();
+        let mut matrix = vec![0.0f32; n * n];
+        for ((a, b), &kf) in &k_feat.pairs {
+            let ia = index[a] as usize;
+            let ib = index[b] as usize;
+            matrix[ia * n + ib] = kf;
+            matrix[ib * n + ia] = kf;
+        }
+        Self { index, matrix, n }
+    }
+
+    /// Same contract as `KFeatMatrix::get`, without ever cloning an
+    /// `AnchorId`.
+    fn get(&self, a: &AnchorId, b: &AnchorId) -> f32 {
+        if a == b {
+            return 1.0;
+        }
+        let (Some(&ia), Some(&ib)) = (self.index.get(a), self.index.get(b)) else {
+            return 0.0;
+        };
+        self.matrix[ia as usize * self.n + ib as usize]
+    }
+}
+
 /// `Homogeneity::Spectral`: the bounded-slope spectral redundancy value
 /// (redesign-tex `spectral-bounded-slope.tex`). Rather than the per-cell
 /// sum `sum_i m_i c_i^{q-1}`, score the entry through the spectrum of its
@@ -413,6 +603,7 @@ fn spectral_value(
         .filter(|(_, m)| **m != 0.0)
         .map(|((s, a), m)| (s, a, *m))
         .collect();
+    let k_feat_idx = KFeatIndex::build(k_feat);
 
     // Per-cell contribution, indexed like `cells`; filled from each sign
     // class's spectral attribution, then emitted in `cells` order so the
@@ -422,7 +613,15 @@ fn spectral_value(
         let idxs: Vec<usize> = (0..cells.len())
             .filter(|&i| cells[i].2.signum() == sign)
             .collect();
-        let attrib = spectral_class(&cells, &idxs, k_feat, taxonomy, idx, k_src_levels, beta);
+        let attrib = spectral_class(
+            &cells,
+            &idxs,
+            &k_feat_idx,
+            taxonomy,
+            idx,
+            k_src_levels,
+            beta,
+        );
         // Positive class adds its log-volume, negative class subtracts.
         for (local, &global) in idxs.iter().enumerate() {
             contrib_by_cell[global] = f64::from(sign) * attrib[local];
@@ -462,7 +661,7 @@ fn spectral_value(
 fn spectral_class(
     cells: &[(&SourceId, &AnchorId, f32)],
     idxs: &[usize],
-    k_feat: &KFeatMatrix,
+    k_feat_idx: &KFeatIndex,
     taxonomy: &Taxonomy,
     idx: &mut SourceIndex,
     k_src_levels: &KSrcLevels,
@@ -472,29 +671,7 @@ fn spectral_class(
     if n == 0 {
         return Vec::new();
     }
-
-    // G_ab = sqrt(|m_a| |m_b|) * K(a, b), K = k_feat . k_src. `k_feat` is
-    // checked first and `k_src` skipped when it's already zero: with only
-    // a handful of anchors and (in the real data) an unpopulated
-    // `k_feat`, most `(anchor_i, anchor_j)` pairs are zero, so this
-    // avoids the bulk of `k_src`'s (still non-free, even memoized) chain
-    // lookups for pairs whose product is zero regardless.
-    let mut g = vec![vec![0.0f64; n]; n];
-    for a in 0..n {
-        let (s_a, an_a, m_a) = cells[idxs[a]];
-        for b in a..n {
-            let (s_b, an_b, m_b) = cells[idxs[b]];
-            let kf = k_feat.get(an_a, an_b);
-            let g_ab = if kf == 0.0 {
-                0.0
-            } else {
-                let k = f64::from(kf) * f64::from(idx.k_src(s_a, s_b, taxonomy, k_src_levels));
-                (f64::from(m_a.abs()) * f64::from(m_b.abs())).sqrt() * k
-            };
-            g[a][b] = g_ab;
-            g[b][a] = g_ab;
-        }
-    }
+    let g = build_spectral_kernel(cells, idxs, k_feat_idx, taxonomy, idx, k_src_levels);
 
     // `faer` has enough fixed per-call overhead (thread-pool/parallelism
     // check, scratch allocation, SIMD kernel dispatch) that it's slower
@@ -521,6 +698,131 @@ fn spectral_class(
     (0..n)
         .map(|i| (0..n).map(|k| gv[k] * vecs[i][k] * vecs[i][k]).sum())
         .collect()
+}
+
+/// `G_ab = sqrt(|m_a| |m_b|) * K(a, b)`, `K = k_feat . k_src`, over the
+/// cells in `idxs` — shared by `spectral_class` (needs eigenvectors,
+/// for `explain()`'s per-cell breakdown) and `spectral_class_value`
+/// (needs only eigenvalues, for `score()`, which discards that
+/// breakdown entirely). `k_feat` is checked first and `k_src` skipped
+/// when it's already zero: with only a handful of anchors and (in the
+/// real data) an unpopulated `k_feat`, most `(anchor_i, anchor_j)`
+/// pairs are zero, so this avoids the bulk of `k_src`'s (still
+/// non-free, even memoized) chain lookups for pairs whose product is
+/// zero regardless.
+fn build_spectral_kernel(
+    cells: &[(&SourceId, &AnchorId, f32)],
+    idxs: &[usize],
+    k_feat_idx: &KFeatIndex,
+    taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
+    k_src_levels: &KSrcLevels,
+) -> Vec<Vec<f64>> {
+    let n = idxs.len();
+    let mut g = vec![vec![0.0f64; n]; n];
+    for a in 0..n {
+        let (s_a, an_a, m_a) = cells[idxs[a]];
+        for b in a..n {
+            let (s_b, an_b, m_b) = cells[idxs[b]];
+            let kf = k_feat_idx.get(an_a, an_b);
+            let g_ab = if kf == 0.0 {
+                0.0
+            } else {
+                let k = f64::from(kf) * f64::from(idx.k_src(s_a, s_b, taxonomy, k_src_levels));
+                (f64::from(m_a.abs()) * f64::from(m_b.abs())).sqrt() * k
+            };
+            g[a][b] = g_ab;
+            g[b][a] = g_ab;
+        }
+    }
+    g
+}
+
+/// Same per-sign-class computation as `spectral_class`, but only the
+/// scalar `V_class = sum_k g(sigma_k)` — `score()`'s only use for
+/// `Spectral` mode, since it discards `explain()`'s per-cell breakdown
+/// entirely (`lib.rs::score()`'s `let (v, _) = ...`). `spectral_class`'s
+/// per-cell attribution needs the full eigendecomposition (accumulated
+/// eigenvectors), but the scalar total is exactly a sum over
+/// eigenvalues alone, so this goes through the cheaper
+/// `householder_ql_eigenvalues` instead - see its docs for why that's
+/// exact, not approximate.
+fn spectral_class_value(
+    cells: &[(&SourceId, &AnchorId, f32)],
+    idxs: &[usize],
+    k_feat_idx: &KFeatIndex,
+    taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
+    k_src_levels: &KSrcLevels,
+    beta: f64,
+) -> f64 {
+    if idxs.is_empty() {
+        return 0.0;
+    }
+    let g = build_spectral_kernel(cells, idxs, k_feat_idx, taxonomy, idx, k_src_levels);
+    householder_ql_eigenvalues(g)
+        .iter()
+        .map(|&sigma| beta * (1.0 + sigma.max(0.0) / beta).ln())
+        .sum()
+}
+
+/// Same contract as `spectral_value`, but only the scalar `V` (see
+/// `spectral_class_value`'s docs for why `score()` never needs the
+/// per-cell breakdown `spectral_value` builds alongside it).
+fn spectral_value_scalar(
+    f: &Measure,
+    k_feat: &KFeatMatrix,
+    taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
+    k_src_levels: &KSrcLevels,
+    beta: f32,
+) -> f32 {
+    let beta = f64::from(beta).max(f64::MIN_POSITIVE);
+    let cells: Vec<(&SourceId, &AnchorId, f32)> = f
+        .iter()
+        .filter(|(_, m)| **m != 0.0)
+        .map(|((s, a), m)| (s, a, *m))
+        .collect();
+    let k_feat_idx = KFeatIndex::build(k_feat);
+
+    let mut total = 0.0f64;
+    for sign in [1.0f32, -1.0] {
+        let idxs: Vec<usize> = (0..cells.len())
+            .filter(|&i| cells[i].2.signum() == sign)
+            .collect();
+        let v_class = spectral_class_value(
+            &cells,
+            &idxs,
+            &k_feat_idx,
+            taxonomy,
+            idx,
+            k_src_levels,
+            beta,
+        );
+        total += f64::from(sign) * v_class;
+    }
+    total as f32
+}
+
+/// Same contract as `value`, but only ever returns the scalar `V` —
+/// `score()`'s only use (`explain()` keeps calling `value` for the
+/// per-cell `Contribution` breakdown). For `DegreeQ`/`Degree1` this is
+/// just `value` with its contributions dropped (no extra work to skip:
+/// `all_crowdings`'s output is needed for `V` either way). For
+/// `Spectral` it's a real saving — see `spectral_value_scalar`.
+pub(crate) fn value_scalar(
+    f: &Measure,
+    k_feat: &KFeatMatrix,
+    taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
+    k_src_levels: &KSrcLevels,
+    q: f32,
+    homogeneity: Homogeneity,
+) -> f32 {
+    if let Homogeneity::Spectral { beta } = homogeneity {
+        return spectral_value_scalar(f, k_feat, taxonomy, idx, k_src_levels, beta);
+    }
+    value(f, k_feat, taxonomy, idx, k_src_levels, q, homogeneity).0
 }
 
 #[cfg(test)]
@@ -580,10 +882,9 @@ mod tests {
             // ~60% chance of a parent, chosen uniformly among 0..i.
             if rng.next_range(10) < 6 {
                 let p = rng.next_range(i);
-                taxonomy.parent.insert(
-                    SourceId(format!("n{i}")),
-                    SourceId(format!("n{p}")),
-                );
+                taxonomy
+                    .parent
+                    .insert(SourceId(format!("n{i}")), SourceId(format!("n{p}")));
             }
         }
         taxonomy
@@ -628,10 +929,9 @@ mod tests {
         let mut taxonomy = Taxonomy::default();
         let n = 20;
         for i in 1..n {
-            taxonomy.parent.insert(
-                SourceId(format!("n{i}")),
-                SourceId(format!("n{}", i - 1)),
-            );
+            taxonomy
+                .parent
+                .insert(SourceId(format!("n{i}")), SourceId(format!("n{}", i - 1)));
         }
         let levels = KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
@@ -645,7 +945,10 @@ mod tests {
         let mut idx_b = SourceIndex::new();
         let brute = brute_force_crowding(&sources, &mut idx_b, &taxonomy, &levels);
         for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
-            assert!((f - b).abs() < 1e-9 * (1.0 + b.abs()), "i={i}: fast={f} brute={b}");
+            assert!(
+                (f - b).abs() < 1e-9 * (1.0 + b.abs()),
+                "i={i}: fast={f} brute={b}"
+            );
         }
     }
 
@@ -657,7 +960,9 @@ mod tests {
         let mut taxonomy = Taxonomy::default();
         let n = 30;
         for i in 1..n {
-            taxonomy.parent.insert(SourceId(format!("n{i}")), SourceId("n0".into()));
+            taxonomy
+                .parent
+                .insert(SourceId(format!("n{i}")), SourceId("n0".into()));
         }
         let levels = KSrcLevels {
             levels: [0.9, 0.6, 0.4, 0.2, 0.05],
@@ -671,7 +976,10 @@ mod tests {
         let mut idx_b = SourceIndex::new();
         let brute = brute_force_crowding(&sources, &mut idx_b, &taxonomy, &levels);
         for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
-            assert!((f - b).abs() < 1e-9 * (1.0 + b.abs()), "i={i}: fast={f} brute={b}");
+            assert!(
+                (f - b).abs() < 1e-9 * (1.0 + b.abs()),
+                "i={i}: fast={f} brute={b}"
+            );
         }
     }
 
@@ -683,10 +991,103 @@ mod tests {
         assert_eq!(bucket_crowding(&[], idx, &tax, &levels), Vec::<f64>::new());
 
         let a = SourceId("a".into());
-        assert_eq!(
-            bucket_crowding(&[(&a, 3.0)], idx, &tax, &levels),
-            vec![3.0]
-        );
+        assert_eq!(bucket_crowding(&[(&a, 3.0)], idx, &tax, &levels), vec![3.0]);
+    }
+
+    /// Brute-force `all_crowdings` oracle: the naive `O(cells^2)`
+    /// all-pairs formula `cross_bucket_crowding` replaces — the
+    /// correctness reference for the (much less obviously correct)
+    /// cross-anchor bucketed path.
+    fn brute_force_all_crowdings(
+        cells: &[(&SourceId, &AnchorId, f32)],
+        k_feat: &KFeatMatrix,
+        taxonomy: &Taxonomy,
+        idx: &mut SourceIndex,
+        levels: &KSrcLevels,
+    ) -> Vec<f64> {
+        cells
+            .iter()
+            .map(|&(s_i, a_i, m_i)| {
+                cells
+                    .iter()
+                    .filter(|item| item.2.signum() == m_i.signum())
+                    .map(|&(s_j, a_j, m_j)| {
+                        let kf = if a_i == a_j {
+                            1.0
+                        } else {
+                            k_feat.get(a_i, a_j)
+                        };
+                        f64::from(kf)
+                            * f64::from(idx.k_src(s_i, s_j, taxonomy, levels))
+                            * f64::from(m_j.abs())
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_crowdings_matches_brute_force_with_populated_k_feat() {
+        let mut rng = Xorshift(0xFEED_FACE_1234_5678);
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let anchors: Vec<AnchorId> = (0..4).map(|i| AnchorId(format!("a{i}"))).collect();
+
+        for &n_sources in &[2usize, 5, 12, 30] {
+            for trial in 0..5 {
+                let taxonomy = random_taxonomy(&mut rng, n_sources);
+                let source_ids: Vec<SourceId> =
+                    (0..n_sources).map(|i| SourceId(format!("n{i}"))).collect();
+
+                // Each source gets 1-2 cells at *distinct* anchors
+                // (real `Measure`s are keyed by `(source, anchor)`, so
+                // that pair is never duplicated) - including the same
+                // source landing in two different anchors (a blend
+                // split), which is exactly the case
+                // `crowding_from_hist`'s dist==0 special case exists for.
+                let mut owned_cells: Vec<(SourceId, AnchorId, f32)> = Vec::new();
+                for s in &source_ids {
+                    let n_cells = 1 + rng.next_range(2);
+                    let first = rng.next_range(anchors.len());
+                    for k in 0..n_cells {
+                        let anchor_idx = (first + k) % anchors.len();
+                        let anchor = anchors[anchor_idx].clone();
+                        let sign = if rng.next_range(2) == 0 { 1.0 } else { -1.0 };
+                        let mass = sign * (rng.next_f32() + 0.05);
+                        owned_cells.push((s.clone(), anchor, mass));
+                    }
+                }
+                let cells: Vec<(&SourceId, &AnchorId, f32)> =
+                    owned_cells.iter().map(|(s, a, m)| (s, a, *m)).collect();
+
+                // A handful of random nonzero cross-anchor k_feat pairs.
+                let mut k_feat = KFeatMatrix::default();
+                for i in 0..anchors.len() {
+                    for j in (i + 1)..anchors.len() {
+                        if rng.next_range(2) == 0 {
+                            k_feat
+                                .pairs
+                                .insert((anchors[i].clone(), anchors[j].clone()), rng.next_f32());
+                        }
+                    }
+                }
+
+                let mut idx_a = SourceIndex::new();
+                let fast = all_crowdings(&cells, &k_feat, &taxonomy, &mut idx_a, &levels);
+                let mut idx_b = SourceIndex::new();
+                let brute =
+                    brute_force_all_crowdings(&cells, &k_feat, &taxonomy, &mut idx_b, &levels);
+
+                assert_eq!(fast.len(), brute.len());
+                for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
+                    assert!(
+                        (f - b).abs() < 1e-6 * (1.0 + b.abs()),
+                        "n_sources={n_sources} trial={trial} i={i}: fast={f} brute={b}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -806,6 +1207,71 @@ mod tests {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         };
         assert_eq!(SourceIndex::new().k_src(&a, &b, &tax, &levels), 0.0);
+    }
+
+    /// The unbounded formula `k_src` used before the `levels.len()`-
+    /// bounded scan: full ancestor chains, no early cutoff. Kept only
+    /// as the correctness oracle for chains deeper than `levels.len()`,
+    /// where the bounded search's early exit is actually exercised.
+    fn brute_force_k_src(
+        a: &SourceId,
+        b: &SourceId,
+        taxonomy: &Taxonomy,
+        levels: &KSrcLevels,
+    ) -> f32 {
+        if a == b {
+            return 1.0;
+        }
+        fn full_chain(taxonomy: &Taxonomy, id: &SourceId) -> Vec<SourceId> {
+            let mut chain = vec![id.clone()];
+            let mut current = id.clone();
+            while let Some(parent) = taxonomy.parent.get(&current) {
+                if chain.contains(parent) {
+                    break;
+                }
+                chain.push(parent.clone());
+                current = parent.clone();
+            }
+            chain
+        }
+        let chain_a = full_chain(taxonomy, a);
+        let chain_b = full_chain(taxonomy, b);
+        for (da, node) in chain_a.iter().enumerate() {
+            if let Some(db) = chain_b.iter().position(|n| n == node) {
+                let dist = da + db;
+                let idx = dist.saturating_sub(1).min(levels.levels.len() - 1);
+                return levels.levels[idx];
+            }
+        }
+        *levels.levels.last().unwrap()
+    }
+
+    #[test]
+    fn k_src_bounded_scan_matches_unbounded_brute_force_on_deep_chains() {
+        let mut rng = Xorshift(0x600D_DEED_C0FF_EE42);
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        // A single deep chain, well past `levels.len()`, so pairs at
+        // every combined distance - short, exactly at the boundary,
+        // and saturated - all get exercised.
+        let mut taxonomy = Taxonomy::default();
+        let n = 15;
+        for i in 1..n {
+            taxonomy
+                .parent
+                .insert(SourceId(format!("n{i}")), SourceId(format!("n{}", i - 1)));
+        }
+        let ids: Vec<SourceId> = (0..n).map(|i| SourceId(format!("n{i}"))).collect();
+
+        for _ in 0..50 {
+            let a = &ids[rng.next_range(n)];
+            let b = &ids[rng.next_range(n)];
+            let mut idx = SourceIndex::new();
+            let fast = idx.k_src(a, b, &taxonomy, &levels);
+            let brute = brute_force_k_src(a, b, &taxonomy, &levels);
+            assert_eq!(fast, brute, "a={a:?} b={b:?}: fast={fast} brute={brute}");
+        }
     }
 
     #[test]
@@ -958,6 +1424,45 @@ mod tests {
                 Homogeneity::Degree1,
             );
             assert!((v - 5.0).abs() < 1e-5, "q={q}: {v}");
+        }
+    }
+
+    #[test]
+    fn kfeat_index_matches_kfeat_matrix_get() {
+        let mut rng = Xorshift(0xA11C_E5FE_D000_1234);
+        let anchors: Vec<AnchorId> = (0..6).map(|i| AnchorId(format!("a{i}"))).collect();
+
+        for trial in 0..10 {
+            let mut k_feat = KFeatMatrix::default();
+            for i in 0..anchors.len() {
+                for j in (i + 1)..anchors.len() {
+                    if rng.next_range(2) == 0 {
+                        k_feat
+                            .pairs
+                            .insert((anchors[i].clone(), anchors[j].clone()), rng.next_f32());
+                    }
+                }
+            }
+            let k_feat_idx = KFeatIndex::build(&k_feat);
+
+            for i in 0..anchors.len() {
+                for j in 0..anchors.len() {
+                    let want = k_feat.get(&anchors[i], &anchors[j]);
+                    let got = k_feat_idx.get(&anchors[i], &anchors[j]);
+                    assert_eq!(
+                        want, got,
+                        "trial={trial} i={i} j={j}: matrix={want} index={got}"
+                    );
+                }
+            }
+
+            // An anchor never mentioned in `pairs` at all must still
+            // resolve to 0 against everything (not panic on a missing
+            // index entry).
+            let stranger = AnchorId("never-seen".into());
+            for a in &anchors {
+                assert_eq!(k_feat_idx.get(&stranger, a), 0.0);
+            }
         }
     }
 
@@ -1167,5 +1672,81 @@ mod tests {
         f.insert((SourceId("neg".into()), anchor.clone()), -2.0);
         let v = spectral(&f, &k_feat, &levels, beta);
         assert!(v.abs() < 1e-4, "mirrored pair should net to 0, got {v}");
+    }
+
+    /// `value_scalar` must return exactly `value(...).0` for every
+    /// homogeneity mode, including `Spectral` with a populated
+    /// cross-anchor `k_feat` (the case that actually takes the cheaper
+    /// `spectral_class_value`/`householder_ql_eigenvalues` path, unlike
+    /// most other tests in this file which use an empty `k_feat`).
+    #[test]
+    fn value_scalar_matches_value_across_homogeneity_modes() {
+        let mut rng = Xorshift(0xFACE_B00C_1357_2468);
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let anchors: Vec<AnchorId> = (0..4).map(|i| AnchorId(format!("a{i}"))).collect();
+        let modes = [
+            Homogeneity::DegreeQ,
+            Homogeneity::Degree1,
+            Homogeneity::Spectral { beta: 1.5 },
+        ];
+
+        for trial in 0..8 {
+            let n_sources = 3 + rng.next_range(10);
+            let taxonomy = random_taxonomy(&mut rng, n_sources);
+            let source_ids: Vec<SourceId> =
+                (0..n_sources).map(|i| SourceId(format!("n{i}"))).collect();
+
+            let mut f = Measure::new();
+            for s in &source_ids {
+                let n_cells = 1 + rng.next_range(2);
+                let first = rng.next_range(anchors.len());
+                for k in 0..n_cells {
+                    let anchor = anchors[(first + k) % anchors.len()].clone();
+                    let sign = if rng.next_range(2) == 0 { 1.0 } else { -1.0 };
+                    let mass = sign * (rng.next_f32() + 0.05);
+                    f.insert((s.clone(), anchor), mass);
+                }
+            }
+
+            let mut k_feat = KFeatMatrix::default();
+            for i in 0..anchors.len() {
+                for j in (i + 1)..anchors.len() {
+                    if rng.next_range(2) == 0 {
+                        k_feat
+                            .pairs
+                            .insert((anchors[i].clone(), anchors[j].clone()), rng.next_f32());
+                    }
+                }
+            }
+
+            for &homogeneity in &modes {
+                let mut idx_a = SourceIndex::new();
+                let (v_full, _) = value(
+                    &f,
+                    &k_feat,
+                    &taxonomy,
+                    &mut idx_a,
+                    &levels,
+                    0.6,
+                    homogeneity,
+                );
+                let mut idx_b = SourceIndex::new();
+                let v_scalar = value_scalar(
+                    &f,
+                    &k_feat,
+                    &taxonomy,
+                    &mut idx_b,
+                    &levels,
+                    0.6,
+                    homogeneity,
+                );
+                assert!(
+                    (v_full - v_scalar).abs() < 1e-4 * (1.0 + v_full.abs()),
+                    "trial={trial} homogeneity={homogeneity:?}: full={v_full} scalar={v_scalar}"
+                );
+            }
+        }
     }
 }

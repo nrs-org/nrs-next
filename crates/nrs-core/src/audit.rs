@@ -174,8 +174,16 @@ pub fn audit_monotonicity(snap: &Snapshot, params: &Params, keep: usize) -> Audi
         for &(s_i, a_i, _) in &cells {
             let mut c = 0.0f64;
             for &(s_j, a_j, m_j) in &cells {
-                c += f64::from(kernel(s_i, a_i, s_j, a_j, k_feat, tax, &mut src_idx, levels))
-                    * f64::from(m_j);
+                c += f64::from(kernel(
+                    s_i,
+                    a_i,
+                    s_j,
+                    a_j,
+                    k_feat,
+                    tax,
+                    &mut src_idx,
+                    levels,
+                )) * f64::from(m_j);
             }
             crowding.push(c);
         }
@@ -204,8 +212,16 @@ pub fn audit_monotonicity(snap: &Snapshot, params: &Params, keep: usize) -> Audi
                 let mut min_related_mass = f32::INFINITY;
                 let qd = f64::from(q);
                 for (idx, &(s_i, a_i, m_i)) in cells.iter().enumerate() {
-                    let kappa =
-                        f64::from(kernel(s_i, a_i, s_y, a_y, k_feat, tax, &mut src_idx, levels));
+                    let kappa = f64::from(kernel(
+                        s_i,
+                        a_i,
+                        s_y,
+                        a_y,
+                        k_feat,
+                        tax,
+                        &mut src_idx,
+                        levels,
+                    ));
                     if kappa == 0.0 {
                         continue;
                     }

@@ -327,6 +327,170 @@ fn tql2(z: &mut [Vec<f64>], n: usize, d: &mut [f64], e: &mut [f64]) {
     }
 }
 
+/// Eigenvalues-only variant of `householder_ql_eigen`: `redundancy::
+/// spectral_class`'s `V = sum_k g(sigma_k)` (all `score()` needs —
+/// `explain()`'s per-cell breakdown, the only consumer of eigenvectors,
+/// is discarded entirely on that path) only ever needs eigenvalues, and
+/// accumulating eigenvectors is roughly the dominant cost of the full
+/// decomposition: `tred2`'s "accumulate the transform" pass and `tql2`'s
+/// per-rotation `O(n)` vector update are each their own `O(n^3)`/`O(n^2)`
+/// term stacked on top of the tridiagonalization's own unavoidable
+/// `O(n^3)` reduction, and neither one ever touches `d`/`e` — dropping
+/// them changes no eigenvalue this returns, so this is exact, not
+/// approximate.
+pub(crate) fn householder_ql_eigenvalues(a_in: Vec<Vec<f64>>) -> Vec<f64> {
+    let n = a_in.len();
+    if n <= 1 {
+        return (0..n).map(|i| a_in[i][i]).collect();
+    }
+
+    let mut z = vec![vec![0.0f64; n + 1]; n + 1];
+    for i in 0..n {
+        for j in 0..n {
+            z[i + 1][j + 1] = a_in[i][j];
+        }
+    }
+    let mut d = vec![0.0f64; n + 1];
+    let mut e = vec![0.0f64; n + 1];
+    tred1(&mut z, n, &mut d, &mut e);
+    tql1(n, &mut d, &mut e);
+    d[1..=n].to_vec()
+}
+
+/// `tred2`'s tridiagonalization, minus accumulating the Householder
+/// reflectors into an orthogonal transform. Each `d[i]`'s final value
+/// (read from `z[i][i]` below) is never touched by that accumulation
+/// regardless of whether it runs: tracing the index algebra, iteration
+/// `i'`'s accumulate step only ever writes `z[k][j]` for `k, j <= i' -
+/// 1`, so it can't reach position `(i, i)` until `i' >= i + 1` — i.e.
+/// strictly *after* `d[i]` has already been read here. Skipping it
+/// changes nothing `tql1` sees.
+#[allow(clippy::needless_range_loop)]
+fn tred1(z: &mut [Vec<f64>], n: usize, d: &mut [f64], e: &mut [f64]) {
+    for i in (2..=n).rev() {
+        let l = i - 1;
+        let mut h = 0.0f64;
+        let mut scale = 0.0f64;
+        if l > 1 {
+            for k in 1..=l {
+                scale += z[i][k].abs();
+            }
+            if scale == 0.0 {
+                e[i] = z[i][l];
+            } else {
+                for k in 1..=l {
+                    z[i][k] /= scale;
+                    h += z[i][k] * z[i][k];
+                }
+                let mut f = z[i][l];
+                let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
+                e[i] = scale * g;
+                h -= f * g;
+                z[i][l] = f - g;
+                f = 0.0;
+                for j in 1..=l {
+                    z[j][i] = z[i][j] / h;
+                    let mut g2 = 0.0f64;
+                    for k in 1..=j {
+                        g2 += z[j][k] * z[i][k];
+                    }
+                    for k in (j + 1)..=l {
+                        g2 += z[k][j] * z[i][k];
+                    }
+                    e[j] = g2 / h;
+                    f += e[j] * z[i][j];
+                }
+                let hh = f / (h + h);
+                for j in 1..=l {
+                    let fj = z[i][j];
+                    let gj = e[j] - hh * fj;
+                    e[j] = gj;
+                    for k in 1..=j {
+                        z[j][k] -= fj * e[k] + gj * z[i][k];
+                    }
+                }
+            }
+        } else {
+            e[i] = z[i][l];
+        }
+        d[i] = h;
+    }
+    d[1] = 0.0;
+    e[1] = 0.0;
+    for i in 1..=n {
+        d[i] = z[i][i];
+    }
+}
+
+/// `tql2`'s implicit-shift QL diagonalization, minus the `O(n)`
+/// per-rotation eigenvector update (`tql2`'s inner `for k in 1..=n`
+/// loop over `z`): that update only ever writes `z`, never reading or
+/// writing `d`/`e` or any of the shift/rotation control-flow scalars,
+/// so the sequence of eigenvalues extracted is identical either way.
+fn tql1(n: usize, d: &mut [f64], e: &mut [f64]) {
+    for i in 2..=n {
+        e[i - 1] = e[i];
+    }
+    e[n] = 0.0;
+    for l in 1..=n {
+        let mut iter = 0;
+        loop {
+            let mut m = n;
+            for mm in l..n {
+                let dd = d[mm].abs() + d[mm + 1].abs();
+                if (e[mm].abs() + dd) == dd {
+                    m = mm;
+                    break;
+                }
+            }
+            if m == l {
+                break;
+            }
+            iter += 1;
+            if iter > 50 {
+                break;
+            }
+            let mut g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+            let mut r = g.hypot(1.0);
+            g = d[m] - d[l] + e[l] / (g + r.copysign(g));
+            let mut s = 1.0f64;
+            let mut c = 1.0f64;
+            let mut p = 0.0f64;
+            let mut ii = m - 1;
+            let mut zeroed = false;
+            loop {
+                let f = s * e[ii];
+                let b = c * e[ii];
+                r = f.hypot(g);
+                e[ii + 1] = r;
+                if r == 0.0 {
+                    d[ii + 1] -= p;
+                    e[m] = 0.0;
+                    zeroed = true;
+                    break;
+                }
+                s = f / r;
+                c = g / r;
+                g = d[ii + 1] - p;
+                r = (d[ii] - g) * s + 2.0 * c * b;
+                p = s * r;
+                d[ii + 1] = g + p;
+                g = c * r - b;
+                if ii == l {
+                    break;
+                }
+                ii -= 1;
+            }
+            if zeroed {
+                continue;
+            }
+            d[l] -= p;
+            e[l] = g;
+            e[m] = 0.0;
+        }
+    }
+}
+
 /// `faer`'s dense self-adjoint eigensolver, for perf comparison against
 /// `jacobi_eigen`/`householder_ql_eigen` (see linalg.rs's header on why
 /// nrs-core doesn't take this as a real dependency by default). Same
@@ -343,7 +507,9 @@ pub(crate) fn faer_eigen(a_in: Vec<Vec<f64>>) -> (Vec<f64>, Vec<Vec<f64>>) {
     let eig = a.self_adjoint_eigen(Side::Lower).expect("symmetric input");
     let vals: Vec<f64> = (0..n).map(|i| eig.S()[i]).collect();
     let u = eig.U();
-    let vecs: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|k| u[(i, k)]).collect()).collect();
+    let vecs: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|k| u[(i, k)]).collect())
+        .collect();
     (vals, vecs)
 }
 
@@ -438,13 +604,20 @@ mod tests {
             vals_j.sort_by(|x, y| x.partial_cmp(y).unwrap());
             vals_h_sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
             for (vj, vh) in vals_j.iter().zip(&vals_h_sorted) {
-                assert!((vj - vh).abs() < 1e-8, "{a:?}: jacobi {vals_j:?} vs householder {vals_h_sorted:?}");
+                assert!(
+                    (vj - vh).abs() < 1e-8,
+                    "{a:?}: jacobi {vals_j:?} vs householder {vals_h_sorted:?}"
+                );
             }
             let r = reconstruct(&vals_h, &vecs_h);
             let n = a.len();
             for i in 0..n {
                 for j in 0..n {
-                    assert!((r[i][j] - a[i][j]).abs() < 1e-8, "{a:?} {i},{j}: {}", r[i][j]);
+                    assert!(
+                        (r[i][j] - a[i][j]).abs() < 1e-8,
+                        "{a:?} {i},{j}: {}",
+                        r[i][j]
+                    );
                 }
             }
         }
@@ -531,6 +704,49 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn householder_ql_eigenvalues_handles_trivial_sizes() {
+        assert!(householder_ql_eigenvalues(Vec::new()).is_empty());
+        assert_eq!(householder_ql_eigenvalues(vec![vec![7.0]]), vec![7.0]);
+    }
+
+    /// `householder_ql_eigenvalues` (no eigenvector accumulation) must
+    /// return exactly the same spectrum as `householder_ql_eigen` (with
+    /// accumulation) — that's the whole premise of `tred1`/`tql1` being
+    /// an exact simplification rather than an approximation.
+    #[test]
+    fn householder_ql_eigenvalues_matches_householder_ql_eigen() {
+        let mut state: u64 = 0xC0FF_EE00_D15E_A5E5;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+
+        for &n in &[0usize, 1, 2, 3, 5, 8, 16, 40] {
+            let mut a = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in i..n {
+                    let x = next();
+                    a[i][j] = x;
+                    a[j][i] = x;
+                }
+            }
+            let (mut vals_full, _) = householder_ql_eigen(a.clone());
+            let mut vals_only = householder_ql_eigenvalues(a.clone());
+            vals_full.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            vals_only.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            assert_eq!(vals_full.len(), vals_only.len());
+            for (vf, vo) in vals_full.iter().zip(&vals_only) {
+                assert!(
+                    (vf - vo).abs() < 1e-9 * (1.0 + vf.abs()),
+                    "n={n}: full {vals_full:?} vs eigenvalues-only {vals_only:?}"
+                );
             }
         }
     }
