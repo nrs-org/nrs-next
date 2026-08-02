@@ -114,6 +114,167 @@ impl SourceIndex {
         }
         *levels.levels.last().unwrap()
     }
+
+    /// The interned ancestor chain of `id` (`chain[0] == id`'s own
+    /// interned id, `chain[1]` its parent, ...), for callers that need
+    /// to aggregate over many sources' ancestry at once (`bucket_crowding`)
+    /// rather than compare one pair at a time.
+    fn chain(&mut self, taxonomy: &Taxonomy, id: &SourceId) -> &[u32] {
+        let i = self.ensure_chain(taxonomy, id);
+        self.chains[i].as_ref().unwrap()
+    }
+}
+
+/// `k_src_levels` always has this many entries (INFRA.md §4.2's "~5
+/// levels"), so a tree-distance `>= MAX_K_SRC_DIST` always saturates to
+/// the last ("unrelated") level regardless of exactly how far apart two
+/// sources are — `bucket_crowding` only needs *exact* per-pair distances
+/// up to here, and can lump everything past it into one aggregate.
+const MAX_K_SRC_DIST: usize = 4;
+
+/// Sum of `k_src(s_i, s_j) * mass_j` over every `j` (including `i`
+/// itself, via the exact `k_src(i,i)=1` self term) for every `i`, over a
+/// bucket of sources that are already known to share one `k_feat` weight
+/// (typically 1.0, the same-anchor diagonal) — i.e. this computes the
+/// per-cell crowding that a naive `O(bucket^2)` all-pairs comparison
+/// would, but in `O(bucket * MAX_K_SRC_DIST)`.
+///
+/// The trick: `k_src(i,j)` only depends on `da + db`, the combined
+/// tree-distance from `i` and `j` to their lowest common ancestor. So
+/// rather than compare every pair, build `depth_hist[node][e]` = total
+/// bucket mass sitting at exact depth `e` (`e <= MAX_K_SRC_DIST`) below
+/// `node`, in one `O(bucket * MAX_K_SRC_DIST)` pass over every source's
+/// own ancestor chain. Then for query source `i`, walking `i`'s own
+/// chain `A_0=i, A_1, ...` and reading `depth_hist[A_da][db]` gives the
+/// mass of *every* bucket source at combined distance `da+db` from `i`
+/// whose ancestor chain passes through `A_da` at depth `db` — except
+/// that also includes sources closer to `i` (whose true LCA with `i` is
+/// some shallower `A_{da'}`, `da' < da`, not `A_da`), which is exactly
+/// the mass `depth_hist[A_{da-1}][db-1]` already walked through: one
+/// less hop from `i`, but the same node overall (subtracting it is the
+/// "claimed by a shallower ancestor" correction below). Whatever mass
+/// isn't accounted for by any `(da, db)` with `da+db <= MAX_K_SRC_DIST`
+/// is, by construction, every source at combined distance `>
+/// MAX_K_SRC_DIST` — i.e. exactly the saturated tail, with no need to
+/// enumerate it explicitly.
+fn bucket_crowding(
+    sources: &[(&SourceId, f64)],
+    idx: &mut SourceIndex,
+    taxonomy: &Taxonomy,
+    levels: &KSrcLevels,
+) -> Vec<f64> {
+    let n = sources.len();
+    if n <= 1 {
+        return sources.iter().map(|&(_, m)| m).collect();
+    }
+
+    let total_mass: f64 = sources.iter().map(|&(_, m)| m).sum();
+    let saturated_level = f64::from(*levels.levels.last().unwrap());
+
+    type Hist = [f64; MAX_K_SRC_DIST + 1];
+    let mut depth_hist: HashMap<u32, Hist> = HashMap::with_capacity(sources.len() * 2);
+    for &(s, m) in sources {
+        let chain = idx.chain(taxonomy, s);
+        for (e, &node) in chain.iter().take(MAX_K_SRC_DIST + 1).enumerate() {
+            depth_hist.entry(node).or_insert([0.0; MAX_K_SRC_DIST + 1])[e] += m;
+        }
+    }
+
+    sources
+        .iter()
+        .map(|&(s_i, mass_i)| {
+            let chain_i = idx.chain(taxonomy, s_i).to_vec();
+            let mut crowding = mass_i; // self term: k_src(i, i) = 1
+            let mut accounted = mass_i; // mass already attributed to some (da, db)
+            let mut prev_hist: Option<Hist> = None;
+            for da in 0..=MAX_K_SRC_DIST {
+                let Some(&node) = chain_i.get(da) else {
+                    break;
+                };
+                let hist = depth_hist.get(&node).copied().unwrap_or([0.0; MAX_K_SRC_DIST + 1]);
+                for db in 0..=(MAX_K_SRC_DIST - da) {
+                    if da == 0 && db == 0 {
+                        continue; // j == i, already the self term above
+                    }
+                    let claimed_by_shallower = if db >= 1 {
+                        prev_hist.map_or(0.0, |h| h[db - 1])
+                    } else {
+                        0.0
+                    };
+                    let exact = (hist[db] - claimed_by_shallower).max(0.0);
+                    if exact > 0.0 {
+                        let dist = da + db;
+                        let level_idx = dist.saturating_sub(1).min(levels.levels.len() - 1);
+                        crowding += f64::from(levels.levels[level_idx]) * exact;
+                        accounted += exact;
+                    }
+                }
+                prev_hist = Some(hist);
+            }
+            let saturated = (total_mass - accounted).max(0.0);
+            crowding + saturated_level * saturated
+        })
+        .collect()
+}
+
+/// Self-inclusive, same-signed crowding `c_i = sum_j K(i,j) * |m_j|` for
+/// every cell in `cells`, in the same order — the shared crowding pass
+/// behind both `DegreeQ`'s value and `Spectral`'s per-cell breakdown
+/// (`explain`'s columns need to stay comparable across modes).
+///
+/// Split into two parts: same-anchor pairs (where `k_feat` is always the
+/// constant `1.0` diagonal, `KFeatMatrix::get`'s `a == b` fast path) go
+/// through `bucket_crowding`'s `O(bucket * MAX_K_SRC_DIST)` aggregation;
+/// any cross-anchor pairs with an explicitly configured nonzero `k_feat`
+/// weight (sparse "only non-default pairs" by `KFeatMatrix`'s own
+/// contract, and empty in the live data today — `nrs-fit` hasn't landed)
+/// fall back to a direct pairwise addition on top, so this stays exact
+/// for any `k_feat`, not just today's empty one.
+/// A same-sign, same-anchor bucket entry: `(source, |mass|, original
+/// index into `cells`)`.
+type BucketEntry<'a> = (&'a SourceId, f64, usize);
+
+fn all_crowdings(
+    cells: &[(&SourceId, &AnchorId, f32)],
+    k_feat: &KFeatMatrix,
+    taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
+    k_src_levels: &KSrcLevels,
+) -> Vec<f64> {
+    let mut crowding = vec![0.0f64; cells.len()];
+
+    let mut buckets: HashMap<(bool, &AnchorId), Vec<BucketEntry>> = HashMap::new();
+    for (i, &(source, anchor, mass)) in cells.iter().enumerate() {
+        buckets
+            .entry((mass.signum() > 0.0, anchor))
+            .or_default()
+            .push((source, f64::from(mass.abs()), i));
+    }
+    for entries in buckets.values() {
+        let sources: Vec<(&SourceId, f64)> = entries.iter().map(|&(s, m, _)| (s, m)).collect();
+        let bucket_result = bucket_crowding(&sources, idx, taxonomy, k_src_levels);
+        for (&(_, _, i), c) in entries.iter().zip(&bucket_result) {
+            crowding[i] = *c;
+        }
+    }
+
+    if !k_feat.pairs.is_empty() {
+        for (i, &(source_i, anchor_i, mass_i)) in cells.iter().enumerate() {
+            for &(source_j, anchor_j, mass_j) in cells {
+                if anchor_i == anchor_j || mass_i.signum() != mass_j.signum() {
+                    continue; // same-anchor pairs are already covered above
+                }
+                let kf = k_feat.get(anchor_i, anchor_j);
+                if kf == 0.0 {
+                    continue;
+                }
+                let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
+                crowding[i] += f64::from(k) * f64::from(mass_j.abs());
+            }
+        }
+    }
+
+    crowding
 }
 
 /// `V(f) = sum_x f(x) . phi(c(x))` (`Homogeneity::DegreeQ`, the
@@ -153,30 +314,11 @@ pub(crate) fn value(
         .map(|((s, a), m)| (s, a, *m))
         .collect();
 
+    let crowdings = all_crowdings(&cells, k_feat, taxonomy, idx, k_src_levels);
+
     let mut total = 0.0;
     let mut contributions = Vec::with_capacity(cells.len());
-    for &(source_i, anchor_i, mass_i) in &cells {
-        // Crowding is a sum of nonnegative terms (no cancellation), but
-        // accumulate it in f64: `RelationScaling::PowQ` at low q produces
-        // masses down near f32's subnormal floor, and an f64 accumulator
-        // keeps their sum out of the denormal range where precision
-        // collapses.
-        let mut crowding = 0.0f64;
-        for &(source_j, anchor_j, mass_j) in &cells {
-            if mass_i.signum() != mass_j.signum() {
-                continue; // opposite valence: never mutually redundant
-            }
-            // Check the cheap factor first: `k_src`'s chain lookup is
-            // still real work even memoized, and with few anchors most
-            // `(anchor_i, anchor_j)` pairs make `k_feat` zero anyway.
-            let kf = k_feat.get(anchor_i, anchor_j);
-            if kf == 0.0 {
-                continue;
-            }
-            let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
-            crowding += f64::from(k) * f64::from(mass_j.abs());
-        }
-
+    for (&(source_i, anchor_i, mass_i), &crowding) in cells.iter().zip(&crowdings) {
         // The one nonlinearity, evaluated in log-space. DegreeQ's cell
         // term is `m * c^(q-1)`; Degree1's is `m * (c/|m|)^(q-1)`,
         // normalising crowding by the cell's own mass first (a
@@ -287,25 +429,16 @@ fn spectral_value(
         }
     }
 
+    // Crowding is kept for the breakdown only (it does not drive the
+    // spectral value): the same self-inclusive, same-signed crowding
+    // `sum_j K_ij |m_j|` that DegreeQ reports, so `explain`'s columns
+    // stay comparable across scoring modes.
+    let crowdings = all_crowdings(&cells, k_feat, taxonomy, idx, k_src_levels);
+
     let mut total = 0.0f64;
     let mut contributions = Vec::with_capacity(cells.len());
-    for (i, &(source_i, anchor_i, mass_i)) in cells.iter().enumerate() {
-        // Crowding is kept for the breakdown only (it does not drive the
-        // spectral value): the same self-inclusive, same-signed crowding
-        // `sum_j K_ij |m_j|` that DegreeQ reports, so `explain`'s columns
-        // stay comparable across scoring modes.
-        let mut crowding = 0.0f64;
-        for &(source_j, anchor_j, mass_j) in &cells {
-            if mass_i.signum() != mass_j.signum() {
-                continue;
-            }
-            let kf = k_feat.get(anchor_i, anchor_j);
-            if kf == 0.0 {
-                continue;
-            }
-            let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
-            crowding += f64::from(k) * f64::from(mass_j.abs());
-        }
+    for (i, (&(source_i, anchor_i, mass_i), &crowding)) in cells.iter().zip(&crowdings).enumerate()
+    {
         let contribution = contrib_by_cell[i] as f32;
         total += f64::from(contribution);
         contributions.push(Contribution {
@@ -395,6 +528,166 @@ mod tests {
     use super::*;
     use crate::types::AnchorId;
     use std::collections::BTreeMap;
+
+    // ---- bucket_crowding: cross-checked against the naive O(n^2)
+    // all-pairs `k_src` sum it replaces, across randomized taxonomy
+    // shapes (empty, chains, branching trees) and bucket sizes. ----
+
+    /// The straightforward `O(n^2)` computation `bucket_crowding`
+    /// optimizes: `crowding_i = sum_j k_src(i, j) * mass_j`. Kept only
+    /// for tests, as the correctness oracle.
+    fn brute_force_crowding(
+        sources: &[(&SourceId, f64)],
+        idx: &mut SourceIndex,
+        taxonomy: &Taxonomy,
+        levels: &KSrcLevels,
+    ) -> Vec<f64> {
+        sources
+            .iter()
+            .map(|&(s_i, _)| {
+                sources
+                    .iter()
+                    .map(|&(s_j, m_j)| f64::from(idx.k_src(s_i, s_j, taxonomy, levels)) * m_j)
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// A small xorshift PRNG, deterministic across runs, no extra dep.
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn next_range(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// A random forest over `n` labeled nodes: each node either has no
+    /// parent, or a parent chosen from *lower-numbered* nodes only (so
+    /// the result is acyclic by construction, no cycle-guard needed to
+    /// interpret it).
+    fn random_taxonomy(rng: &mut Xorshift, n: usize) -> Taxonomy {
+        let mut taxonomy = Taxonomy::default();
+        for i in 1..n {
+            // ~60% chance of a parent, chosen uniformly among 0..i.
+            if rng.next_range(10) < 6 {
+                let p = rng.next_range(i);
+                taxonomy.parent.insert(
+                    SourceId(format!("n{i}")),
+                    SourceId(format!("n{p}")),
+                );
+            }
+        }
+        taxonomy
+    }
+
+    #[test]
+    fn bucket_crowding_matches_brute_force_on_random_taxonomies() {
+        let mut rng = Xorshift(0xD1CE_B00C_1234_5678);
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+
+        for &n in &[1usize, 2, 3, 5, 8, 16, 40] {
+            for trial in 0..5 {
+                let taxonomy = random_taxonomy(&mut rng, n);
+                let ids: Vec<SourceId> = (0..n).map(|i| SourceId(format!("n{i}"))).collect();
+                let masses: Vec<f64> = (0..n).map(|_| f64::from(rng.next_f32()) + 0.01).collect();
+                let sources: Vec<(&SourceId, f64)> =
+                    ids.iter().zip(masses.iter().copied()).collect();
+
+                let mut idx_a = SourceIndex::new();
+                let fast = bucket_crowding(&sources, &mut idx_a, &taxonomy, &levels);
+                let mut idx_b = SourceIndex::new();
+                let brute = brute_force_crowding(&sources, &mut idx_b, &taxonomy, &levels);
+
+                assert_eq!(fast.len(), brute.len());
+                for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
+                    assert!(
+                        (f - b).abs() < 1e-9 * (1.0 + b.abs()),
+                        "n={n} trial={trial} i={i}: fast={f} brute={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_crowding_matches_brute_force_with_a_deep_chain() {
+        // A single deep chain (n0 <- n1 <- ... <- n_{k-1}) exercises
+        // distances well past MAX_K_SRC_DIST, so both the exact-distance
+        // table entries and the saturated tail get real coverage.
+        let mut taxonomy = Taxonomy::default();
+        let n = 20;
+        for i in 1..n {
+            taxonomy.parent.insert(
+                SourceId(format!("n{i}")),
+                SourceId(format!("n{}", i - 1)),
+            );
+        }
+        let levels = KSrcLevels {
+            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+        };
+        let ids: Vec<SourceId> = (0..n).map(|i| SourceId(format!("n{i}"))).collect();
+        let masses: Vec<f64> = (0..n).map(|i| 1.0 + i as f64 * 0.1).collect();
+        let sources: Vec<(&SourceId, f64)> = ids.iter().zip(masses.iter().copied()).collect();
+
+        let mut idx_a = SourceIndex::new();
+        let fast = bucket_crowding(&sources, &mut idx_a, &taxonomy, &levels);
+        let mut idx_b = SourceIndex::new();
+        let brute = brute_force_crowding(&sources, &mut idx_b, &taxonomy, &levels);
+        for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
+            assert!((f - b).abs() < 1e-9 * (1.0 + b.abs()), "i={i}: fast={f} brute={b}");
+        }
+    }
+
+    #[test]
+    fn bucket_crowding_matches_brute_force_on_a_wide_star() {
+        // One shared parent with many direct children (a franchise with
+        // many top-level characters): heavy reuse of the same ancestor
+        // node across sources, exercising depth_hist's aggregation.
+        let mut taxonomy = Taxonomy::default();
+        let n = 30;
+        for i in 1..n {
+            taxonomy.parent.insert(SourceId(format!("n{i}")), SourceId("n0".into()));
+        }
+        let levels = KSrcLevels {
+            levels: [0.9, 0.6, 0.4, 0.2, 0.05],
+        };
+        let ids: Vec<SourceId> = (0..n).map(|i| SourceId(format!("n{i}"))).collect();
+        let masses: Vec<f64> = (0..n).map(|_| 2.0).collect();
+        let sources: Vec<(&SourceId, f64)> = ids.iter().zip(masses.iter().copied()).collect();
+
+        let mut idx_a = SourceIndex::new();
+        let fast = bucket_crowding(&sources, &mut idx_a, &taxonomy, &levels);
+        let mut idx_b = SourceIndex::new();
+        let brute = brute_force_crowding(&sources, &mut idx_b, &taxonomy, &levels);
+        for (i, (f, b)) in fast.iter().zip(&brute).enumerate() {
+            assert!((f - b).abs() < 1e-9 * (1.0 + b.abs()), "i={i}: fast={f} brute={b}");
+        }
+    }
+
+    #[test]
+    fn bucket_crowding_handles_trivial_sizes() {
+        let idx = &mut SourceIndex::new();
+        let tax = Taxonomy::default();
+        let levels = KSrcLevels { levels: [1.0; 5] };
+        assert_eq!(bucket_crowding(&[], idx, &tax, &levels), Vec::<f64>::new());
+
+        let a = SourceId("a".into());
+        assert_eq!(
+            bucket_crowding(&[(&a, 3.0)], idx, &tax, &levels),
+            vec![3.0]
+        );
+    }
 
     #[test]
     fn opposite_sign_masses_do_not_crowd_each_other() {
