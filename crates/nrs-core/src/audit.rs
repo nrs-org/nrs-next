@@ -32,7 +32,7 @@
 //! and callers should only run it for `q < 1`.
 
 use crate::measure::{build_measures, Measure};
-use crate::redundancy::k_src;
+use crate::redundancy::SourceIndex;
 use crate::solve::solve_relations;
 use crate::types::{
     AnchorId, EntryId, KFeatMatrix, KSrcLevels, Params, Relation, Snapshot, SourceId, Taxonomy,
@@ -96,9 +96,10 @@ fn kernel(
     a_j: &AnchorId,
     k_feat: &KFeatMatrix,
     taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
     levels: &KSrcLevels,
 ) -> f32 {
-    k_feat.get(a_i, a_j) * k_src(s_i, s_j, taxonomy, levels)
+    k_feat.get(a_i, a_j) * idx.k_src(s_i, s_j, taxonomy, levels)
 }
 
 /// Ancestors of `s` (walking `taxonomy.parent`), *excluding* `s`
@@ -153,6 +154,7 @@ pub fn audit_monotonicity(snap: &Snapshot, params: &Params, keep: usize) -> Audi
     let mut n_bridging = 0usize;
     let mut n_violations = 0usize;
     let mut n_entries_scored = 0usize;
+    let mut src_idx = SourceIndex::new();
 
     for (entry, f) in &resolved {
         // Positive cells only (a positive insertion crowds only
@@ -168,17 +170,15 @@ pub fn audit_monotonicity(snap: &Snapshot, params: &Params, keep: usize) -> Audi
         n_entries_scored += 1;
 
         // Self-inclusive crowding c_i for each positive cell (f64).
-        let crowding: Vec<f64> = cells
-            .iter()
-            .map(|&(s_i, a_i, _)| {
-                cells
-                    .iter()
-                    .map(|&(s_j, a_j, m_j)| {
-                        f64::from(kernel(s_i, a_i, s_j, a_j, k_feat, tax, levels)) * f64::from(m_j)
-                    })
-                    .sum()
-            })
-            .collect();
+        let mut crowding: Vec<f64> = Vec::with_capacity(cells.len());
+        for &(s_i, a_i, _) in &cells {
+            let mut c = 0.0f64;
+            for &(s_j, a_j, m_j) in &cells {
+                c += f64::from(kernel(s_i, a_i, s_j, a_j, k_feat, tax, &mut src_idx, levels))
+                    * f64::from(m_j);
+            }
+            crowding.push(c);
+        }
 
         // Candidate insertion grid: (entry's sources ∪ their ancestors)
         // × entry's anchors. Ancestors supply the bridge points §1.2
@@ -204,7 +204,8 @@ pub fn audit_monotonicity(snap: &Snapshot, params: &Params, keep: usize) -> Audi
                 let mut min_related_mass = f32::INFINITY;
                 let qd = f64::from(q);
                 for (idx, &(s_i, a_i, m_i)) in cells.iter().enumerate() {
-                    let kappa = f64::from(kernel(s_i, a_i, s_y, a_y, k_feat, tax, levels));
+                    let kappa =
+                        f64::from(kernel(s_i, a_i, s_y, a_y, k_feat, tax, &mut src_idx, levels));
                     if kappa == 0.0 {
                         continue;
                     }

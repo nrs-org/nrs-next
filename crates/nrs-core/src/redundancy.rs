@@ -22,46 +22,98 @@
 //!   negatives saturates under `q` the same way a pile of small
 //!   positives does, rather than subtracting without bound.
 
-use crate::linalg::jacobi_eigen;
+use std::collections::HashMap;
+
+use crate::linalg::householder_ql_eigen;
+#[cfg(feature = "faer-eigen")]
+use crate::linalg::faer_eigen;
 use crate::measure::Measure;
 use crate::types::{
     AnchorId, Contribution, Homogeneity, KFeatMatrix, KSrcLevels, SourceId, Taxonomy,
 };
 
-fn ancestor_chain(taxonomy: &Taxonomy, id: &SourceId) -> Vec<SourceId> {
-    let mut chain = vec![id.clone()];
-    let mut current = id.clone();
-    while let Some(parent) = taxonomy.parent.get(&current) {
-        if chain.contains(parent) {
-            break;
-        }
-        chain.push(parent.clone());
-        current = parent.clone();
-    }
-    chain
+/// Memoized `k_src` evaluator. `ancestor_chain` used to rebuild a fresh
+/// `Vec<SourceId>` (cloning every `String` on the path to the root) on
+/// *every* pairwise call — with a hot loop making O(cells^2) calls per
+/// entry, that's millions of heap allocations for the real dataset's
+/// biggest franchise entries. `SourceIndex` interns each `SourceId` to a
+/// small integer exactly once (the first time it's seen, across the
+/// *whole* `score()`/`explain()` call, not per entry — siblings under
+/// the same franchise share sources) and caches its ancestor chain as a
+/// plain `Vec<u32>`, so every later `k_src` lookup is pointer-chasing
+/// over integers, not string comparisons or allocations.
+#[derive(Default)]
+pub(crate) struct SourceIndex {
+    id_of: HashMap<SourceId, u32>,
+    chains: Vec<Option<Vec<u32>>>,
 }
 
-/// `k_src`: 1.0 at an identical source; otherwise the level indexed by
-/// the combined tree-distance to the deepest shared ancestor (notes
-/// table: same character/scene, same work, same franchise, same
-/// genre/vibe, unrelated), falling back to the "unrelated" level when
-/// the two sources share no ancestor at all. The exact distance-to-level
-/// mapping is a modelling choice pending `nrs-fit` (roadmap phase 6);
-/// this only needs to be monotone in "how far apart".
-pub(crate) fn k_src(a: &SourceId, b: &SourceId, taxonomy: &Taxonomy, levels: &KSrcLevels) -> f32 {
-    if a == b {
-        return 1.0;
+impl SourceIndex {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    let chain_a = ancestor_chain(taxonomy, a);
-    let chain_b = ancestor_chain(taxonomy, b);
-    for (da, node) in chain_a.iter().enumerate() {
-        if let Some(db) = chain_b.iter().position(|n| n == node) {
-            let dist = da + db;
-            let idx = dist.saturating_sub(1).min(levels.levels.len() - 1);
-            return levels.levels[idx];
+
+    fn intern(&mut self, id: &SourceId) -> u32 {
+        if let Some(&i) = self.id_of.get(id) {
+            return i;
         }
+        let i = self.chains.len() as u32;
+        self.id_of.insert(id.clone(), i);
+        self.chains.push(None);
+        i
     }
-    *levels.levels.last().unwrap()
+
+    /// Interns `id` (if needed) and returns its ancestor chain, building
+    /// and caching it on first request.
+    fn ensure_chain(&mut self, taxonomy: &Taxonomy, id: &SourceId) -> usize {
+        let i = self.intern(id) as usize;
+        if self.chains[i].is_none() {
+            let mut chain = vec![i as u32];
+            let mut current = id.clone();
+            while let Some(parent) = taxonomy.parent.get(&current) {
+                let p = self.intern(parent);
+                if chain.contains(&p) {
+                    break;
+                }
+                chain.push(p);
+                current = parent.clone();
+            }
+            self.chains[i] = Some(chain);
+        }
+        i
+    }
+
+    /// `k_src`: 1.0 at an identical source; otherwise the level indexed
+    /// by the combined tree-distance to the deepest shared ancestor
+    /// (notes table: same character/scene, same work, same franchise,
+    /// same genre/vibe, unrelated), falling back to the "unrelated"
+    /// level when the two sources share no ancestor at all. The exact
+    /// distance-to-level mapping is a modelling choice pending `nrs-fit`
+    /// (roadmap phase 6); this only needs to be monotone in "how far
+    /// apart".
+    pub(crate) fn k_src(
+        &mut self,
+        a: &SourceId,
+        b: &SourceId,
+        taxonomy: &Taxonomy,
+        levels: &KSrcLevels,
+    ) -> f32 {
+        if a == b {
+            return 1.0;
+        }
+        let ia = self.ensure_chain(taxonomy, a);
+        let ib = self.ensure_chain(taxonomy, b);
+        let chain_a = self.chains[ia].as_ref().unwrap();
+        let chain_b = self.chains[ib].as_ref().unwrap();
+        for (da, &node) in chain_a.iter().enumerate() {
+            if let Some(db) = chain_b.iter().position(|&n| n == node) {
+                let dist = da + db;
+                let idx = dist.saturating_sub(1).min(levels.levels.len() - 1);
+                return levels.levels[idx];
+            }
+        }
+        *levels.levels.last().unwrap()
+    }
 }
 
 /// `V(f) = sum_x f(x) . phi(c(x))` (`Homogeneity::DegreeQ`, the
@@ -83,6 +135,7 @@ pub(crate) fn value(
     f: &Measure,
     k_feat: &KFeatMatrix,
     taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
     k_src_levels: &KSrcLevels,
     q: f32,
     homogeneity: Homogeneity,
@@ -91,7 +144,7 @@ pub(crate) fn value(
     // kernel's spectrum, not a per-cell crowding sum), so it branches out
     // before the additive path below rather than sharing its loop.
     if let Homogeneity::Spectral { beta } = homogeneity {
-        return spectral_value(f, k_feat, taxonomy, k_src_levels, beta);
+        return spectral_value(f, k_feat, taxonomy, idx, k_src_levels, beta);
     }
 
     let cells: Vec<(&SourceId, &crate::types::AnchorId, f32)> = f
@@ -113,8 +166,14 @@ pub(crate) fn value(
             if mass_i.signum() != mass_j.signum() {
                 continue; // opposite valence: never mutually redundant
             }
-            let k =
-                k_feat.get(anchor_i, anchor_j) * k_src(source_i, source_j, taxonomy, k_src_levels);
+            // Check the cheap factor first: `k_src`'s chain lookup is
+            // still real work even memoized, and with few anchors most
+            // `(anchor_i, anchor_j)` pairs make `k_feat` zero anyway.
+            let kf = k_feat.get(anchor_i, anchor_j);
+            if kf == 0.0 {
+                continue;
+            }
+            let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
             crowding += f64::from(k) * f64::from(mass_j.abs());
         }
 
@@ -202,6 +261,7 @@ fn spectral_value(
     f: &Measure,
     k_feat: &KFeatMatrix,
     taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
     k_src_levels: &KSrcLevels,
     beta: f32,
 ) -> (f32, Vec<Contribution>) {
@@ -220,7 +280,7 @@ fn spectral_value(
         let idxs: Vec<usize> = (0..cells.len())
             .filter(|&i| cells[i].2.signum() == sign)
             .collect();
-        let attrib = spectral_class(&cells, &idxs, k_feat, taxonomy, k_src_levels, beta);
+        let attrib = spectral_class(&cells, &idxs, k_feat, taxonomy, idx, k_src_levels, beta);
         // Positive class adds its log-volume, negative class subtracts.
         for (local, &global) in idxs.iter().enumerate() {
             contrib_by_cell[global] = f64::from(sign) * attrib[local];
@@ -239,8 +299,11 @@ fn spectral_value(
             if mass_i.signum() != mass_j.signum() {
                 continue;
             }
-            let k =
-                k_feat.get(anchor_i, anchor_j) * k_src(source_i, source_j, taxonomy, k_src_levels);
+            let kf = k_feat.get(anchor_i, anchor_j);
+            if kf == 0.0 {
+                continue;
+            }
+            let k = kf * idx.k_src(source_i, source_j, taxonomy, k_src_levels);
             crowding += f64::from(k) * f64::from(mass_j.abs());
         }
         let contribution = contrib_by_cell[i] as f32;
@@ -268,6 +331,7 @@ fn spectral_class(
     idxs: &[usize],
     k_feat: &KFeatMatrix,
     taxonomy: &Taxonomy,
+    idx: &mut SourceIndex,
     k_src_levels: &KSrcLevels,
     beta: f64,
 ) -> Vec<f64> {
@@ -276,21 +340,45 @@ fn spectral_class(
         return Vec::new();
     }
 
-    // G_ab = sqrt(|m_a| |m_b|) * K(a, b), K = k_feat . k_src.
+    // G_ab = sqrt(|m_a| |m_b|) * K(a, b), K = k_feat . k_src. `k_feat` is
+    // checked first and `k_src` skipped when it's already zero: with only
+    // a handful of anchors and (in the real data) an unpopulated
+    // `k_feat`, most `(anchor_i, anchor_j)` pairs are zero, so this
+    // avoids the bulk of `k_src`'s (still non-free, even memoized) chain
+    // lookups for pairs whose product is zero regardless.
     let mut g = vec![vec![0.0f64; n]; n];
     for a in 0..n {
         let (s_a, an_a, m_a) = cells[idxs[a]];
         for b in a..n {
             let (s_b, an_b, m_b) = cells[idxs[b]];
-            let k = f64::from(k_feat.get(an_a, an_b))
-                * f64::from(k_src(s_a, s_b, taxonomy, k_src_levels));
-            let g_ab = (f64::from(m_a.abs()) * f64::from(m_b.abs())).sqrt() * k;
+            let kf = k_feat.get(an_a, an_b);
+            let g_ab = if kf == 0.0 {
+                0.0
+            } else {
+                let k = f64::from(kf) * f64::from(idx.k_src(s_a, s_b, taxonomy, k_src_levels));
+                (f64::from(m_a.abs()) * f64::from(m_b.abs())).sqrt() * k
+            };
             g[a][b] = g_ab;
             g[b][a] = g_ab;
         }
     }
 
-    let (vals, vecs) = jacobi_eigen(g);
+    // `faer` has enough fixed per-call overhead (thread-pool/parallelism
+    // check, scratch allocation, SIMD kernel dispatch) that it's slower
+    // than the hand-rolled solver below this size in practice — measured
+    // *slower* than `jacobi_eigen` for n<=4, breakeven around n=8 (see
+    // linalg.rs's `householder_ql_vs_jacobi_timing`). Since most entries'
+    // per-sign-class kernels are small and only a handful are large, a
+    // blanket faer swap was a net *regression* end to end; this dispatch
+    // sends only the few large kernels to it.
+    #[cfg(feature = "faer-eigen")]
+    let (vals, vecs) = if n >= 64 {
+        faer_eigen(g)
+    } else {
+        householder_ql_eigen(g)
+    };
+    #[cfg(not(feature = "faer-eigen"))]
+    let (vals, vecs) = householder_ql_eigen(g);
     // g(t) = beta ln(1 + t/beta), clipping negative eigenvalues to 0
     // (the nearest-PSD projection). g(0) = 0, so clipped modes drop out.
     let gv: Vec<f64> = vals
@@ -321,7 +409,15 @@ mod tests {
         f.insert((SourceId("pos".into()), anchor.clone()), 2.0);
         f.insert((SourceId("neg".into()), anchor.clone()), -2.0);
 
-        let (_, contributions) = value(&f, &k_feat, &tax, &levels, 0.5, Homogeneity::DegreeQ);
+        let (_, contributions) = value(
+            &f,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            0.5,
+            Homogeneity::DegreeQ,
+        );
         for c in &contributions {
             assert_eq!(
                 c.crowding, 2.0,
@@ -344,7 +440,15 @@ mod tests {
         for &tiny in &[1e-30f32, 1e-38, 1e-40, 1e-44] {
             let mut f = Measure::new();
             f.insert((SourceId("s".into()), anchor.clone()), tiny);
-            let (v, contributions) = value(&f, &k_feat, &tax, &levels, 0.1, Homogeneity::DegreeQ);
+            let (v, contributions) = value(
+                &f,
+                &k_feat,
+                &tax,
+                &mut SourceIndex::new(),
+                &levels,
+                0.1,
+                Homogeneity::DegreeQ,
+            );
             assert!(v.is_finite(), "tiny={tiny}: V={v}");
             for c in &contributions {
                 assert!(
@@ -371,7 +475,15 @@ mod tests {
         for &tiny in &[1e-20f32, 1e-30, 1e-38, 1e-42] {
             let mut f = Measure::new();
             f.insert((SourceId("s".into()), anchor.clone()), tiny);
-            let (v, _) = value(&f, &k_feat, &tax, &levels, q, Homogeneity::DegreeQ);
+            let (v, _) = value(
+                &f,
+                &k_feat,
+                &tax,
+                &mut SourceIndex::new(),
+                &levels,
+                q,
+                Homogeneity::DegreeQ,
+            );
             let expect = tiny.powf(q); // isolated: c = m, so m*m^(q-1) = m^q
             assert!(v > 0.0, "tiny={tiny}: floored to {v}");
             let rel = (v - expect).abs() / expect;
@@ -389,7 +501,7 @@ mod tests {
         let levels = KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         };
-        assert_eq!(k_src(&s, &s, &tax, &levels), 1.0);
+        assert_eq!(SourceIndex::new().k_src(&s, &s, &tax, &levels), 1.0);
     }
 
     #[test]
@@ -400,7 +512,7 @@ mod tests {
         let levels = KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         };
-        assert_eq!(k_src(&a, &b, &tax, &levels), 0.0);
+        assert_eq!(SourceIndex::new().k_src(&a, &b, &tax, &levels), 0.0);
     }
 
     #[test]
@@ -428,7 +540,15 @@ mod tests {
         *same_cell
             .entry((source.clone(), anchor.clone()))
             .or_insert(0.0) += a;
-        let (v_same, _) = value(&same_cell, &k_feat, &tax, &levels, q, Homogeneity::DegreeQ);
+        let (v_same, _) = value(
+            &same_cell,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            q,
+            Homogeneity::DegreeQ,
+        );
 
         let mut distinct_cells: BTreeMap<_, _> = BTreeMap::new();
         distinct_cells.insert((SourceId("s1".into()), anchor.clone()), a);
@@ -437,6 +557,7 @@ mod tests {
             &distinct_cells,
             &k_feat,
             &tax,
+            &mut SourceIndex::new(),
             &levels,
             q,
             Homogeneity::DegreeQ,
@@ -462,8 +583,24 @@ mod tests {
         let anchor = AnchorId("x".into());
         let f = two_related_cells(3.0, &anchor);
 
-        let (v_q, _) = value(&f, &k_feat, &tax, &levels, 1.0, Homogeneity::DegreeQ);
-        let (v_1, _) = value(&f, &k_feat, &tax, &levels, 1.0, Homogeneity::Degree1);
+        let (v_q, _) = value(
+            &f,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            1.0,
+            Homogeneity::DegreeQ,
+        );
+        let (v_1, _) = value(
+            &f,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            1.0,
+            Homogeneity::Degree1,
+        );
         assert!((v_q - v_1).abs() < 1e-5, "{v_q} vs {v_1}");
     }
 
@@ -478,8 +615,24 @@ mod tests {
         let f = two_related_cells(3.0, &anchor);
         let scaled = two_related_cells(3.0 * 7.0, &anchor);
 
-        let (v, _) = value(&f, &k_feat, &tax, &levels, 0.5, Homogeneity::Degree1);
-        let (v_scaled, _) = value(&scaled, &k_feat, &tax, &levels, 0.5, Homogeneity::Degree1);
+        let (v, _) = value(
+            &f,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            0.5,
+            Homogeneity::Degree1,
+        );
+        let (v_scaled, _) = value(
+            &scaled,
+            &k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            &levels,
+            0.5,
+            Homogeneity::Degree1,
+        );
         assert!(
             (v_scaled - 7.0 * v).abs() < 1e-3,
             "{v_scaled} vs {}",
@@ -502,7 +655,15 @@ mod tests {
         f.insert((SourceId("s".into()), anchor), 5.0);
 
         for &q in &[0.1f32, 0.5, 1.0, 2.0] {
-            let (v, _) = value(&f, &k_feat, &tax, &levels, q, Homogeneity::Degree1);
+            let (v, _) = value(
+                &f,
+                &k_feat,
+                &tax,
+                &mut SourceIndex::new(),
+                &levels,
+                q,
+                Homogeneity::Degree1,
+            );
             assert!((v - 5.0).abs() < 1e-5, "q={q}: {v}");
         }
     }
@@ -516,7 +677,16 @@ mod tests {
 
     fn spectral(f: &Measure, k_feat: &KFeatMatrix, levels: &KSrcLevels, beta: f32) -> f32 {
         let tax = Taxonomy::default();
-        value(f, k_feat, &tax, levels, 0.0, Homogeneity::Spectral { beta }).0
+        value(
+            f,
+            k_feat,
+            &tax,
+            &mut SourceIndex::new(),
+            levels,
+            0.0,
+            Homogeneity::Spectral { beta },
+        )
+        .0
     }
 
     #[test]
@@ -680,6 +850,7 @@ mod tests {
             &f,
             &k_feat,
             &tax,
+            &mut SourceIndex::new(),
             &levels,
             0.0,
             Homogeneity::Spectral { beta },

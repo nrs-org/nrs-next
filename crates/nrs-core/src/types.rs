@@ -112,6 +112,14 @@ impl KFeatMatrix {
         if a == b {
             return 1.0;
         }
+        // The lookup key clones both `AnchorId` `String`s (a `BTreeMap<(K,
+        // K), V>` has no borrowed-key query path for a tuple), so skip it
+        // entirely when there's nothing to find — the common case today,
+        // since nothing populates `pairs` yet (INFRA.md's `nrs-fit` phase),
+        // and this sits in `score()`'s O(cells^2) hot loop.
+        if self.pairs.is_empty() {
+            return 0.0;
+        }
         self.pairs
             .get(&(a.clone(), b.clone()))
             .or_else(|| self.pairs.get(&(b.clone(), a.clone())))

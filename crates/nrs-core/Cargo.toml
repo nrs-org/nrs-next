@@ -4,9 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+faer = { version = "0.24.4", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[features]
+# Perf-comparison-only: benchmarks `faer`'s symmetric eigensolver against
+# the hand-rolled `householder_ql_eigen`/`jacobi_eigen`. Not on by
+# default — nrs-core is otherwise dependency-free by design (see
+# linalg.rs).
+faer-eigen = ["dep:faer"]
 
 [[bench]]
 name = "score"

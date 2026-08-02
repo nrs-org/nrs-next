@@ -19,12 +19,17 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
     let resolved =
         solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
 
+    // Shared across every entry in this call so `k_src`'s taxonomy-chain
+    // memoization (redundancy::SourceIndex) amortizes over sibling
+    // entries that reuse the same sources (INFRA.md §4.3 phase 3).
+    let mut src_index = redundancy::SourceIndex::new();
     let mut values = std::collections::BTreeMap::new();
     for (entry, f) in &resolved {
         let (v, _) = redundancy::value(
             f,
             &params.k_feat,
             &snap.taxonomy,
+            &mut src_index,
             &params.k_src_levels,
             params.q,
             params.homogeneity,
@@ -47,6 +52,7 @@ pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation 
         f,
         &params.k_feat,
         &snap.taxonomy,
+        &mut redundancy::SourceIndex::new(),
         &params.k_src_levels,
         params.q,
         params.homogeneity,
