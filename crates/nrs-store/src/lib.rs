@@ -9,6 +9,7 @@ mod event;
 mod events;
 mod import;
 mod params_blob;
+mod preferences;
 mod relkind;
 mod schema;
 mod snapshot;
@@ -20,6 +21,7 @@ use rusqlite::Connection;
 pub use error::{Result, StoreError};
 pub use event::EventKind;
 pub use events::EventRecord;
+pub use preferences::Preference;
 
 pub struct Store {
     conn: Connection,

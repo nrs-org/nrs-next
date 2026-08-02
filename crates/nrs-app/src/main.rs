@@ -6,34 +6,38 @@
 //! document is a few thousand atoms), so the `q` (redundancy
 //! exponent) box on the page reruns live.
 //!
-//! No calibration/fitting exists yet (`nrs-fit`, INFRA.md roadmap
-//! phase 6), so what's shown is the raw `V` value from the
-//! redundancy functional, not a calibrated public score — labelled
-//! honestly as "V (raw)" rather than "Score".
+//! The raw `V` value from the redundancy functional is shown as-is
+//! (labelled "V (raw)"), not a calibrated public score; `/calibrate`
+//! (INFRA.md roadmap phase 6, `nrs-fit`) exists to work towards one.
 //!
 //! Usage: `cargo run -p nrs-app -- /path/to/NRSImplMain.xml [port]`
 //! or `cargo run -p nrs-app -- /path/to/nrs.db [port]` (a path
-//! ending in `.db` loads via `nrs-store` instead of re-parsing XML;
-//! CRUD against it is a later pass, INFRA.md roadmap phase 5 — this
-//! only reads).
+//! ending in `.db` loads via `nrs-store` instead of re-parsing XML,
+//! and unlocks `/calibrate` -- XML mode is read-only).
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::header;
-use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use nrs_core::{
-    EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, RelationScaling, Snapshot,
+    AnchorId, EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, RelationScaling,
+    Snapshot,
 };
+use nrs_store::Store;
 use serde::{Deserialize, Serialize};
 
 struct AppState {
     snapshot: Snapshot,
     warnings: Vec<String>,
+    /// Only set when launched against a `.db` path — the calibration UI
+    /// (INFRA.md roadmap phase 6) needs write access, which the
+    /// read-only XML-mode doesn't have.
+    store: Option<Mutex<Store>>,
 }
 
 #[tokio::main]
@@ -53,9 +57,9 @@ async fn main() {
         .and_then(|e| e.to_str())
         == Some("db");
 
-    let (snapshot, warnings) = if is_db {
+    let (snapshot, warnings, store) = if is_db {
         eprintln!("loading {path}...");
-        let store = match nrs_store::Store::open(&path) {
+        let store = match Store::open(&path) {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("failed to open store: {e}");
@@ -63,7 +67,7 @@ async fn main() {
             }
         };
         match store.load_snapshot() {
-            Ok((snapshot, _params)) => (snapshot, Vec::new()),
+            Ok((snapshot, _params)) => (snapshot, Vec::new(), Some(store)),
             Err(e) => {
                 eprintln!("failed to load snapshot: {e}");
                 std::process::exit(1);
@@ -79,10 +83,13 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let (snapshot, conversion_warnings) = nrs_import::build_snapshot(&doc);
+        // XML-mode is read-only browsing (no Store), so BuildExtras
+        // (comments/needs-review, feeding the review UI) has nowhere
+        // to go here -- only meaningful in `.db` mode.
+        let (snapshot, _extras, conversion_warnings) = nrs_import::build_snapshot(&doc);
         let mut warnings = doc.warnings;
         warnings.extend(conversion_warnings);
-        (snapshot, warnings)
+        (snapshot, warnings, None)
     };
     eprintln!(
         "loaded {} entries, {} impacts, {} relations ({} warnings)",
@@ -91,12 +98,25 @@ async fn main() {
         snapshot.relations.len(),
         warnings.len()
     );
+    if store.is_none() {
+        eprintln!("(read-only XML mode -- /calibrate needs a .db path)");
+    }
 
-    let state = Arc::new(AppState { snapshot, warnings });
+    let state = Arc::new(AppState {
+        snapshot,
+        warnings,
+        store: store.map(Mutex::new),
+    });
     let app = Router::new()
         .route("/", get(index))
         .route("/scores.csv", get(scores_csv))
         .route("/scores.json", get(scores_json))
+        .route("/calibrate", get(calibrate))
+        .route("/calibrate/vote", post(calibrate_vote))
+        .route("/calibrate/fit", get(calibrate_fit))
+        .route("/calibrate/fit/save", post(calibrate_fit_save))
+        .route("/calibrate/kfeat", get(calibrate_kfeat))
+        .route("/calibrate/kfeat/set", post(calibrate_kfeat_set))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -191,7 +211,7 @@ impl RelScaling {
     }
 }
 
-fn params(rel: RelScaling, mode: Mode, beta: f32) -> Params {
+fn params(rel: RelScaling, mode: Mode, beta: f32, k_feat: KFeatMatrix) -> Params {
     let homogeneity = match mode {
         Mode::Degreeq => Homogeneity::DegreeQ,
         Mode::Spectral => Homogeneity::Spectral {
@@ -203,10 +223,24 @@ fn params(rel: RelScaling, mode: Mode, beta: f32) -> Params {
         k_src_levels: KSrcLevels {
             levels: [0.95, 0.5, 0.3, 0.15, 0.0],
         },
-        k_feat: KFeatMatrix::default(),
+        k_feat,
         homogeneity,
         calibration: Isotonic::default(),
         relation_scaling: rel.to_core(),
+    }
+}
+
+/// The live `k_feat` calibrated via `/calibrate/kfeat`, when running
+/// against a `.db` -- otherwise the identity default. Without this, the
+/// scores view would be completely blind to anything calibrated there.
+fn live_k_feat(state: &AppState) -> KFeatMatrix {
+    let Some(store_lock) = &state.store else {
+        return KFeatMatrix::default();
+    };
+    let store = store_lock.lock().unwrap();
+    match store.load_snapshot() {
+        Ok((_, params)) => params.k_feat,
+        Err(_) => KFeatMatrix::default(),
     }
 }
 
@@ -226,8 +260,9 @@ fn rows(
     rel: RelScaling,
     mode: Mode,
     beta: f32,
+    k_feat: KFeatMatrix,
 ) -> Vec<Row<'_>> {
-    let mut p = params(rel, mode, beta);
+    let mut p = params(rel, mode, beta, k_feat);
     p.q = q.clamp(0.001, 4.0);
     let scores = nrs_core::score(snapshot, &p);
 
@@ -260,6 +295,7 @@ async fn index(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
+    let k_feat = live_k_feat(&state);
     let rows = rows(
         &state.snapshot,
         view.q,
@@ -268,6 +304,7 @@ async fn index(
         view.rel,
         view.mode,
         view.beta,
+        k_feat,
     );
 
     let mut body = String::new();
@@ -285,7 +322,7 @@ async fn index(
   #grid {{ width: 100%; }}
 </style></head><body>
 <h1>nrs scores</h1>
-<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}&mode={}&beta={}">download CSV</a></div>
+<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}&mode={}&beta={}">download CSV</a> · <a href="/calibrate">calibrate</a></div>
 <form method="get">
   <label>mode:
     <select name="mode">
@@ -374,6 +411,7 @@ async fn scores_csv(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
+    let k_feat = live_k_feat(&state);
     let rows = rows(
         &state.snapshot,
         view.q,
@@ -382,6 +420,7 @@ async fn scores_csv(
         view.rel,
         view.mode,
         view.beta,
+        k_feat,
     );
 
     let mut csv = String::from("id,title,store,value\n");
@@ -421,6 +460,7 @@ async fn scores_json(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
 ) -> impl IntoResponse {
+    let k_feat = live_k_feat(&state);
     let rows = rows(
         &state.snapshot,
         view.q,
@@ -429,6 +469,7 @@ async fn scores_json(
         view.rel,
         view.mode,
         view.beta,
+        k_feat,
     );
 
     Json(
@@ -441,6 +482,339 @@ async fn scores_json(
             })
             .collect::<Vec<_>>(),
     )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn no_store_message() -> String {
+    "<!doctype html><p>calibration needs write access -- launch <code>nrs-app</code> against a \
+     <code>.db</code> path instead of XML.</p>"
+        .to_string()
+}
+
+fn page_shell(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; }}
+  nav a {{ margin-right: 1rem; }}
+  .pair {{ display: flex; gap: 1rem; margin: 1.5rem 0; }}
+  .pair form {{ flex: 1; border: 1px solid #8884; border-radius: 6px; padding: 1rem; text-align: center; }}
+  .pair button {{ width: 100%; padding: 0.75rem; font-size: 1rem; }}
+  .value {{ color: #888; font-size: 0.85rem; }}
+  dl {{ display: grid; grid-template-columns: max-content auto; gap: 0.25rem 1rem; }}
+  .kfeat-grid {{ display: flex; flex-direction: column; gap: 0.3rem; }}
+  .kfeat-row {{ display: flex; align-items: center; gap: 0.5rem; }}
+  .kfeat-row input[type="number"] {{ width: 5rem; }}
+</style></head><body>
+<nav><a href="/">scores</a><a href="/calibrate">calibrate</a><a href="/calibrate/fit">run fit</a><a href="/calibrate/kfeat">k_feat</a></nav>
+{body}
+</body></html>
+"#
+    )
+}
+
+/// A random pair for the calibrate page's "which is better" vote
+/// (INFRA.md §8's "corrections" -- v1 doesn't try to pick an
+/// informative pair, just two distinct entries).
+async fn calibrate(State(state): State<Arc<AppState>>) -> Html<String> {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message());
+    };
+    if state.snapshot.entries.len() < 2 {
+        return Html(page_shell(
+            "nrs calibrate",
+            "<p>need at least two entries to compare.</p>",
+        ));
+    }
+
+    let live_params = {
+        let store = store_lock.lock().unwrap();
+        match store.load_snapshot() {
+            Ok((_, params)) => params,
+            Err(e) => {
+                return Html(page_shell(
+                    "nrs calibrate",
+                    &format!("<p>failed to load params: {e}</p>"),
+                ))
+            }
+        }
+    };
+    let scores = nrs_core::score(&state.snapshot, &live_params);
+
+    let n = state.snapshot.entries.len();
+    let mut rng = rand::rng();
+    let idx_a = rand::Rng::random_range(&mut rng, 0..n);
+    let mut idx_b = rand::Rng::random_range(&mut rng, 0..n);
+    while idx_b == idx_a {
+        idx_b = rand::Rng::random_range(&mut rng, 0..n);
+    }
+    let a = &state.snapshot.entries[idx_a];
+    let b = &state.snapshot.entries[idx_b];
+    let value_a = scores.values.get(&a.id).copied().unwrap_or(0.0);
+    let value_b = scores.values.get(&b.id).copied().unwrap_or(0.0);
+
+    let body = format!(
+        r#"<h1>calibrate</h1>
+<p>Which of these do you actually think is better?</p>
+<div class="pair">
+  <form method="post" action="/calibrate/vote">
+    <input type="hidden" name="winner" value="{a_id}">
+    <input type="hidden" name="loser" value="{b_id}">
+    <button type="submit">{a_title}</button>
+    <div class="value">current V: {value_a:.3}</div>
+  </form>
+  <form method="post" action="/calibrate/vote">
+    <input type="hidden" name="winner" value="{b_id}">
+    <input type="hidden" name="loser" value="{a_id}">
+    <button type="submit">{b_title}</button>
+    <div class="value">current V: {value_b:.3}</div>
+  </form>
+</div>
+"#,
+        a_id = html_escape(&a.id.0),
+        b_id = html_escape(&b.id.0),
+        a_title = html_escape(a.title_cache.as_deref().unwrap_or(&a.id.0)),
+        b_title = html_escape(b.title_cache.as_deref().unwrap_or(&b.id.0)),
+    );
+    Html(page_shell("nrs calibrate", &body))
+}
+
+#[derive(Deserialize)]
+struct VoteForm {
+    winner: String,
+    loser: String,
+}
+
+async fn calibrate_vote(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<VoteForm>,
+) -> impl IntoResponse {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message()).into_response();
+    };
+    let winner = EntryId(form.winner);
+    let loser = EntryId(form.loser);
+    let mut store = store_lock.lock().unwrap();
+    if let Err(e) = store.record_preference(&winner, &loser, None) {
+        return Html(page_shell(
+            "nrs calibrate",
+            &format!("<p>failed to record: {e}</p>"),
+        ))
+        .into_response();
+    }
+    drop(store);
+    Redirect::to("/calibrate").into_response()
+}
+
+async fn calibrate_fit(State(state): State<Arc<AppState>>) -> Html<String> {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message());
+    };
+    let store = store_lock.lock().unwrap();
+    let (_, prior) = match store.load_snapshot() {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs fit",
+                &format!("<p>failed to load: {e}</p>"),
+            ))
+        }
+    };
+    let preferences = match store.load_preferences() {
+        Ok(p) => p,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs fit",
+                &format!("<p>failed to load preferences: {e}</p>"),
+            ))
+        }
+    };
+    drop(store);
+
+    let result = nrs_fit::fit(&state.snapshot, &prior, &preferences);
+    let prior_beta = match prior.homogeneity {
+        Homogeneity::Spectral { beta } => format!("{beta:.4}"),
+        _ => "n/a (prior isn't spectral)".to_string(),
+    };
+
+    let body = format!(
+        r#"<h1>fit</h1>
+<dl>
+  <dt>preferences recorded</dt><dd>{n_preferences}</dd>
+  <dt>prior beta</dt><dd>{prior_beta}</dd>
+  <dt>fitted beta</dt><dd>{fitted_beta:.4}</dd>
+  <dt>loss</dt><dd>{loss:.6}</dd>
+  <dt>violations</dt><dd>{violations} / {n_preferences}</dd>
+</dl>
+<form method="post" action="/calibrate/fit/save">
+  <button type="submit">save fitted beta</button>
+</form>
+"#,
+        n_preferences = preferences.len(),
+        fitted_beta = result.beta,
+        loss = result.loss,
+        violations = result.violations,
+    );
+    Html(page_shell("nrs fit", &body))
+}
+
+async fn calibrate_fit_save(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message()).into_response();
+    };
+    let mut store = store_lock.lock().unwrap();
+    let (_, prior) = match store.load_snapshot() {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs fit",
+                &format!("<p>failed to load: {e}</p>"),
+            ))
+            .into_response()
+        }
+    };
+    let preferences = match store.load_preferences() {
+        Ok(p) => p,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs fit",
+                &format!("<p>failed to load preferences: {e}</p>"),
+            ))
+            .into_response()
+        }
+    };
+
+    let result = nrs_fit::fit(&state.snapshot, &prior, &preferences);
+    let params = &result.params;
+    if let Err(e) = store.set_params(
+        params.q,
+        params.k_src_levels,
+        params.homogeneity,
+        params.relation_scaling,
+    ) {
+        return Html(page_shell(
+            "nrs fit",
+            &format!("<p>failed to save: {e}</p>"),
+        ))
+        .into_response();
+    }
+    drop(store);
+    Redirect::to("/calibrate/fit").into_response()
+}
+
+/// Every distinct anchor actually used by some atom's blend in
+/// `snapshot` -- `Palette.anchors` isn't populated by `nrs-import` yet,
+/// so this is the honest source of "what anchors exist" for real data.
+fn used_anchors(snapshot: &Snapshot) -> Vec<AnchorId> {
+    let mut set = std::collections::BTreeSet::new();
+    for impact in &snapshot.impacts {
+        for atom in &impact.atoms {
+            for (anchor, _) in &atom.blend {
+                set.insert(anchor.clone());
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// `k_feat` is directly interpretable (unlike `beta`), so this skips
+/// `nrs-fit` entirely: pick two anchors, say how redundant they feel,
+/// write straight into `k_feat` via the existing `set_kfeat_pair`.
+async fn calibrate_kfeat(State(state): State<Arc<AppState>>) -> Html<String> {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message());
+    };
+    let k_feat = {
+        let store = store_lock.lock().unwrap();
+        match store.load_snapshot() {
+            Ok((_, params)) => params.k_feat,
+            Err(e) => {
+                return Html(page_shell(
+                    "nrs k_feat",
+                    &format!("<p>failed to load: {e}</p>"),
+                ))
+            }
+        }
+    };
+
+    let anchors = used_anchors(&state.snapshot);
+    if anchors.len() < 2 {
+        return Html(page_shell(
+            "nrs k_feat",
+            "<p>need at least two anchors in use to compare.</p>",
+        ));
+    }
+
+    let mut rows = String::new();
+    for i in 0..anchors.len() {
+        for j in (i + 1)..anchors.len() {
+            let a = &anchors[i];
+            let b = &anchors[j];
+            let current = k_feat.get(a, b);
+            write!(
+                rows,
+                r#"<form method="post" action="/calibrate/kfeat/set" class="kfeat-row">
+  <span>{a_label}</span> &harr; <span>{b_label}</span>
+  <input type="hidden" name="a" value="{a_val}">
+  <input type="hidden" name="b" value="{b_val}">
+  <input type="number" name="k" value="{current}" step="0.05" min="0" max="1">
+  <button type="submit">save</button>
+</form>
+"#,
+                a_label = html_escape(&a.0),
+                b_label = html_escape(&b.0),
+                a_val = html_escape(&a.0),
+                b_val = html_escape(&b.0),
+            )
+            .unwrap();
+        }
+    }
+
+    let body = format!(
+        r#"<h1>k_feat</h1>
+<p>How redundant does each anchor pair feel? 0 = unrelated, 1 = fully redundant
+(the same signal counted twice).</p>
+<div class="kfeat-grid">
+{rows}</div>
+"#
+    );
+    Html(page_shell("nrs k_feat", &body))
+}
+
+#[derive(Deserialize)]
+struct KfeatForm {
+    a: String,
+    b: String,
+    k: f32,
+}
+
+async fn calibrate_kfeat_set(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<KfeatForm>,
+) -> impl IntoResponse {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message()).into_response();
+    };
+    let mut store = store_lock.lock().unwrap();
+    if let Err(e) =
+        store.set_kfeat_pair(&AnchorId(form.a), &AnchorId(form.b), form.k.clamp(0.0, 1.0))
+    {
+        return Html(page_shell(
+            "nrs k_feat",
+            &format!("<p>failed to save: {e}</p>"),
+        ))
+        .into_response();
+    }
+    drop(store);
+    Redirect::to("/calibrate/kfeat").into_response()
 }
 
 #[cfg(test)]
@@ -513,6 +887,7 @@ mod tests {
             RelScaling::Fixed,
             Mode::Degreeq,
             2.0,
+            KFeatMatrix::default(),
         );
         assert_eq!(r[0].id.0, "a"); // higher magnitude -> higher value
         assert_eq!(r[1].id.0, "b");
@@ -529,6 +904,7 @@ mod tests {
             RelScaling::Fixed,
             Mode::Degreeq,
             2.0,
+            KFeatMatrix::default(),
         );
         assert_eq!(r[0].title, "Apple");
         assert_eq!(r[1].title, "Zebra");
@@ -545,6 +921,7 @@ mod tests {
             RelScaling::Fixed,
             Mode::Spectral,
             2.0,
+            KFeatMatrix::default(),
         );
         assert!(r.iter().all(|row| row.value.is_finite()));
         // Entry "a" (mass 5) still outranks "b" (mass 1) under spectral.
