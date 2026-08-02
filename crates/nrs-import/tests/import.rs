@@ -50,7 +50,7 @@ fn parses_and_scores_a_franchise_shaped_document() {
     let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
     assert_eq!(doc.entries.len(), 3);
 
-    let (snapshot, conversion_warnings) = build_snapshot(&doc);
+    let (snapshot, _extras, conversion_warnings) = build_snapshot(&doc);
     assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
     assert_eq!(snapshot.entries.len(), 3);
 
@@ -92,7 +92,7 @@ fn parses_and_scores_a_franchise_shaped_document() {
 #[test]
 fn contains_relations_populate_taxonomy_and_change_scoring() {
     let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
-    let (snapshot, conversion_warnings) = build_snapshot(&doc);
+    let (snapshot, _extras, conversion_warnings) = build_snapshot(&doc);
     assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
 
     let franchise = SourceId("F-VGMDB-1018".into());
@@ -119,11 +119,11 @@ fn contains_relations_populate_taxonomy_and_change_scoring() {
 #[test]
 fn write_snapshot_then_load_snapshot_scores_identically() {
     let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
-    let (snapshot, conversion_warnings) = build_snapshot(&doc);
+    let (snapshot, extras, conversion_warnings) = build_snapshot(&doc);
     assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
 
     let mut store = Store::open_in_memory().expect("open store");
-    write_snapshot(&mut store, &snapshot).expect("write snapshot");
+    write_snapshot(&mut store, &snapshot, &extras).expect("write snapshot");
 
     let (reloaded, _params) = store.load_snapshot().expect("load snapshot");
     assert_eq!(reloaded.entries.len(), snapshot.entries.len());
@@ -181,7 +181,7 @@ fn role_credit_generates_a_weighted_credit_relation() {
     .expect("parse");
     assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
 
-    let (snapshot, warnings) = build_snapshot(&doc);
+    let (snapshot, _extras, warnings) = build_snapshot(&doc);
     assert!(warnings.is_empty(), "{warnings:?}");
 
     let artist = EntryId("M-ARTIST".into());
@@ -244,7 +244,7 @@ fn script_split_contributors_reach_the_snapshot() {
     .expect("parse");
     assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
 
-    let (snapshot, warnings) = build_snapshot(&doc);
+    let (snapshot, _extras, warnings) = build_snapshot(&doc);
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(snapshot.impacts.len(), 2);
 
@@ -297,7 +297,7 @@ fn dollar_placeholder_ids_are_scoped_to_their_containing_entry() {
         "M-ALBUM-B's $-1 should resolve to M-ALBUM-B-1"
     );
 
-    let (snapshot, warnings) = build_snapshot(&doc);
+    let (snapshot, _extras, warnings) = build_snapshot(&doc);
     assert!(warnings.is_empty(), "{warnings:?}");
     // Two entries, two impacts, two distinct scores - not merged into
     // one shared "$-1" measure.
@@ -313,4 +313,184 @@ fn dollar_placeholder_ids_are_scoped_to_their_containing_entry() {
 
     let scores = score(&snapshot, &params());
     assert!(scores.values[&track_a] > scores.values[&track_b]);
+}
+
+/// End-to-end: a comment immediately before an impact tag reaches
+/// `BuildExtras.source_comments`, and an `AP`-coded impact (an
+/// overloaded box under the legacy palette) is flagged for review,
+/// while an `AU`-coded one (unambiguous) is not.
+#[test]
+fn build_snapshot_captures_comments_and_flags_ambiguous_anchors() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="A-1" title="A">
+                <!-- comedy was weak ngl -->
+                <nei base="0.5" emotions="AP" />
+                <!-- suicidal undertones -->
+                <aei base="0.5" emotions="AU" />
+            </entry>
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+
+    let (snapshot, extras, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(snapshot.impacts.len(), 2);
+
+    let ap_impact = snapshot
+        .impacts
+        .iter()
+        .find(|i| extras.needs_review.contains(&i.id))
+        .expect("the AP-coded impact should be flagged");
+    assert_eq!(
+        extras.source_comments.get(&ap_impact.id).map(String::as_str),
+        Some("comedy was weak ngl")
+    );
+
+    let au_impact = snapshot
+        .impacts
+        .iter()
+        .find(|i| !extras.needs_review.contains(&i.id))
+        .expect("the AU-coded impact should not be flagged");
+    assert_eq!(
+        extras.source_comments.get(&au_impact.id).map(String::as_str),
+        Some("suicidal undertones")
+    );
+}
+
+/// The migration to the new palette (`ANCHOR_PALETTE_PROPOSAL.md`) is
+/// meant to be a pure relabeling with `k_feat` still all-default -- the
+/// same claim the plan calls "byte-identical, not just eyeballed".
+/// Rather than depending on prior git history for a literal
+/// old-palette snapshot, this tests the actual invariant directly:
+/// renaming every `AnchorId` in a scored `Snapshot` back to its legacy
+/// 2-letter box code (the reverse of `snapshot::anchor_for_code`/
+/// `legacy.rs`'s new targets) must not change any score, since
+/// `score()` only ever reads anchor identity for same-cell grouping
+/// and `k_feat` lookups, both of which are relabeled consistently.
+#[test]
+fn anchor_relabeling_does_not_change_scores() {
+    let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
+    let (snapshot, _extras, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let reverse: std::collections::BTreeMap<AnchorId, AnchorId> = [
+        ("comedy", "AP"),
+        ("tragedy", "CU"),
+        ("cozy", "CP"),
+        ("heartwarming", "MP"),
+        ("hate", "AU"),
+        ("discomfort", "MU"),
+        ("writing", "AL"),
+        ("visual", "AV"),
+        ("music", "AM"),
+    ]
+    .into_iter()
+    .map(|(new, old)| (AnchorId(new.into()), AnchorId(old.into())))
+    .collect();
+
+    let relabeled = relabel_snapshot(&snapshot, &reverse);
+
+    let p = params();
+    let original_scores = score(&snapshot, &p);
+    let relabeled_scores = score(&relabeled, &p);
+    // Not bit-exact: BTreeMaps are keyed by the anchor strings
+    // themselves, so relabeling can shift floating-point summation
+    // order enough to move the last ULP (nrs-core's own types.rs docs
+    // note summation order, and so exact bit-pattern, depends on
+    // BTreeMap iteration order) -- the actual claim under test is
+    // "the same score", not "the same bit pattern".
+    assert_eq!(
+        original_scores.values.len(),
+        relabeled_scores.values.len()
+    );
+    for (entry, original) in &original_scores.values {
+        let relabeled = relabeled_scores.values[entry];
+        assert!(
+            (original - relabeled).abs() < 1e-4,
+            "{entry:?}: {original} vs {relabeled}"
+        );
+    }
+}
+
+fn relabel_snapshot(
+    snap: &Snapshot,
+    map: &std::collections::BTreeMap<AnchorId, AnchorId>,
+) -> Snapshot {
+    let relabel = |id: &AnchorId| map.get(id).cloned().unwrap_or_else(|| id.clone());
+
+    let impacts = snap
+        .impacts
+        .iter()
+        .map(|impact| Impact {
+            id: impact.id.clone(),
+            target: impact.target.clone(),
+            atoms: impact
+                .atoms
+                .iter()
+                .map(|atom| Atom {
+                    source: atom.source.clone(),
+                    blend: atom
+                        .blend
+                        .iter()
+                        .map(|(a, w)| (relabel(a), *w))
+                        .collect(),
+                    magnitude: atom.magnitude,
+                    time: atom.time,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let relations = snap
+        .relations
+        .iter()
+        .map(|rel| Relation {
+            kind: rel.kind,
+            from: rel.from.clone(),
+            to: rel.to.clone(),
+            transform: match &rel.transform {
+                Transform::Scalar(w) => Transform::Scalar(*w),
+                Transform::Regional(m) => {
+                    Transform::Regional(m.iter().map(|(a, w)| (relabel(a), *w)).collect())
+                }
+                Transform::Transport(m) => Transform::Transport(
+                    m.iter()
+                        .map(|((a, b), w)| ((relabel(a), relabel(b)), *w))
+                        .collect(),
+                ),
+            },
+        })
+        .collect();
+
+    let anchors = snap
+        .palette
+        .anchors
+        .iter()
+        .map(|a| Anchor {
+            id: relabel(&a.id),
+            label: a.label.clone(),
+            family: a.family.clone(),
+        })
+        .collect();
+    let pairs = snap
+        .palette
+        .k_feat
+        .pairs
+        .iter()
+        .map(|((a, b), k)| ((relabel(a), relabel(b)), *k))
+        .collect();
+
+    Snapshot {
+        entries: snap.entries.clone(),
+        impacts,
+        relations,
+        palette: Palette {
+            anchors,
+            k_feat: KFeatMatrix { pairs },
+        },
+        taxonomy: snap.taxonomy.clone(),
+    }
 }

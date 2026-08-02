@@ -7,6 +7,7 @@ pub enum EventKind {
     ImpactAdd,
     ImpactEdit,
     ImpactDelete,
+    ImpactConfirm,
     RelationAdd,
     RelationEdit,
     RelationDelete,
@@ -15,6 +16,7 @@ pub enum EventKind {
     ParamSet,
     CalibrationSet,
     SnapshotImport,
+    PreferenceRecord,
 }
 
 impl EventKind {
@@ -24,6 +26,7 @@ impl EventKind {
             EventKind::ImpactAdd => "impact.add",
             EventKind::ImpactEdit => "impact.edit",
             EventKind::ImpactDelete => "impact.delete",
+            EventKind::ImpactConfirm => "impact.confirm",
             EventKind::RelationAdd => "relation.add",
             EventKind::RelationEdit => "relation.edit",
             EventKind::RelationDelete => "relation.delete",
@@ -32,6 +35,7 @@ impl EventKind {
             EventKind::ParamSet => "param.set",
             EventKind::CalibrationSet => "calibration.set",
             EventKind::SnapshotImport => "snapshot.import",
+            EventKind::PreferenceRecord => "preference.record",
         }
     }
 }

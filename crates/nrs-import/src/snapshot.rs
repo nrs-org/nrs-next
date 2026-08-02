@@ -20,14 +20,19 @@ use crate::legacy;
 use crate::roles;
 use crate::xml::{ImpactKind, ParsedDocument, ParsedRelation};
 
+/// `AU`/`MU`/`CP` are unambiguous 1:1 renames (`hate`/`discomfort`/
+/// `cozy`); `AP`/`MP`/`CU` were overloaded boxes under the legacy
+/// palette and resolve to a *default* sub-anchor (`comedy`/
+/// `heartwarming`/`tragedy`) -- `is_anchor_ambiguous` below flags
+/// exactly these three for the review UI to confirm or re-split.
 fn anchor_for_code(code: &str) -> Option<AnchorId> {
     match code {
-        "AU" => Some(anchors::au()),
-        "AP" => Some(anchors::ap()),
-        "MU" => Some(anchors::mu()),
-        "MP" => Some(anchors::mp()),
-        "CU" => Some(anchors::cu()),
-        "CP" => Some(anchors::cp()),
+        "AU" => Some(anchors::hate()),
+        "AP" => Some(anchors::comedy()),
+        "MU" => Some(anchors::discomfort()),
+        "MP" => Some(anchors::heartwarming()),
+        "CU" => Some(anchors::tragedy()),
+        "CP" => Some(anchors::cozy()),
         _ => None,
     }
 }
@@ -55,15 +60,15 @@ fn blend_anchors(
 /// `<regularImpact><score><component factor="..">`.
 fn anchor_for_factor_name(name: &str) -> Option<AnchorId> {
     Some(match name {
-        "Emotion.AU" => anchors::au(),
-        "Emotion.AP" => anchors::ap(),
-        "Emotion.MU" => anchors::mu(),
-        "Emotion.MP" => anchors::mp(),
-        "Emotion.CU" => anchors::cu(),
-        "Emotion.CP" => anchors::cp(),
-        "Art.Language" => anchors::al(),
-        "Art.Visual" => anchors::av(),
-        "Art.Music" => anchors::am(),
+        "Emotion.AU" => anchors::hate(),
+        "Emotion.AP" => anchors::comedy(),
+        "Emotion.MU" => anchors::discomfort(),
+        "Emotion.MP" => anchors::heartwarming(),
+        "Emotion.CU" => anchors::tragedy(),
+        "Emotion.CP" => anchors::cozy(),
+        "Art.Language" => anchors::writing(),
+        "Art.Visual" => anchors::visual(),
+        "Art.Music" => anchors::music(),
         "Boredom" => anchors::boredom(),
         "Additional" => anchors::additional(),
         _ => return None,
@@ -181,11 +186,47 @@ fn atoms_for(
     }
 }
 
+/// Comments and anchor-ambiguity flags collected alongside `Snapshot`
+/// during `build_snapshot`, keyed by the `ImpactId`s it generated --
+/// staging data for `nrs-store`'s review workflow, not part of the
+/// frozen `Snapshot`/`Impact` contract itself.
+#[derive(Debug, Default)]
+pub struct BuildExtras {
+    /// The `<!-- -->` block immediately preceding the impact tag, if
+    /// any -- not yet a confirmed `impact.note`, just a suggestion.
+    pub source_comments: BTreeMap<ImpactId, String>,
+    /// Impacts whose anchor came from one of the historically
+    /// overloaded boxes (`AP`/`MP`/`CU`) or an `epi`/`ehi` "legendary
+    /// moment" marker -- these got a *default* anchor, not a confident
+    /// one, and want a human look via the review UI.
+    pub needs_review: BTreeSet<ImpactId>,
+}
+
+/// Whether `kind`'s anchor was a default guess rather than a confident
+/// classification -- see `BuildExtras::needs_review`.
+fn is_anchor_ambiguous(kind: &ImpactKind) -> bool {
+    const OVERLOADED: [&str; 3] = ["AP", "MP", "CU"];
+    const OVERLOADED_FACTORS: [&str; 3] = ["Emotion.AP", "Emotion.MP", "Emotion.CU"];
+    match kind {
+        ImpactKind::Cry { blend }
+        | ImpactKind::Nei { blend, .. }
+        | ImpactKind::Aei { blend, .. }
+        | ImpactKind::Pads { blend, .. } => blend
+            .iter()
+            .any(|(code, _)| OVERLOADED.contains(&code.as_str())),
+        ImpactKind::Epi { .. } | ImpactKind::Ehi => true,
+        ImpactKind::Regular { components } => components
+            .iter()
+            .any(|(factor, _)| OVERLOADED_FACTORS.contains(&factor.as_str())),
+        _ => false,
+    }
+}
+
 /// Build a `Snapshot` from a parsed document. Returns conversion-time
 /// warnings in addition to whatever `xml::parse_file` already
 /// collected during parsing (dangling contributor/relation ids,
 /// out-of-range values, etc.) - callers should combine both.
-pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
+pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, BuildExtras, Vec<String>) {
     let mut warnings = Vec::new();
     let known_ids: BTreeSet<&str> = doc.entries.iter().map(|e| e.id.as_str()).collect();
 
@@ -193,6 +234,7 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
     let mut impacts = Vec::new();
     let mut relations = Vec::new();
     let mut impact_seq = 0usize;
+    let mut extras = BuildExtras::default();
 
     for parsed in &doc.entries {
         entries.push(Entry {
@@ -233,8 +275,15 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
                     })
                     .collect();
                 impact_seq += 1;
+                let id = ImpactId(format!("i{impact_seq}"));
+                if let Some(comment) = &impact.source_comment {
+                    extras.source_comments.insert(id.clone(), comment.clone());
+                }
+                if is_anchor_ambiguous(&impact.kind) {
+                    extras.needs_review.insert(id.clone());
+                }
                 impacts.push(Impact {
-                    id: ImpactId(format!("i{impact_seq}")),
+                    id,
                     target: EntryId(contributor_id.clone()),
                     atoms,
                 });
@@ -355,5 +404,56 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, Vec<String>) {
         },
         taxonomy,
     };
-    (snapshot, warnings)
+    (snapshot, extras, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blend(codes: &[&str]) -> Vec<(String, f32)> {
+        codes.iter().map(|c| (c.to_string(), 1.0)).collect()
+    }
+
+    #[test]
+    fn overloaded_boxes_are_ambiguous() {
+        assert!(is_anchor_ambiguous(&ImpactKind::Nei {
+            base: 0.5,
+            blend: blend(&["AP"]),
+        }));
+        assert!(is_anchor_ambiguous(&ImpactKind::Aei {
+            base: 0.5,
+            blend: blend(&["MP"]),
+        }));
+        assert!(is_anchor_ambiguous(&ImpactKind::Cry {
+            blend: blend(&["CU"]),
+        }));
+        // Mixed blend: any overloaded code taints the whole impact.
+        assert!(is_anchor_ambiguous(&ImpactKind::Nei {
+            base: 0.5,
+            blend: blend(&["CP", "AP"]),
+        }));
+        assert!(is_anchor_ambiguous(&ImpactKind::Epi { factor: 1.0 }));
+        assert!(is_anchor_ambiguous(&ImpactKind::Ehi));
+    }
+
+    #[test]
+    fn unambiguous_boxes_are_not_flagged() {
+        assert!(!is_anchor_ambiguous(&ImpactKind::Nei {
+            base: 0.5,
+            blend: blend(&["AU"]),
+        }));
+        assert!(!is_anchor_ambiguous(&ImpactKind::Aei {
+            base: 0.5,
+            blend: blend(&["MU"]),
+        }));
+        assert!(!is_anchor_ambiguous(&ImpactKind::Cry {
+            blend: blend(&["CP"]),
+        }));
+        assert!(!is_anchor_ambiguous(&ImpactKind::Waifu { days: 30.0 }));
+        assert!(!is_anchor_ambiguous(&ImpactKind::Meme {
+            strength: 0.5,
+            days: 10.0,
+        }));
+    }
 }

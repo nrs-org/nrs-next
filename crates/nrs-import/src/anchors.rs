@@ -1,41 +1,73 @@
-//! The starting palette: one anchor per legacy `nrs-lib-ts` factor
-//! (`DAH_factors.ts`), named after the old short names so the mapping
-//! is traceable at a glance. This is a literal 1:1 migration target,
-//! not a considered palette — expected to be replaced/refined once
-//! real anchors are chosen.
+//! The considered palette (`../../ANCHOR_PALETTE_PROPOSAL.md`), replacing
+//! the legacy `nrs-lib-ts` 6-box valence/arousal grid + 3 craft factors
+//! (`DAH_factors.ts`) this crate started as a literal migration target
+//! of. Mined from the real dataset, not designed in the abstract -- see
+//! the proposal doc for the evidence behind each split.
 
 use nrs_core::AnchorId;
 
-pub fn au() -> AnchorId {
-    AnchorId("AU".into())
+// -- feeling anchors, replacing the old AP/MP/CU boxes --------------
+
+pub fn comedy() -> AnchorId {
+    AnchorId("comedy".into())
 }
-pub fn ap() -> AnchorId {
-    AnchorId("AP".into())
+pub fn hype() -> AnchorId {
+    AnchorId("hype".into())
 }
-pub fn mu() -> AnchorId {
-    AnchorId("MU".into())
+pub fn tragedy() -> AnchorId {
+    AnchorId("tragedy".into())
 }
-pub fn mp() -> AnchorId {
-    AnchorId("MP".into())
+pub fn wistful() -> AnchorId {
+    AnchorId("wistful".into())
 }
-pub fn cu() -> AnchorId {
-    AnchorId("CU".into())
+pub fn cozy() -> AnchorId {
+    AnchorId("cozy".into())
 }
-pub fn cp() -> AnchorId {
-    AnchorId("CP".into())
+pub fn heartwarming() -> AnchorId {
+    AnchorId("heartwarming".into())
 }
-pub fn al() -> AnchorId {
-    AnchorId("AL".into())
+pub fn hate() -> AnchorId {
+    AnchorId("hate".into())
 }
-pub fn av() -> AnchorId {
-    AnchorId("AV".into())
+pub fn discomfort() -> AnchorId {
+    AnchorId("discomfort".into())
 }
-pub fn am() -> AnchorId {
-    AnchorId("AM".into())
+
+// -- previously-conflated special-case impacts, now their own anchors --
+
+pub fn waifu() -> AnchorId {
+    AnchorId("waifu".into())
 }
+pub fn meme() -> AnchorId {
+    AnchorId("meme".into())
+}
+pub fn hooked() -> AnchorId {
+    AnchorId("hooked".into())
+}
+pub fn worldview() -> AnchorId {
+    AnchorId("worldview".into())
+}
+pub fn gateway() -> AnchorId {
+    AnchorId("gateway".into())
+}
+
+// -- craft factors, kept (renamed from AL/AV/AM) ---------------------
+
+pub fn writing() -> AnchorId {
+    AnchorId("writing".into())
+}
+pub fn visual() -> AnchorId {
+    AnchorId("visual".into())
+}
+pub fn music() -> AnchorId {
+    AnchorId("music".into())
+}
+
+// -- scalar extras, kept --------------------------------------------
+
 pub fn boredom() -> AnchorId {
-    AnchorId("Boredom".into())
+    AnchorId("boredom".into())
 }
 pub fn additional() -> AnchorId {
-    AnchorId("Additional".into())
+    AnchorId("additional".into())
 }

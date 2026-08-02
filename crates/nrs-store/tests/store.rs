@@ -140,7 +140,11 @@ fn edit_impact_replaces_atoms() {
         .unwrap();
 
     store
-        .edit_impact(&impact_id, &[sample_atom("gorgeous-visuals", "src-b", 2.0)])
+        .edit_impact(
+            &impact_id,
+            &[sample_atom("gorgeous-visuals", "src-b", 2.0)],
+            None,
+        )
         .unwrap();
 
     let (snap, _) = store.load_snapshot().unwrap();
@@ -184,7 +188,11 @@ fn each_mutation_appends_exactly_one_event() {
     assert_eq!(store.event_log().unwrap().len(), 2);
 
     store
-        .edit_impact(&impact_id, &[sample_atom("gorgeous-visuals", "src-b", 1.0)])
+        .edit_impact(
+            &impact_id,
+            &[sample_atom("gorgeous-visuals", "src-b", 1.0)],
+            None,
+        )
         .unwrap();
     let events = store.event_log().unwrap();
     assert_eq!(events.len(), 3);
@@ -250,6 +258,59 @@ fn every_relkind_round_trips_through_its_text_column() {
     ] {
         assert!(kinds.contains(&kind), "{kind:?} did not round-trip");
     }
+}
+
+#[test]
+fn preferences_round_trip_and_append_events() {
+    let mut store = Store::open_in_memory().unwrap();
+    let a = store.add_entry("music", "a", None).unwrap();
+    let b = store.add_entry("music", "b", None).unwrap();
+    let c = store.add_entry("music", "c", None).unwrap();
+
+    store
+        .record_preference(&a, &b, Some("A is just better"))
+        .unwrap();
+    store.record_preference(&b, &c, None).unwrap();
+
+    let preferences = store.load_preferences().unwrap();
+    assert_eq!(preferences.len(), 2);
+    assert_eq!(preferences[0].winner, a);
+    assert_eq!(preferences[0].loser, b);
+    assert_eq!(preferences[0].confidence, 1.0);
+    assert_eq!(preferences[1].winner, b);
+    assert_eq!(preferences[1].loser, c);
+
+    let events = store.event_log().unwrap();
+    let preference_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "preference.record")
+        .collect();
+    assert_eq!(preference_events.len(), 2);
+    assert!(preference_events[0].before.is_none());
+    assert!(preference_events[0].after.is_some());
+    assert_eq!(
+        preference_events[0].note.as_deref(),
+        Some("A is just better")
+    );
+
+    // Unrelated events (the three add_entry calls) don't leak in as
+    // preferences: total events = 5, but the filtered set above is 2.
+    assert_eq!(events.len(), 5);
+}
+
+#[test]
+fn set_kfeat_pair_auto_registers_unknown_anchors() {
+    // nrs-import doesn't populate Palette.anchors, so an anchor id that
+    // only ever appeared in an atom's blend wouldn't already have an
+    // `anchor` row -- set_kfeat_pair must not require it to.
+    let mut store = Store::open_in_memory().unwrap();
+    let a = AnchorId("AU".into());
+    let b = AnchorId("AP".into());
+    store.set_kfeat_pair(&a, &b, 0.4).unwrap();
+
+    let (snap, _) = store.load_snapshot().unwrap();
+    assert_eq!(snap.palette.k_feat.get(&a, &b), 0.4);
+    assert_eq!(snap.palette.anchors.len(), 2);
 }
 
 fn tempdir_path() -> std::path::PathBuf {

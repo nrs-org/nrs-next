@@ -14,6 +14,6 @@ pub mod xml;
 pub mod xtree;
 
 pub use legacy::*;
-pub use snapshot::build_snapshot;
+pub use snapshot::{build_snapshot, BuildExtras};
 pub use store::write_snapshot;
 pub use xml::{parse_file, ImportError, ParsedDocument};

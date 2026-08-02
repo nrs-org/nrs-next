@@ -102,7 +102,7 @@ fn main() {
     let today = time::OffsetDateTime::now_utc().date();
 
     let doc = nrs_import::xml::parse_file(&path, today).expect("parse");
-    let (snap, _warnings) = nrs_import::build_snapshot(&doc);
+    let (snap, _extras, _warnings) = nrs_import::build_snapshot(&doc);
     println!(
         "snapshot: {} entries, {} impacts, {} relations\n",
         snap.entries.len(),

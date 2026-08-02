@@ -93,31 +93,36 @@ pub fn aei(source: SourceId, factor: f32, sign: f32, blend: &[(AnchorId, f32)]) 
     emotion_atoms(source, base, blend)
 }
 
+/// "Legendary moment" markers, currently always routed to `comedy` as a
+/// placeholder -- INFRA.md's migration mapping flags `epi`/`ehi` as
+/// always needing individual review (`BuildExtras::needs_review`),
+/// since the real emotion depends on the specific moment and can't be
+/// determined from the tag alone.
 pub fn ehi(source: SourceId) -> Vec<Atom> {
-    emotion_atoms(source, 3.5, &[(anchors::ap(), 1.0)])
+    emotion_atoms(source, 3.5, &[(anchors::comedy(), 1.0)])
 }
 
 pub fn epi(source: SourceId, factor: f32) -> Vec<Atom> {
     let base = remap(factor, 0.0, 1.0, 3.5, 4.5);
-    emotion_atoms(source, base, &[(anchors::ap(), 1.0)])
+    emotion_atoms(source, base, &[(anchors::comedy(), 1.0)])
 }
 
 pub fn jumpscare(source: SourceId) -> Vec<Atom> {
-    emotion_atoms(source, 1.0, &[(anchors::mp(), 1.0)])
+    emotion_atoms(source, 1.0, &[(anchors::hooked(), 1.0)])
 }
 
 pub fn sleepless_night(source: SourceId) -> Vec<Atom> {
-    emotion_atoms(source, 4.0, &[(anchors::mp(), 1.0)])
+    emotion_atoms(source, 4.0, &[(anchors::hooked(), 1.0)])
 }
 
 pub fn politics(source: SourceId) -> Vec<Atom> {
-    flat_atom(source, anchors::additional(), 0.75)
+    flat_atom(source, anchors::worldview(), 0.75)
 }
 
 pub fn interest_field(source: SourceId, new_field: bool) -> Vec<Atom> {
     flat_atom(
         source,
-        anchors::additional(),
+        anchors::gateway(),
         if new_field { 2.0 } else { 1.0 },
     )
 }
@@ -127,12 +132,12 @@ pub fn additional(source: SourceId, value: f32) -> Vec<Atom> {
 }
 
 pub fn music(source: SourceId, music_base: f32) -> Vec<Atom> {
-    flat_atom(source, anchors::am(), music_base * 3.0)
+    flat_atom(source, anchors::music(), music_base * 3.0)
 }
 
 pub fn visual(source: SourceId, visual_type_factor: f32, base: f32, unique: f32) -> Vec<Atom> {
     let score = ((base * (unique + 2.0)) / 3.0) * visual_type_factor * 2.0;
-    flat_atom(source, anchors::av(), score)
+    flat_atom(source, anchors::visual(), score)
 }
 
 pub fn writing(
@@ -146,20 +151,27 @@ pub fn writing(
     let base = m * (character_complexity + story_quality) / 2.0 * (1.0 + pacing) / 2.0
         * (1.0 + originality)
         / 2.0;
-    flat_atom(source, anchors::al(), base)
+    flat_atom(source, anchors::writing(), base)
 }
 
+/// Splits cleanly into the two anchors the palette proposal already
+/// names: `personal` (played/mastered this specific map) is the same
+/// "invested in this one thing" feeling as `hooked`; `community` (how
+/// big a deal it is in the osu scene) is the same cultural-currency
+/// shape as `meme`. One `osuSong` tag, two atoms.
 pub fn osu_song(source: SourceId, personal: f32, community: f32) -> Vec<Atom> {
     let personal_factor = remap(personal, 0.0, 1.0, 0.0, 0.5);
     let community_factor = remap(community, 0.0, 1.0, 0.0, 0.2);
-    flat_atom(source, anchors::ap(), personal_factor + community_factor)
+    let mut atoms = flat_atom(source.clone(), anchors::hooked(), personal_factor);
+    atoms.extend(flat_atom(source, anchors::meme(), community_factor));
+    atoms
 }
 
 // --- Duration-decayed impacts (already-collapsed magnitudes) ---------
 
 pub fn waifu(source: SourceId, days: f32) -> Vec<Atom> {
     let base = 1.2 * (days / 90.0).powf(0.35); // MP.factorWeight
-    flat_atom(source, anchors::mp(), base)
+    flat_atom(source, anchors::waifu(), base)
 }
 
 pub fn meme(source: SourceId, strength: f32, days: f32) -> Vec<Atom> {
@@ -168,7 +180,7 @@ pub fn meme(source: SourceId, strength: f32, days: f32) -> Vec<Atom> {
         "strength out of [0, 2) range"
     );
     let base = strength * (days / 120.0).powf(0.4) * 4.0; // AP.factorWeight
-    flat_atom(source, anchors::ap(), base)
+    flat_atom(source, anchors::meme(), base)
 }
 
 pub fn pads(source: SourceId, days: f32, blend: &[(AnchorId, f32)]) -> Vec<Atom> {
@@ -243,7 +255,7 @@ pub fn remix(from: nrs_core::EntryId, to: nrs_core::EntryId) -> Relation {
 
 pub fn feature_music(from: nrs_core::EntryId, to: nrs_core::EntryId) -> Relation {
     let mut map = BTreeMap::new();
-    map.insert(anchors::am(), 0.2);
+    map.insert(anchors::music(), 0.2);
     Relation {
         kind: RelKind::FeatureMusic,
         from,
@@ -252,6 +264,10 @@ pub fn feature_music(from: nrs_core::EntryId, to: nrs_core::EntryId) -> Relation
     }
 }
 
+/// Structural discount across old box identities has no per-instance
+/// content to disambiguate, so this uses the same box-level defaults
+/// as everywhere else in the migration (`AP->comedy`, `MP->heartwarming`,
+/// `CU->tragedy`) rather than trying to split it.
 pub fn killed_by(
     from: nrs_core::EntryId,
     to: nrs_core::EntryId,
@@ -262,14 +278,14 @@ pub fn killed_by(
     let scale = potential * effect * base;
     let mut map = BTreeMap::new();
     for (anchor, coefficient) in [
-        (anchors::ap(), 0.2),
-        (anchors::au(), 0.1),
-        (anchors::cp(), 0.05),
-        (anchors::cu(), 0.05),
-        (anchors::mp(), 0.2),
-        (anchors::mu(), 0.1),
-        (anchors::al(), 0.1),
-        (anchors::am(), 0.1),
+        (anchors::comedy(), 0.2),
+        (anchors::hate(), 0.1),
+        (anchors::cozy(), 0.05),
+        (anchors::tragedy(), 0.05),
+        (anchors::heartwarming(), 0.2),
+        (anchors::discomfort(), 0.1),
+        (anchors::writing(), 0.1),
+        (anchors::music(), 0.1),
         (anchors::boredom(), 0.1),
         // AV and Additional are 0 in the old DiagonalMatrix; the
         // sparse Regional map's default (0.0) already matches.
@@ -305,7 +321,7 @@ mod tests {
     #[test]
     fn writing_matches_clannad() {
         let atom = only(writing(s("A-MAL-2167"), 0.5, 0.5, 0.8, 0.8));
-        assert_eq!(atom.blend, vec![(anchors::al(), 1.0)]);
+        assert_eq!(atom.blend, vec![(anchors::writing(), 1.0)]);
         // 4*(0.5+0.5)/2 * 1.8/2 * 1.8/2 = 4*0.5*0.9*0.9 = 1.62
         assert!((atom.magnitude - 1.62).abs() < 1e-4, "{}", atom.magnitude);
     }
@@ -315,7 +331,7 @@ mod tests {
     #[test]
     fn visual_matches_clannad() {
         let atom = only(visual(s("A-MAL-2167"), 1.0, 0.35, 0.75));
-        assert_eq!(atom.blend, vec![(anchors::av(), 1.0)]);
+        assert_eq!(atom.blend, vec![(anchors::visual(), 1.0)]);
         assert!(
             (atom.magnitude - 0.641667).abs() < 1e-4,
             "{}",
@@ -344,7 +360,7 @@ mod tests {
             s("A-MAL-2167"),
             0.3,
             1.0,
-            &[(anchors::cu(), 0.5), (anchors::cp(), 0.5)],
+            &[(anchors::tragedy(), 0.5), (anchors::cozy(), 0.5)],
         );
         assert_eq!(atoms.len(), 2);
         // Equal 0.5/0.5 split: combined = 2^-0.4, magnitude = 0.6/sqrt(2).
@@ -362,12 +378,12 @@ mod tests {
     /// normalisation effect when there's nothing to split against.
     #[test]
     fn nei_single_anchor_is_identity() {
-        let atom = only(nei(s("e"), 0.6, 1.0, &[(anchors::ap(), 1.0)]));
+        let atom = only(nei(s("e"), 0.6, 1.0, &[(anchors::comedy(), 1.0)]));
         assert!((atom.magnitude - 1.2).abs() < 1e-5, "{}", atom.magnitude);
     }
 
     #[test]
-    fn waifu_uses_mp_own_weight_as_exponent() {
+    fn waifu_uses_its_own_weight_as_exponent() {
         let atom = only(waifu(s("e"), 90.0));
         // days == the 90-day reference point, so (days/90)^w == 1.
         assert!((atom.magnitude - 1.2).abs() < 1e-5, "{}", atom.magnitude);
@@ -385,12 +401,12 @@ mod tests {
         let r = killed_by(e("a"), e("b"), 0.3, 1.0);
         match r.transform {
             Transform::Regional(map) => {
-                let ap = map.get(&anchors::ap()).copied().unwrap();
+                let comedy = map.get(&anchors::comedy()).copied().unwrap();
                 // 0.2 * (0.3 * 1.0 * 0.4) = 0.024
-                assert!((ap - 0.024).abs() < 1e-5, "{ap}");
+                assert!((comedy - 0.024).abs() < 1e-5, "{comedy}");
                 assert!(
-                    !map.contains_key(&anchors::av()),
-                    "AV must be absent (0 coefficient)"
+                    !map.contains_key(&anchors::visual()),
+                    "visual must be absent (0 coefficient)"
                 );
             }
             other => panic!("expected Regional, got {other:?}"),

@@ -34,7 +34,7 @@ fn main() {
         .expect("usage: monotonicity_audit <path to NRSImplMain.xml>");
     let today = time::OffsetDateTime::now_utc().date();
     let doc = nrs_import::parse_file(std::path::Path::new(&path), today).expect("parse");
-    let (snap, _warnings) = nrs_import::build_snapshot(&doc);
+    let (snap, _extras, _warnings) = nrs_import::build_snapshot(&doc);
     eprintln!(
         "loaded {} entries, {} impacts, {} relations",
         snap.entries.len(),

@@ -33,23 +33,29 @@ use nrs_core::AnchorId;
 use crate::anchors;
 
 const N: usize = 11;
-const IDX_AL: usize = 6;
-const IDX_AV: usize = 7;
-const IDX_AM: usize = 8;
+const IDX_WRITING: usize = 6;
+const IDX_VISUAL: usize = 7;
+const IDX_MUSIC: usize = 8;
 
 type Vec11 = [f32; N];
 
+/// Positions are historical (the old 11-factor space), not the new
+/// palette's own ordering -- `hate`/`comedy`/`discomfort`/
+/// `heartwarming`/`tragedy`/`cozy` sit at the old `AU`/`AP`/`MU`/`MP`/
+/// `CU`/`CP` box-default positions (see `snapshot::anchor_for_code`),
+/// so a role's weight vector still lands on the same defaults
+/// everything else does; `AP`/`MP`/`CU`'s ambiguity applies here too.
 fn anchor_order() -> [AnchorId; N] {
     [
-        anchors::au(),
-        anchors::ap(),
-        anchors::mu(),
-        anchors::mp(),
-        anchors::cu(),
-        anchors::cp(),
-        anchors::al(),
-        anchors::av(),
-        anchors::am(),
+        anchors::hate(),
+        anchors::comedy(),
+        anchors::discomfort(),
+        anchors::heartwarming(),
+        anchors::tragedy(),
+        anchors::cozy(),
+        anchors::writing(),
+        anchors::visual(),
+        anchors::music(),
         anchors::boredom(),
         anchors::additional(),
     ]
@@ -227,12 +233,12 @@ fn calc(role: RoleType, vars: &MusicVars) -> Vec11 {
         Atomic(Lyrics) => mul(
             calc(Composite(VocalLyrics), vars),
             add(
-                add(scalar(vars.emolyrics), at(IDX_AL, 1.0 - vars.emolyrics)),
-                at(IDX_AM, vars.lyricsmusic - vars.emolyrics),
+                add(scalar(vars.emolyrics), at(IDX_WRITING, 1.0 - vars.emolyrics)),
+                at(IDX_MUSIC, vars.lyricsmusic - vars.emolyrics),
             ),
         ),
-        Atomic(Mv) => at(IDX_AV, 1.0),
-        Atomic(AlbumArt) => at(IDX_AV, 1.0),
+        Atomic(Mv) => at(IDX_VISUAL, 1.0),
+        Atomic(AlbumArt) => at(IDX_VISUAL, 1.0),
         Composite(MusicTotal) => calc(Atomic(Total), vars),
         Composite(ImageTotal) => scale(calc(Composite(MusicTotal), vars), 0.2),
         Composite(VocalLyrics) => mul(
@@ -240,7 +246,7 @@ fn calc(role: RoleType, vars: &MusicVars) -> Vec11 {
                 calc(Composite(MusicTotal), vars),
                 calc(Composite(ImageTotal), vars),
             ),
-            add(scalar(vars.vocallyrics), at(IDX_AL, 1.0 - vars.vocallyrics)),
+            add(scalar(vars.vocallyrics), at(IDX_WRITING, 1.0 - vars.vocallyrics)),
         ),
         Composite(InstTotal) => sub(
             sub(
@@ -367,7 +373,7 @@ mod tests {
         let terms = parse_role_expression("mv").unwrap();
         let v = weight_vector(&terms, &MusicVars::default());
         for (i, &x) in v.iter().enumerate() {
-            if i == IDX_AV {
+            if i == IDX_VISUAL {
                 assert!((x - 1.0).abs() < 1e-6);
             } else {
                 assert!(x.abs() < 1e-6, "index {i} should be 0, got {x}");
@@ -379,7 +385,7 @@ mod tests {
     fn expression_with_multiplier_scales_result() {
         let terms = parse_role_expression("mv*2").unwrap();
         let v = weight_vector(&terms, &MusicVars::default());
-        assert!((v[IDX_AV] - 2.0).abs() < 1e-6);
+        assert!((v[IDX_VISUAL] - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -451,7 +457,7 @@ mod tests {
         let terms_twice = parse_role_expression("mv+mv").unwrap();
         let once = weight_vector(&terms_once, &MusicVars::default());
         let twice = weight_vector(&terms_twice, &MusicVars::default());
-        assert!((twice[IDX_AV] - 2.0 * once[IDX_AV]).abs() < 1e-6);
+        assert!((twice[IDX_VISUAL] - 2.0 * once[IDX_VISUAL]).abs() < 1e-6);
     }
 
     #[test]

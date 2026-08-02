@@ -34,6 +34,14 @@ pub struct XNode {
     /// (mirrors `<include>`'s own path resolution). `Arc` because
     /// every node from one file shares the identical path.
     source_dir: Arc<Path>,
+    /// The consecutive run of `<!-- -->` comments immediately before
+    /// this node in the source (joined by newline), if any - real
+    /// grading reasoning lives here far more often than in the
+    /// structured attributes (`nrs-store`'s `impact.note`, once
+    /// confirmed through the review UI, is seeded from this). Only
+    /// tracked for nested nodes (impact tags are always nested inside
+    /// an `<entry>`); top-level document children don't collect this.
+    preceding_comment: Option<String>,
 }
 
 impl XNode {
@@ -55,6 +63,10 @@ impl XNode {
     pub fn source_dir(&self) -> &Path {
         &self.source_dir
     }
+    /// The comment block immediately preceding this node, if any.
+    pub fn preceding_comment(&self) -> Option<&str> {
+        self.preceding_comment.as_deref()
+    }
 }
 
 pub fn from_roxmltree(node: roxmltree::Node, source_dir: &Arc<Path>) -> XNode {
@@ -65,11 +77,34 @@ pub fn from_roxmltree(node: roxmltree::Node, source_dir: &Arc<Path>) -> XNode {
         .collect();
     let mut children = Vec::new();
     let mut text = String::new();
+    // Comments are collected separately from `text` (previously they
+    // were silently merged into it via the `child.text()` fallback,
+    // since roxmltree's `.text()` also covers comment nodes) and
+    // attached to whichever element immediately follows a run of them
+    // - matching how every comment in the real data actually sits.
+    // Non-whitespace text content between a comment and an element
+    // breaks the association; pure indentation/whitespace doesn't.
+    let mut pending_comment: Vec<String> = Vec::new();
     for child in node.children() {
-        if child.is_element() {
-            children.push(from_roxmltree(child, source_dir));
+        if child.is_comment() {
+            if let Some(t) = child.text() {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    pending_comment.push(trimmed.to_string());
+                }
+            }
+        } else if child.is_element() {
+            let mut child_node = from_roxmltree(child, source_dir);
+            if !pending_comment.is_empty() {
+                child_node.preceding_comment = Some(pending_comment.join("\n"));
+            }
+            pending_comment.clear();
+            children.push(child_node);
         } else if let Some(t) = child.text() {
             text.push_str(t);
+            if !t.trim().is_empty() {
+                pending_comment.clear();
+            }
         }
     }
     XNode {
@@ -78,6 +113,7 @@ pub fn from_roxmltree(node: roxmltree::Node, source_dir: &Arc<Path>) -> XNode {
         children,
         text,
         source_dir: source_dir.clone(),
+        preceding_comment: None,
     }
 }
 
@@ -138,6 +174,10 @@ fn substitute_children(
                 children: substitute_children(&node.children, vars, ref_children),
                 text: substitute_string(&node.text, vars),
                 source_dir: node.source_dir.clone(),
+                // Template-internal comments aren't meaningful per
+                // instantiation; a <ref> call site's own comment is
+                // reattached separately in expand_refs_depth below.
+                preceding_comment: None,
             });
         }
     }
@@ -189,8 +229,18 @@ fn expand_refs_depth(
                     .filter(|(k, _)| k.as_str() != "name")
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
+                let ref_comment = node.preceding_comment.clone();
                 let expanded = substitute_children(&macro_def.template, &args, &node.children);
-                expand_refs_depth(expanded, macros, warnings, depth + 1)
+                let mut expanded = expand_refs_depth(expanded, macros, warnings, depth + 1);
+                // The <ref> call site's own comment (e.g. "during the
+                // anti-ksdgk era..." before <ref name="KoikakeAEI" />)
+                // annotates whatever it expands to, not the template
+                // definition - reattach it to the first expanded node
+                // rather than lose it.
+                if let (Some(comment), Some(first)) = (ref_comment, expanded.first_mut()) {
+                    first.preceding_comment.get_or_insert(comment);
+                }
+                expanded
             } else {
                 let XNode {
                     tag,
@@ -198,6 +248,7 @@ fn expand_refs_depth(
                     children,
                     text,
                     source_dir,
+                    preceding_comment,
                 } = node;
                 vec![XNode {
                     tag,
@@ -205,6 +256,7 @@ fn expand_refs_depth(
                     children: expand_refs_depth(children, macros, warnings, depth + 1),
                     text,
                     source_dir,
+                    preceding_comment,
                 }]
             }
         })
@@ -282,5 +334,67 @@ mod tests {
         let expanded = expand_refs(nodes, &macros, &mut warnings);
         assert!(expanded.is_empty());
         assert!(warnings.iter().any(|w| w.contains("DoesNotExist")));
+    }
+
+    #[test]
+    fn captures_the_comment_block_immediately_preceding_a_nested_element() {
+        let nodes = parse(
+            r#"<r>
+                <outer>
+                    <!-- first line -->
+                    <!-- second line -->
+                    <inner />
+                    <after />
+                </outer>
+            </r>"#,
+        );
+        let outer = &nodes[0];
+        let inner = outer.children().find(|n| n.tag_name() == "inner").unwrap();
+        assert_eq!(inner.preceding_comment(), Some("first line\nsecond line"));
+
+        // A later sibling with no comment of its own doesn't inherit
+        // the previous one.
+        let after = outer.children().find(|n| n.tag_name() == "after").unwrap();
+        assert_eq!(after.preceding_comment(), None);
+    }
+
+    #[test]
+    fn real_text_between_comment_and_element_breaks_the_association() {
+        let nodes = parse(
+            r#"<r>
+                <outer>
+                    <!-- orphaned -->
+                    some real text
+                    <inner />
+                </outer>
+            </r>"#,
+        );
+        let outer = &nodes[0];
+        let inner = outer.children().find(|n| n.tag_name() == "inner").unwrap();
+        assert_eq!(inner.preceding_comment(), None);
+    }
+
+    #[test]
+    fn ref_call_site_comment_is_reattached_to_its_expansion() {
+        let nodes = parse(
+            r#"<r>
+                <def name="Greet" vars="a_name:string">
+                    <cry emotions="a_name" />
+                </def>
+                <outer>
+                    <!-- why this exists -->
+                    <ref name="Greet" a_name="MU" />
+                </outer>
+            </r>"#,
+        );
+        let mut macros = BTreeMap::new();
+        collect_macros(&nodes, &mut macros);
+        let mut warnings = Vec::new();
+        let expanded = expand_refs(nodes, &macros, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let outer = expanded.iter().find(|n| n.tag_name() == "outer").unwrap();
+        let cry = outer.children().find(|n| n.tag_name() == "cry").unwrap();
+        assert_eq!(cry.preceding_comment(), Some("why this exists"));
     }
 }

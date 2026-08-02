@@ -2,7 +2,7 @@ fn main() {
     let path = std::path::Path::new("/home/ayaneso/dev/nrs-org/nrs-impl/nrs/NRSImplMain.xml");
     let today = time::OffsetDateTime::now_utc().date();
     let doc = nrs_import::xml::parse_file(path, today).expect("parse");
-    let (snap, _w) = nrs_import::build_snapshot(&doc);
+    let (snap, _extras, _w) = nrs_import::build_snapshot(&doc);
 
     let params = nrs_core::Params {
         q: 0.6,

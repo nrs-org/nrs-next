@@ -24,11 +24,11 @@ fn new_id() -> String {
     Ulid::new().to_string()
 }
 
-fn to_json<T: Serialize>(v: Option<&T>) -> Result<Option<String>> {
+pub(crate) fn to_json<T: Serialize>(v: Option<&T>) -> Result<Option<String>> {
     v.map(serde_json::to_string).transpose().map_err(Into::into)
 }
 
-fn append_event(
+pub(crate) fn append_event(
     tx: &Transaction,
     kind: EventKind,
     target: Option<&str>,
@@ -137,6 +137,24 @@ fn read_anchor(tx: &Transaction, id: &AnchorId) -> Result<Option<Anchor>> {
     .map_err(Into::into)
 }
 
+/// Inserts a minimal `anchor` row (label = the id itself) if one
+/// doesn't already exist. See `set_kfeat_pair`'s doc comment.
+fn ensure_anchor_exists(tx: &Transaction, id: &AnchorId) -> Result<()> {
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM anchor WHERE id = ?1", params![id.0], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_some();
+    if !exists {
+        tx.execute(
+            "INSERT INTO anchor (id, label, family) VALUES (?1, ?2, NULL)",
+            params![id.0, id.0],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn add_entry(
         &mut self,
@@ -200,13 +218,17 @@ impl Store {
         Ok(ImpactId(id))
     }
 
-    pub fn edit_impact(&mut self, id: &ImpactId, atoms: &[Atom]) -> Result<()> {
+    pub fn edit_impact(&mut self, id: &ImpactId, atoms: &[Atom], note: Option<&str>) -> Result<()> {
         let tx = self.conn.transaction()?;
         let before = read_impact(&tx, id)?;
         tx.execute("DELETE FROM impact_atom WHERE impact = ?1", params![id.0])?;
         for atom in atoms {
             insert_atom(&tx, &id.0, atom)?;
         }
+        tx.execute(
+            "UPDATE impact SET note = ?2 WHERE id = ?1",
+            params![id.0, note],
+        )?;
         let after = read_impact(&tx, id)?;
         append_event(
             &tx,
@@ -214,9 +236,53 @@ impl Store {
             Some(&id.0),
             to_json(before.as_ref())?.as_deref(),
             to_json(after.as_ref())?.as_deref(),
+            note,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Accepts the current review suggestion as final, for the `/review`
+    /// UI's common "this looks right" path: if `impact.note` (the
+    /// existing `SCHEMA_V1` column) is still unset, fills it in from the
+    /// `ReviewLog`'s raw `source_comment` for this impact; clears the
+    /// `needs_review` flag regardless of whether there was a comment to
+    /// promote. Unlike `edit_impact`, this never touches the blend --
+    /// confirming doesn't imply agreement with a specific anchor, just
+    /// that nothing here needs a second look anymore.
+    pub fn confirm_impact(&mut self, id: &ImpactId) -> Result<()> {
+        let source_comment = self.review.get(&id.0).source_comment;
+
+        let tx = self.conn.transaction()?;
+        let before = read_impact(&tx, id)?;
+        let has_note: Option<String> = tx
+            .query_row(
+                "SELECT note FROM impact WHERE id = ?1",
+                params![id.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if has_note.is_none() {
+            if let Some(comment) = &source_comment {
+                tx.execute(
+                    "UPDATE impact SET note = ?2 WHERE id = ?1",
+                    params![id.0, comment],
+                )?;
+            }
+        }
+        let after = read_impact(&tx, id)?;
+        append_event(
+            &tx,
+            EventKind::ImpactConfirm,
+            Some(&id.0),
+            to_json(before.as_ref())?.as_deref(),
+            to_json(after.as_ref())?.as_deref(),
             None,
         )?;
         tx.commit()?;
+
+        self.review.clear_needs_review(&id.0)?;
         Ok(())
     }
 
@@ -355,6 +421,16 @@ impl Store {
 
     pub fn set_kfeat_pair(&mut self, a: &AnchorId, b: &AnchorId, k: f32) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // `kfeat.a`/`kfeat.b` are FK-constrained to `anchor(id)`, but
+        // `nrs-import` doesn't populate `Palette.anchors` yet -- so an
+        // anchor id that only ever appeared in an atom's `blend` (the
+        // common case for imported data) wouldn't exist as a row here.
+        // Auto-register it minimally rather than making every caller of
+        // this method know about that gap; this is plumbing to satisfy
+        // the constraint, not a user action, so it doesn't get its own
+        // event (the `kfeat.set` event below is the meaningful one).
+        ensure_anchor_exists(&tx, a)?;
+        ensure_anchor_exists(&tx, b)?;
         let before: Option<f32> = tx
             .query_row(
                 "SELECT k FROM kfeat WHERE a = ?1 AND b = ?2",
@@ -440,5 +516,143 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use nrs_core::{AnchorId, Atom, Entry, Palette, Snapshot, SourceId, Taxonomy, TimeSupport};
+
+    use super::*;
+    use crate::ImportExtras;
+
+    fn sample_atom(anchor: &str, source: &str, magnitude: f32) -> Atom {
+        Atom {
+            source: SourceId(source.into()),
+            blend: vec![(AnchorId(anchor.into()), 1.0)],
+            magnitude,
+            time: TimeSupport::Moment,
+        }
+    }
+
+    fn read_note(store: &Store, id: &ImpactId) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT note FROM impact WHERE id = ?1",
+                params![id.0],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Seeds a store the way `nrs-import`'s bulk path does (fixed ids,
+    /// staging state in `ReviewLog`), since that's the only route by
+    /// which a `source_comment` gets attached today -- `add_impact`
+    /// writes straight to the confirmed `note` column instead.
+    fn imported_store(comment: Option<&str>, needs_review: bool) -> (Store, ImpactId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let entry = EntryId("e1".into());
+        let impact_id = ImpactId("i1".into());
+        let snap = Snapshot {
+            entries: vec![Entry {
+                id: entry.clone(),
+                store: "music".into(),
+                store_id: "m1".into(),
+                title_cache: None,
+            }],
+            impacts: vec![Impact {
+                id: impact_id.clone(),
+                target: entry,
+                atoms: vec![sample_atom("gut-punch", "src-a", 1.0)],
+            }],
+            relations: vec![],
+            palette: Palette {
+                anchors: vec![],
+                k_feat: Default::default(),
+            },
+            taxonomy: Taxonomy::default(),
+        };
+        let mut comments = BTreeMap::new();
+        if let Some(comment) = comment {
+            comments.insert(impact_id.clone(), comment.to_string());
+        }
+        let mut needs_review_set = BTreeSet::new();
+        if needs_review {
+            needs_review_set.insert(impact_id.clone());
+        }
+        store
+            .import_snapshot(
+                &snap,
+                &ImportExtras {
+                    comments,
+                    needs_review: needs_review_set,
+                },
+            )
+            .unwrap();
+        (store, impact_id)
+    }
+
+    #[test]
+    fn confirm_impact_promotes_unconfirmed_comment_to_note_and_clears_flag() {
+        let (mut store, impact_id) = imported_store(Some("the hype is unreal"), true);
+
+        store.confirm_impact(&impact_id).unwrap();
+
+        assert_eq!(read_note(&store, &impact_id).as_deref(), Some("the hype is unreal"));
+        assert!(!store.review.get(&impact_id.0).needs_review);
+    }
+
+    #[test]
+    fn confirm_impact_does_not_overwrite_an_already_confirmed_note() {
+        let (mut store, impact_id) = imported_store(Some("the hype is unreal"), true);
+        store
+            .edit_impact(
+                &impact_id,
+                &[sample_atom("gut-punch", "src-a", 1.0)],
+                Some("actually just comedic timing"),
+            )
+            .unwrap();
+
+        store.confirm_impact(&impact_id).unwrap();
+
+        assert_eq!(
+            read_note(&store, &impact_id).as_deref(),
+            Some("actually just comedic timing")
+        );
+    }
+
+    #[test]
+    fn confirm_impact_with_no_comment_just_clears_the_flag() {
+        let (mut store, impact_id) = imported_store(None, true);
+
+        store.confirm_impact(&impact_id).unwrap();
+
+        assert_eq!(read_note(&store, &impact_id), None);
+        assert!(!store.review.get(&impact_id.0).needs_review);
+    }
+
+    #[test]
+    fn edit_impact_writes_the_note_column() {
+        let mut store = Store::open_in_memory().unwrap();
+        let entry = store.add_entry("music", "m1", None).unwrap();
+        let impact_id = store
+            .add_impact(&entry, &[sample_atom("gut-punch", "src-a", 5.0)], None)
+            .unwrap();
+
+        store
+            .edit_impact(
+                &impact_id,
+                &[sample_atom("gut-punch", "src-a", 5.0)],
+                Some("confirmed: genuine despair"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_note(&store, &impact_id).as_deref(),
+            Some("confirmed: genuine despair")
+        );
     }
 }

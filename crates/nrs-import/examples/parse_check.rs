@@ -34,7 +34,7 @@ fn main() {
         doc.warnings.len()
     );
 
-    let (snapshot, mut conversion_warnings) = nrs_import::build_snapshot(&doc);
+    let (snapshot, _extras, mut conversion_warnings) = nrs_import::build_snapshot(&doc);
     println!(
         "snapshot: {} entries, {} impacts, {} relations",
         snapshot.entries.len(),

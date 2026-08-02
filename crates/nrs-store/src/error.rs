@@ -4,6 +4,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("invalid stored data: {0}")]
     InvalidData(String),
 }

@@ -6,8 +6,14 @@
 //! persisted.
 
 use nrs_core::Snapshot;
-use nrs_store::{Result, Store};
+use nrs_store::{ImportExtras, Result, Store};
 
-pub fn write_snapshot(store: &mut Store, snapshot: &Snapshot) -> Result<()> {
-    store.import_snapshot(snapshot)
+use crate::snapshot::BuildExtras;
+
+pub fn write_snapshot(store: &mut Store, snapshot: &Snapshot, extras: &BuildExtras) -> Result<()> {
+    let import_extras = ImportExtras {
+        comments: extras.source_comments.clone(),
+        needs_review: extras.needs_review.clone(),
+    };
+    store.import_snapshot(snapshot, &import_extras)
 }

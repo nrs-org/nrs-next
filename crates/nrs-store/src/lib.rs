@@ -11,36 +11,51 @@ mod import;
 mod params_blob;
 mod preferences;
 mod relkind;
+mod review;
+mod review_queue;
 mod schema;
 mod snapshot;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 pub use error::{Result, StoreError};
 pub use event::EventKind;
 pub use events::EventRecord;
+pub use import::ImportExtras;
 pub use preferences::Preference;
+pub use review_queue::ReviewImpact;
+
+use review::ReviewLog;
 
 pub struct Store {
     conn: Connection,
+    review: ReviewLog,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        let review = ReviewLog::load(Some(review_log_path(path)))?;
+        Self::init(conn, review)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn)
+        Self::init(conn, ReviewLog::load(None)?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, review: ReviewLog) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
         schema::migrate(&conn)?;
-        Ok(Store { conn })
+        Ok(Store { conn, review })
     }
+}
+
+/// `nrs.db` -> `nrs.review.json`: a sibling of the database file, not a
+/// table in it (see `review` module docs for why).
+fn review_log_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("review.json")
 }

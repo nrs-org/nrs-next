@@ -83,6 +83,12 @@ pub struct ParsedImpact {
     /// `(entry id, factor)`; defaults to `[(self, 1.0)]` when no
     /// explicit `<contributor>` children are present.
     pub contributors: Vec<(String, f32)>,
+    /// The `<!-- -->` comment block immediately preceding this impact
+    /// tag, if any (`XNode::preceding_comment`) -- the real grading
+    /// reasoning, seeded into `nrs-store`'s review workflow rather than
+    /// becoming `impact.note` directly (INFRA.md's review UI confirms
+    /// or edits it first).
+    pub source_comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,7 +408,11 @@ fn parse_entry(
                 if let Some(kind) = parse_impact_kind(child, tag, today, &context_prefix, warnings)
                 {
                     let contributors = parse_contributors(child, &id, engine, warnings);
-                    entry.impacts.push(ParsedImpact { kind, contributors });
+                    entry.impacts.push(ParsedImpact {
+                        kind,
+                        contributors,
+                        source_comment: child.preceding_comment().map(String::from),
+                    });
                 }
             }
         }
