@@ -1368,6 +1368,7 @@ dependencies = [
  "nrs-store",
  "rand",
  "serde",
+ "serde_json",
  "time",
  "tokio",
 ]

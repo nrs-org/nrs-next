@@ -6,27 +6,29 @@
 //! document is a few thousand atoms), so the `q` (redundancy
 //! exponent) box on the page reruns live.
 //!
-//! The raw `V` value from the redundancy functional is shown as-is
-//! (labelled "V (raw)"), not a calibrated public score; `/calibrate`
-//! (INFRA.md roadmap phase 6, `nrs-fit`) exists to work towards one.
+//! No calibration/fitting exists yet (`nrs-fit`, INFRA.md roadmap
+//! phase 6), so what's shown is the raw `V` value from the
+//! redundancy functional, not a calibrated public score — labelled
+//! honestly as "V (raw)" rather than "Score".
 //!
 //! Usage: `cargo run -p nrs-app -- /path/to/NRSImplMain.xml [port]`
 //! or `cargo run -p nrs-app -- /path/to/nrs.db [port]` (a path
-//! ending in `.db` loads via `nrs-store` instead of re-parsing XML,
-//! and unlocks `/calibrate` -- XML mode is read-only).
+//! ending in `.db` loads via `nrs-store` instead of re-parsing XML;
+//! CRUD against it is a later pass, INFRA.md roadmap phase 5 — this
+//! only reads).
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nrs_core::{
-    AnchorId, EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, RelationScaling,
-    Snapshot,
+    AnchorId, Atom, EntryId, Homogeneity, ImpactId, Isotonic, KFeatMatrix, KSrcLevels, Params,
+    RelationScaling, Snapshot, SourceId, TimeSupport,
 };
 use nrs_store::Store;
 use serde::{Deserialize, Serialize};
@@ -117,6 +119,10 @@ async fn main() {
         .route("/calibrate/fit/save", post(calibrate_fit_save))
         .route("/calibrate/kfeat", get(calibrate_kfeat))
         .route("/calibrate/kfeat/set", post(calibrate_kfeat_set))
+        .route("/review", get(review_index))
+        .route("/review/{entry_id}", get(review_entry))
+        .route("/review/{entry_id}/confirm", post(review_confirm))
+        .route("/review/{entry_id}/save", post(review_save))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -513,8 +519,18 @@ fn page_shell(title: &str, body: &str) -> String {
   .kfeat-grid {{ display: flex; flex-direction: column; gap: 0.3rem; }}
   .kfeat-row {{ display: flex; align-items: center; gap: 0.5rem; }}
   .kfeat-row input[type="number"] {{ width: 5rem; }}
+  .impact {{ border: 1px solid #8884; border-radius: 6px; padding: 1rem; margin: 1rem 0; }}
+  .impact .flagged {{ color: #e08; font-weight: bold; }}
+  .impact .hint {{ color: #888; font-size: 0.85rem; margin: 0.25rem 0; }}
+  .impact textarea {{ width: 100%; box-sizing: border-box; font-family: inherit; }}
+  .chip-row {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.5rem 0; }}
+  .chip-row form {{ display: inline; }}
+  .chip {{ border: 1px solid #8884; border-radius: 999px; padding: 0.2rem 0.6rem; font-size: 0.85rem; cursor: pointer; background: none; }}
+  .chip.remove {{ background: #e0808020; }}
+  .chip.add {{ background: #80e08020; }}
+  .raw-atom {{ font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; }}
 </style></head><body>
-<nav><a href="/">scores</a><a href="/calibrate">calibrate</a><a href="/calibrate/fit">run fit</a><a href="/calibrate/kfeat">k_feat</a></nav>
+<nav><a href="/">scores</a><a href="/calibrate">calibrate</a><a href="/calibrate/fit">run fit</a><a href="/calibrate/kfeat">k_feat</a><a href="/review">review</a></nav>
 {body}
 </body></html>
 "#
@@ -815,6 +831,366 @@ async fn calibrate_kfeat_set(
     }
     drop(store);
     Redirect::to("/calibrate/kfeat").into_response()
+}
+
+/// The full 18-anchor palette (`nrs-import`'s `anchors` module is the
+/// source of truth) -- the "+anchor" quick-add buttons on the review
+/// page offer all of them rather than trying to guess plausible
+/// alternatives from which raw legacy box an impact came from, since
+/// that provenance isn't threaded past `nrs-import` today.
+fn all_anchors() -> Vec<AnchorId> {
+    vec![
+        nrs_import::anchors::comedy(),
+        nrs_import::anchors::hype(),
+        nrs_import::anchors::tragedy(),
+        nrs_import::anchors::wistful(),
+        nrs_import::anchors::cozy(),
+        nrs_import::anchors::heartwarming(),
+        nrs_import::anchors::hate(),
+        nrs_import::anchors::discomfort(),
+        nrs_import::anchors::waifu(),
+        nrs_import::anchors::meme(),
+        nrs_import::anchors::hooked(),
+        nrs_import::anchors::worldview(),
+        nrs_import::anchors::gateway(),
+        nrs_import::anchors::writing(),
+        nrs_import::anchors::visual(),
+        nrs_import::anchors::music(),
+        nrs_import::anchors::boredom(),
+        nrs_import::anchors::additional(),
+    ]
+}
+
+async fn review_index(State(state): State<Arc<AppState>>) -> Html<String> {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message());
+    };
+    let store = store_lock.lock().unwrap();
+    let flagged = match store.entries_needing_review() {
+        Ok(f) => f,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs review",
+                &format!("<p>failed to load review queue: {e}</p>"),
+            ))
+        }
+    };
+    drop(store);
+
+    if flagged.is_empty() {
+        return Html(page_shell(
+            "nrs review",
+            "<h1>review queue</h1><p>nothing left to review.</p>",
+        ));
+    }
+
+    let mut items = String::new();
+    for id in &flagged {
+        let title = state
+            .snapshot
+            .entries
+            .iter()
+            .find(|e| &e.id == id)
+            .and_then(|e| e.title_cache.as_deref())
+            .unwrap_or(&id.0);
+        write!(
+            items,
+            r#"<li><a href="/review/{href}">{title}</a></li>"#,
+            href = html_escape(&id.0),
+            title = html_escape(title),
+        )
+        .unwrap();
+    }
+
+    let body = format!(
+        "<h1>review queue</h1>\n<p>{} entries with something left to confirm.</p>\n<ul>{items}</ul>",
+        flagged.len()
+    );
+    Html(page_shell("nrs review", &body))
+}
+
+/// One `+`/`-` control: a tiny standalone form pre-loaded with the atom
+/// as it would look after this one click, so the click needs no
+/// JavaScript -- it's a plain form submit to `/review/{entry}/save`.
+#[allow(clippy::too_many_arguments)]
+fn blend_edit_form(
+    entry_id: &str,
+    impact_id: &str,
+    note: &str,
+    atom: &Atom,
+    new_blend: &[(AnchorId, f32)],
+    class: &str,
+    label: &str,
+) -> String {
+    let blend_json = serde_json::to_string(new_blend).unwrap();
+    let time_json = serde_json::to_string(&atom.time).unwrap();
+    format!(
+        r#"<form method="post" action="/review/{entry_id}/save">
+  <input type="hidden" name="impact" value="{impact_id}">
+  <input type="hidden" name="note" value="{note}">
+  <input type="hidden" name="source" value="{source}">
+  <input type="hidden" name="magnitude" value="{magnitude}">
+  <input type="hidden" name="time_json" value="{time_json}">
+  <input type="hidden" name="blend_json" value="{blend_json}">
+  <button type="submit" class="chip {class}">{label}</button>
+</form>"#,
+        entry_id = html_escape(entry_id),
+        impact_id = html_escape(impact_id),
+        note = html_escape(note),
+        source = html_escape(&atom.source.0),
+        magnitude = atom.magnitude,
+        time_json = html_escape(&time_json),
+        blend_json = html_escape(&blend_json),
+        class = class,
+        label = html_escape(label),
+    )
+}
+
+fn impact_block(entry_id: &str, ri: &nrs_store::ReviewImpact, all_anchors: &[AnchorId]) -> String {
+    let note_value = ri
+        .note
+        .as_deref()
+        .or(ri.source_comment.as_deref())
+        .unwrap_or("");
+    let flagged = if ri.needs_review {
+        r#"<span class="flagged">needs review</span>"#
+    } else {
+        ""
+    };
+    let hint = match &ri.source_comment {
+        Some(c) => format!(r#"<div class="hint">raw comment: {}</div>"#, html_escape(c)),
+        None => String::new(),
+    };
+
+    let editor = match ri.atoms.as_slice() {
+        [atom] => {
+            let mut chips = String::new();
+            for (anchor, weight) in &atom.blend {
+                let mut new_blend = atom.blend.clone();
+                new_blend.retain(|(a, _)| a != anchor);
+                write!(
+                    chips,
+                    "{}",
+                    blend_edit_form(
+                        entry_id,
+                        &ri.id.0,
+                        note_value,
+                        atom,
+                        &new_blend,
+                        "remove",
+                        &format!("- {} ({weight:.2})", anchor.0),
+                    )
+                )
+                .unwrap();
+            }
+            for anchor in all_anchors {
+                if atom.blend.iter().any(|(a, _)| a == anchor) {
+                    continue;
+                }
+                let mut new_blend = atom.blend.clone();
+                new_blend.push((anchor.clone(), 1.0));
+                write!(
+                    chips,
+                    "{}",
+                    blend_edit_form(
+                        entry_id,
+                        &ri.id.0,
+                        note_value,
+                        atom,
+                        &new_blend,
+                        "add",
+                        &format!("+ {}", anchor.0),
+                    )
+                )
+                .unwrap();
+            }
+            format!(r#"<div class="chip-row">{chips}</div>"#)
+        }
+        atoms => {
+            let mut raw = String::new();
+            for atom in atoms {
+                writeln!(
+                    raw,
+                    "{} blend={:?} magnitude={}",
+                    html_escape(&atom.source.0),
+                    atom.blend,
+                    atom.magnitude
+                )
+                .unwrap();
+            }
+            format!(
+                r#"<div class="hint">{} atoms -- multi-atom blend editing isn't supported yet, view only:</div><div class="raw-atom">{}</div>"#,
+                atoms.len(),
+                html_escape(&raw)
+            )
+        }
+    };
+
+    format!(
+        r#"<div class="impact">
+  <div>impact <code>{impact_id}</code> {flagged}</div>
+  {hint}
+  {editor}
+  <form method="post" action="/review/{entry_id}/save">
+    <input type="hidden" name="impact" value="{impact_id}">
+    <textarea name="note" rows="2">{note_value}</textarea>
+    <button type="submit">save note</button>
+  </form>
+  <form method="post" action="/review/{entry_id}/confirm">
+    <input type="hidden" name="impact" value="{impact_id}">
+    <button type="submit">confirm as shown</button>
+  </form>
+</div>"#,
+        impact_id = html_escape(&ri.id.0),
+        entry_id = html_escape(entry_id),
+        note_value = html_escape(note_value),
+    )
+}
+
+async fn review_entry(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> Html<String> {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message());
+    };
+    let store = store_lock.lock().unwrap();
+    let impacts = match store.impacts_for_entry(&EntryId(entry_id.clone())) {
+        Ok(i) => i,
+        Err(e) => {
+            return Html(page_shell(
+                "nrs review",
+                &format!("<p>failed to load impacts: {e}</p>"),
+            ))
+        }
+    };
+    drop(store);
+
+    let anchors = all_anchors();
+    let mut blocks = String::new();
+    for impact in &impacts {
+        blocks.push_str(&impact_block(&entry_id, impact, &anchors));
+    }
+
+    let title = state
+        .snapshot
+        .entries
+        .iter()
+        .find(|e| e.id.0 == entry_id)
+        .and_then(|e| e.title_cache.as_deref())
+        .unwrap_or(&entry_id);
+
+    let body = format!(
+        "<h1>{}</h1>\n<p><a href=\"/review\">&larr; back to queue</a></p>\n{blocks}",
+        html_escape(title)
+    );
+    Html(page_shell("nrs review", &body))
+}
+
+/// Every "+"/"-" chip's tiny form also carries the note through as a
+/// hidden field so a reclassification click doesn't clobber an
+/// in-progress edit to the note -- both land in the same handler.
+#[derive(Deserialize)]
+struct ImpactSaveForm {
+    impact: String,
+    note: String,
+    blend_json: Option<String>,
+    source: Option<String>,
+    magnitude: Option<f32>,
+    time_json: Option<String>,
+}
+
+async fn review_save(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Form(form): Form<ImpactSaveForm>,
+) -> impl IntoResponse {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message()).into_response();
+    };
+    let note = if form.note.trim().is_empty() {
+        None
+    } else {
+        Some(form.note.as_str())
+    };
+
+    let mut store = store_lock.lock().unwrap();
+    let atoms = match (form.blend_json, form.source, form.magnitude, form.time_json) {
+        (Some(blend_json), Some(source), Some(magnitude), Some(time_json)) => {
+            let blend: Vec<(AnchorId, f32)> = match serde_json::from_str(&blend_json) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Html(page_shell(
+                        "nrs review",
+                        &format!("<p>bad blend: {e}</p>"),
+                    ))
+                    .into_response()
+                }
+            };
+            let time: TimeSupport = match serde_json::from_str(&time_json) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Html(page_shell("nrs review", &format!("<p>bad time: {e}</p>")))
+                        .into_response()
+                }
+            };
+            Some(vec![Atom {
+                source: SourceId(source),
+                blend,
+                magnitude,
+                time,
+            }])
+        }
+        // The note-only save form (multi-atom fallback, or the plain
+        // "save note" button) submits no blend fields at all -- reread
+        // the existing atoms rather than guessing at a replacement.
+        _ => None,
+    };
+
+    let result = match atoms {
+        Some(atoms) => store.edit_impact(&ImpactId(form.impact.clone()), &atoms, note),
+        None => match store.impacts_for_entry(&EntryId(entry_id.clone())) {
+            Ok(impacts) => match impacts.into_iter().find(|i| i.id.0 == form.impact) {
+                Some(impact) => store.edit_impact(&ImpactId(form.impact.clone()), &impact.atoms, note),
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(e) = result {
+        return Html(page_shell(
+            "nrs review",
+            &format!("<p>failed to save: {e}</p>"),
+        ))
+        .into_response();
+    }
+    drop(store);
+    Redirect::to(&format!("/review/{entry_id}")).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImpactConfirmForm {
+    impact: String,
+}
+
+async fn review_confirm(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Form(form): Form<ImpactConfirmForm>,
+) -> impl IntoResponse {
+    let Some(store_lock) = &state.store else {
+        return Html(no_store_message()).into_response();
+    };
+    let mut store = store_lock.lock().unwrap();
+    if let Err(e) = store.confirm_impact(&ImpactId(form.impact)) {
+        return Html(page_shell(
+            "nrs review",
+            &format!("<p>failed to confirm: {e}</p>"),
+        ))
+        .into_response();
+    }
+    drop(store);
+    Redirect::to(&format!("/review/{entry_id}")).into_response()
 }
 
 #[cfg(test)]
