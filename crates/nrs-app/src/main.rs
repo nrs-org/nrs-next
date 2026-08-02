@@ -22,11 +22,11 @@ use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use nrs_core::{
     EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params, RelationScaling, Snapshot,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 struct AppState {
     snapshot: Snapshot,
@@ -69,6 +69,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/scores.csv", get(scores_csv))
+        .route("/scores.json", get(scores_json))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -228,13 +229,6 @@ fn rows(
     rows
 }
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 async fn index(
     State(state): State<Arc<AppState>>,
     Query(view): Query<ViewParams>,
@@ -249,46 +243,19 @@ async fn index(
         view.beta,
     );
 
-    let sort_link = |by: &str, label: &str| {
-        let is_current = sort_by_name(view.sort) == by;
-        let next_dir = if is_current && view.dir == SortDir::Desc {
-            "asc"
-        } else {
-            "desc"
-        };
-        let arrow = if !is_current {
-            ""
-        } else if view.dir == SortDir::Desc {
-            " ▼"
-        } else {
-            " ▲"
-        };
-        format!(
-            "<a href=\"/?q={}&sort={by}&dir={next_dir}&rel={}&mode={}&beta={}\">{label}{arrow}</a>",
-            view.q,
-            view.rel.name(),
-            view.mode.name(),
-            view.beta,
-        )
-    };
-
     let mut body = String::new();
     write!(
         body,
         r#"<!doctype html><html><head><meta charset="utf-8">
 <title>nrs scores</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.css">
 <style>
   :root {{ color-scheme: light dark; }}
-  body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
+  body {{ font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }}
   h1 {{ font-size: 1.3rem; }}
   .meta {{ color: #888; font-size: 0.85rem; margin-bottom: 1rem; }}
   form {{ margin-bottom: 1rem; display: flex; gap: 0.5rem; align-items: center; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8883; }}
-  th a {{ text-decoration: none; color: inherit; }}
-  tbody tr:hover {{ background: #8881; }}
-  td.value {{ font-variant-numeric: tabular-nums; text-align: right; }}
-  td.store {{ color: #888; font-size: 0.85rem; }}
+  #grid {{ width: 100%; }}
 </style></head><body>
 <h1>nrs scores</h1>
 <div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}&mode={}&beta={}">download CSV</a></div>
@@ -311,9 +278,32 @@ async fn index(
   <input type="hidden" name="dir" value="{}">
   <button type="submit">rerun</button>
 </form>
-<table><thead><tr>
-  <th>{}</th><th>{}</th><th>store</th><th>{}</th>
-</tr></thead><tbody>
+<div id="grid"></div>
+<script src="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.js"></script>
+<script>
+  fetch('/scores.json' + location.search)
+    .then(function (r) {{ return r.json(); }})
+    .then(function (data) {{
+      new Handsontable(document.getElementById('grid'), {{
+        data: data,
+        colHeaders: ['id', 'title', 'store', 'V (raw)'],
+        columns: [
+          {{ data: 'id' }},
+          {{ data: 'title' }},
+          {{ data: 'store' }},
+          {{ data: 'value', type: 'numeric', numericFormat: {{ pattern: '0.0000' }} }},
+        ],
+        columnSorting: true,
+        filters: true,
+        dropdownMenu: true,
+        stretchH: 'all',
+        height: 600,
+        rowHeaders: true,
+        licenseKey: 'non-commercial-and-evaluation',
+      }});
+    }});
+</script>
+</body></html>
 "#,
         rows.len(),
         state.warnings.len(),
@@ -329,24 +319,8 @@ async fn index(
         if view.rel == RelScaling::Powq { "selected" } else { "" },
         sort_by_name(view.sort),
         sort_dir_name(view.dir),
-        sort_link("id", "id"),
-        sort_link("title", "title"),
-        sort_link("value", "V (raw)"),
     )
     .unwrap();
-
-    for row in &rows {
-        writeln!(
-            body,
-            "<tr><td>{}</td><td>{}</td><td class=\"store\">{}</td><td class=\"value\">{:.4}</td></tr>",
-            escape_html(&row.id.0),
-            escape_html(row.title),
-            escape_html(row.store),
-            row.value,
-        )
-        .unwrap();
-    }
-    body.push_str("</tbody></table></body></html>");
 
     Html(body)
 }
@@ -408,6 +382,40 @@ async fn scores_csv(
     )
 }
 
+#[derive(Serialize)]
+struct RowJson {
+    id: String,
+    title: String,
+    store: String,
+    value: f32,
+}
+
+async fn scores_json(
+    State(state): State<Arc<AppState>>,
+    Query(view): Query<ViewParams>,
+) -> impl IntoResponse {
+    let rows = rows(
+        &state.snapshot,
+        view.q,
+        view.sort,
+        view.dir,
+        view.rel,
+        view.mode,
+        view.beta,
+    );
+
+    Json(
+        rows.iter()
+            .map(|row| RowJson {
+                id: row.id.0.clone(),
+                title: row.title.to_string(),
+                store: row.store.to_string(),
+                value: row.value,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,11 +426,6 @@ mod tests {
         assert_eq!(csv_field("plain"), "\"plain\"");
         assert_eq!(csv_field("has \"quotes\""), "\"has \"\"quotes\"\"\"");
         assert_eq!(csv_field("a,b"), "\"a,b\"");
-    }
-
-    #[test]
-    fn escape_html_neutralises_markup() {
-        assert_eq!(escape_html("<b>&\""), "&lt;b&gt;&amp;&quot;");
     }
 
     fn tiny_snapshot() -> Snapshot {
