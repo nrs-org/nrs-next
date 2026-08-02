@@ -9,33 +9,45 @@ mod redundancy;
 mod solve;
 pub mod types;
 
+use rayon::prelude::*;
+
 pub use audit::{audit_monotonicity, AuditReport, InsertionMargin};
 pub use types::*;
 
 /// INFRA.md §4.3, phases 1-4: build measures, solve relations, apply the
 /// one nonlinearity, calibrate.
+///
+/// Entries score independently of one another (phase 3 only reads one
+/// entry's own resolved measure), so this fans the per-entry work out
+/// over `rayon`'s thread pool. Each task gets its own `SourceIndex`
+/// rather than sharing one: cross-entry chain memoization no longer
+/// pays for itself now that `redundancy::bucket_crowding` has cut most
+/// of the pairwise `k_src` traffic it existed to amortize, and a fresh
+/// per-task index avoids synchronizing mutable state across threads.
 pub fn score(snap: &Snapshot, params: &Params) -> Scores {
     let built = measure::build_measures(snap);
     let resolved =
         solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
 
-    // Shared across every entry in this call so `k_src`'s taxonomy-chain
-    // memoization (redundancy::SourceIndex) amortizes over sibling
-    // entries that reuse the same sources (INFRA.md §4.3 phase 3).
-    let mut src_index = redundancy::SourceIndex::new();
-    let mut values = std::collections::BTreeMap::new();
-    for (entry, f) in &resolved {
-        let (v, _) = redundancy::value(
-            f,
-            &params.k_feat,
-            &snap.taxonomy,
-            &mut src_index,
-            &params.k_src_levels,
-            params.q,
-            params.homogeneity,
-        );
-        values.insert(entry.clone(), params.calibration.apply(v));
-    }
+    // Collected to a `Vec` first: rayon splits a slice for work-stealing
+    // more cheaply than `BTreeMap`'s tree-shaped parallel iterator.
+    let entries: Vec<_> = resolved.iter().collect();
+    let values: std::collections::BTreeMap<EntryId, f32> = entries
+        .par_iter()
+        .map(|&(entry, f)| {
+            let mut src_index = redundancy::SourceIndex::new();
+            let (v, _) = redundancy::value(
+                f,
+                &params.k_feat,
+                &snap.taxonomy,
+                &mut src_index,
+                &params.k_src_levels,
+                params.q,
+                params.homogeneity,
+            );
+            (entry.clone(), params.calibration.apply(v))
+        })
+        .collect();
     Scores { values }
 }
 
