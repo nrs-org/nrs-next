@@ -4,6 +4,7 @@ members = [
     "crates/nrs-app",
     "crates/nrs-core",
     "crates/nrs-import",
+    "crates/nrs-store",
 ]
 
 [workspace.package]

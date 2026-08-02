@@ -1,11 +1,10 @@
 //! A tiny local server for browsing scores over a real `nrsml`
 //! dataset — the "just let me look at this without needing a
-//! spreadsheet app" tool. Parses + scores the dataset once at
-//! startup (the expensive part: XML parsing, macro expansion, and
-//! optional `<script>` execution) and caches the resulting
-//! `Snapshot`; each request just re-runs `nrs_core::score()` (cheap
-//! at this scale, since the whole document is a few thousand atoms),
-//! so the `q` (redundancy exponent) box on the page reruns live.
+//! spreadsheet app" tool. Loads + scores the dataset once at
+//! startup and caches the resulting `Snapshot`; each request just
+//! re-runs `nrs_core::score()` (cheap at this scale, since the whole
+//! document is a few thousand atoms), so the `q` (redundancy
+//! exponent) box on the page reruns live.
 //!
 //! No calibration/fitting exists yet (`nrs-fit`, INFRA.md roadmap
 //! phase 6), so what's shown is the raw `V` value from the
@@ -13,6 +12,10 @@
 //! honestly as "V (raw)" rather than "Score".
 //!
 //! Usage: `cargo run -p nrs-app -- /path/to/NRSImplMain.xml [port]`
+//! or `cargo run -p nrs-app -- /path/to/nrs.db [port]` (a path
+//! ending in `.db` loads via `nrs-store` instead of re-parsing XML;
+//! CRUD against it is a later pass, INFRA.md roadmap phase 5 — this
+//! only reads).
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -45,18 +48,42 @@ async fn main() {
     };
     let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3737);
 
-    eprintln!("parsing {path}...");
-    let today = time::OffsetDateTime::now_utc().date();
-    let doc = match nrs_import::parse_file(std::path::Path::new(&path), today) {
-        Ok(doc) => doc,
-        Err(e) => {
-            eprintln!("parse error: {e}");
-            std::process::exit(1);
+    let is_db = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        == Some("db");
+
+    let (snapshot, warnings) = if is_db {
+        eprintln!("loading {path}...");
+        let store = match nrs_store::Store::open(&path) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("failed to open store: {e}");
+                std::process::exit(1);
+            }
+        };
+        match store.load_snapshot() {
+            Ok((snapshot, _params)) => (snapshot, Vec::new()),
+            Err(e) => {
+                eprintln!("failed to load snapshot: {e}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        eprintln!("parsing {path}...");
+        let today = time::OffsetDateTime::now_utc().date();
+        let doc = match nrs_import::parse_file(std::path::Path::new(&path), today) {
+            Ok(doc) => doc,
+            Err(e) => {
+                eprintln!("parse error: {e}");
+                std::process::exit(1);
+            }
+        };
+        let (snapshot, conversion_warnings) = nrs_import::build_snapshot(&doc);
+        let mut warnings = doc.warnings;
+        warnings.extend(conversion_warnings);
+        (snapshot, warnings)
     };
-    let (snapshot, conversion_warnings) = nrs_import::build_snapshot(&doc);
-    let mut warnings = doc.warnings;
-    warnings.extend(conversion_warnings);
     eprintln!(
         "loaded {} entries, {} impacts, {} relations ({} warnings)",
         snapshot.entries.len(),

@@ -3,7 +3,8 @@
 //! real point of having a parser at all.
 
 use nrs_core::*;
-use nrs_import::{build_snapshot, xml::parse_str};
+use nrs_import::{build_snapshot, write_snapshot, xml::parse_str};
+use nrs_store::Store;
 use time::macros::date;
 
 fn params() -> Params {
@@ -82,6 +83,28 @@ fn parses_and_scores_a_franchise_shaped_document() {
     // The franchise borrows both works' measures via Contains, so its
     // score must be nonzero (it has no direct impacts of its own).
     assert!(scores.values[&franchise] != 0.0);
+}
+
+/// Roadmap phase 3's "-> nrs.db" half (INFRA.md §12): the same franchise
+/// fixture, written into a store and reloaded, must score identically to
+/// scoring the freshly-built in-memory `Snapshot` directly.
+#[test]
+fn write_snapshot_then_load_snapshot_scores_identically() {
+    let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
+    let (snapshot, conversion_warnings) = build_snapshot(&doc);
+    assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
+
+    let mut store = Store::open_in_memory().expect("open store");
+    write_snapshot(&mut store, &snapshot).expect("write snapshot");
+
+    let (reloaded, _params) = store.load_snapshot().expect("load snapshot");
+    assert_eq!(reloaded.entries.len(), snapshot.entries.len());
+    assert_eq!(reloaded.impacts.len(), snapshot.impacts.len());
+    assert_eq!(reloaded.relations.len(), snapshot.relations.len());
+
+    let original_scores = score(&snapshot, &params());
+    let reloaded_scores = score(&reloaded, &params());
+    assert_eq!(original_scores, reloaded_scores);
 }
 
 #[test]

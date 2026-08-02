@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(pub String);
     };
 }
@@ -34,6 +35,7 @@ pub struct Snapshot {
 /// Opaque id plus a pointer into a type store; the central DB never
 /// stores a provider id itself (INFRA.md §5.1, §5.2).
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Entry {
     pub id: EntryId,
     pub store: String,
@@ -42,6 +44,7 @@ pub struct Entry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Impact {
     pub id: ImpactId,
     pub target: EntryId,
@@ -51,6 +54,7 @@ pub struct Impact {
 /// One embedded mass: a source, a blend over 1-3 palette anchors, a
 /// signed magnitude, and how it's spread over time.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Atom {
     pub source: SourceId,
     pub blend: Vec<(AnchorId, f32)>,
@@ -59,6 +63,7 @@ pub struct Atom {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TimeSupport {
     Moment,
     Tail { peak: f32, lambda: f32, cutoff: f32 },
@@ -66,6 +71,7 @@ pub enum TimeSupport {
 
 /// Relation kinds (INFRA.md §5.1 `relation.kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RelKind {
     Contains,
     Remix,
@@ -76,13 +82,48 @@ pub enum RelKind {
 /// A scalar field `s_r(x)` over the anchor space (notes §8.3).
 /// `Transport` is rare and discouraged (INFRA.md §4.2).
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Transform {
     Scalar(f32),
     Regional(BTreeMap<AnchorId, f32>),
+    // JSON object keys must be strings, so a `BTreeMap<(AnchorId, AnchorId),
+    // f32>` can't derive directly (serde_json errors at the first non-empty
+    // map). Represented on the wire as a list of `(a, b, k)` triples instead.
+    #[cfg_attr(feature = "serde", serde(with = "transport_pairs"))]
     Transport(BTreeMap<(AnchorId, AnchorId), f32>),
 }
 
+#[cfg(feature = "serde")]
+mod transport_pairs {
+    use super::AnchorId;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(
+        map: &BTreeMap<(AnchorId, AnchorId), f32>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let triples: Vec<(&AnchorId, &AnchorId, f32)> =
+            map.iter().map(|((a, b), k)| (a, b, *k)).collect();
+        triples.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(AnchorId, AnchorId), f32>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let triples = Vec::<(AnchorId, AnchorId, f32)>::deserialize(deserializer)?;
+        Ok(triples.into_iter().map(|(a, b, k)| ((a, b), k)).collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Relation {
     pub kind: RelKind,
     pub from: EntryId,
@@ -93,6 +134,7 @@ pub struct Relation {
 /// A named palette anchor (INFRA.md §5.1 `anchor` table). `family` is a
 /// soft label only (emotion|craft|...), not load-bearing for scoring.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Anchor {
     pub id: AnchorId,
     pub label: String,
@@ -149,6 +191,7 @@ pub struct Taxonomy {
 /// Exact semantics are pinned down when `nrs-fit` lands (roadmap phase 6);
 /// frozen here only as a fixed-size fitted vector.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct KSrcLevels {
     pub levels: [f32; 5],
 }
@@ -164,6 +207,7 @@ pub struct KSrcLevels {
 /// tuning constant, and `Params` (its only embedder) needs only
 /// `PartialEq`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Homogeneity {
     Degree1,
     DegreeQ,
@@ -190,6 +234,7 @@ pub enum Homogeneity {
 /// Monotone calibration `g`: piecewise-linear through sorted `(v, s)`
 /// knots (INFRA.md §5.1 `calibration.isotonic`).
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Isotonic {
     pub knots: Vec<(f32, f32)>,
 }
@@ -247,6 +292,7 @@ impl Isotonic {
 /// reparametrization doesn't just fix the pathology, it provably
 /// tightens the same double-count bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RelationScaling {
     #[default]
     Fixed,
@@ -316,5 +362,33 @@ mod tests {
         m.pairs.insert((a.clone(), b.clone()), 0.4);
         assert_eq!(m.get(&a, &b), 0.4);
         assert_eq!(m.get(&b, &a), 0.4);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn transform_transport_round_trips_through_json() {
+        let a = AnchorId("gut-punch".into());
+        let b = AnchorId("gorgeous-visuals".into());
+        let mut pairs = BTreeMap::new();
+        pairs.insert((a.clone(), b.clone()), 0.4);
+        let t = Transform::Transport(pairs);
+
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Transform = serde_json::from_str(&json).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn transform_scalar_and_regional_round_trip_through_json() {
+        let scalar = Transform::Scalar(0.2);
+        let json = serde_json::to_string(&scalar).unwrap();
+        assert_eq!(serde_json::from_str::<Transform>(&json).unwrap(), scalar);
+
+        let mut regional = BTreeMap::new();
+        regional.insert(AnchorId("gut-punch".into()), 0.5);
+        let regional = Transform::Regional(regional);
+        let json = serde_json::to_string(&regional).unwrap();
+        assert_eq!(serde_json::from_str::<Transform>(&json).unwrap(), regional);
     }
 }

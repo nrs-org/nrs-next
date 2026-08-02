@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 nrs-core = { path = "../nrs-core" }
 nrs-import = { path = "../nrs-import", features = ["scripting"] }
+nrs-store = { path = "../nrs-store" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 time = { version = "0.3", features = ["macros"] }

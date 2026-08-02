@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 boa_engine = { version = "0.21.1", optional = true }
 nrs-core = { path = "../nrs-core" }
+nrs-store = { path = "../nrs-store" }
 roxmltree = "0.21.1"
 serde_json = { version = "1.0.151", optional = true }
 time = { version = "0.3.54", features = ["parsing", "macros"] }
