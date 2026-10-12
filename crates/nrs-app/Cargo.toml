@@ -5,12 +5,13 @@ edition.workspace = true
 
 [dependencies]
 nrs-core = { path = "../nrs-core" }
-nrs-fit = { path = "../nrs-fit" }
+nrs-entry-store = { path = "../nrs-entry-store" }
 nrs-import = { path = "../nrs-import", features = ["scripting"] }
 nrs-store = { path = "../nrs-store" }
 axum = "0.8"
 rand = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-time = { version = "0.3", features = ["macros"] }
+tower-http = { version = "0.6", features = ["fs"] }
+time = { version = "0.3", features = ["macros", "parsing"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

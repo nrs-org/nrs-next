@@ -1,8 +1,0 @@
-[package]
-name = "nrs-fit"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-nrs-core = { path = "../nrs-core" }
-nrs-store = { path = "../nrs-store" }

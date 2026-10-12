@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/nrs-app",
     "crates/nrs-core",
-    "crates/nrs-fit",
+    "crates/nrs-entry-store",
     "crates/nrs-import",
     "crates/nrs-store",
 ]
