@@ -29,7 +29,6 @@ pub struct Snapshot {
     pub impacts: Vec<Impact>,
     pub relations: Vec<Relation>,
     pub palette: Palette,
-    pub taxonomy: Taxonomy,
 }
 
 /// Opaque id plus a pointer into a type store; the central DB never
@@ -70,25 +69,18 @@ pub enum TimeSupport {
 }
 
 /// Relation kinds (INFRA.md §5.1 `relation.kind`). Not read by the
-/// scoring math itself (`measure`/`solve`/`redundancy` only ever look at
-/// `from`/`to`/`transform`) — this is a semantic label for downstream
-/// consumers like [`crate::derive_taxonomy`] and any future audit/explain
-/// UI, not part of the redundancy computation.
+/// scoring math (`measure`/`solve`/`pool` only look at
+/// `from`/`to`/`transform`); a semantic label for downstream consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RelKind {
     /// Genuine structural containment: a franchise/album nested around
     /// its works/tracks (nested XML entries or an explicit `<contains>`
-    /// tag). Taxonomically load-bearing — `derive_taxonomy` builds the
-    /// `k_src` ancestor tree from exactly these.
+    /// tag).
     Contains,
     /// A contributor (artist, writer, ...) borrowing a share of a work
-    /// they're credited on. Same borrow mechanics as `Contains` (the
-    /// `transform` is solved identically either way — see `solve.rs`),
-    /// but *not* structural containment: a prolific contributor can have
-    /// many of these pointing at unrelated works, so `derive_taxonomy`
-    /// ignores them rather than treating a contributor as every credited
-    /// work's taxonomic parent.
+    /// they're credited on. Same borrow mechanics as `Contains`, but not
+    /// structural containment.
     Credit,
     Remix,
     FeatureMusic,
@@ -157,9 +149,20 @@ pub struct Anchor {
     pub family: Option<String>,
 }
 
-/// Sparse anchor x anchor redundancy matrix (INFRA.md §5.1 `kfeat`:
-/// "sparse: only non-default pairs"). Unlisted pairs default to `1.0`
-/// on the diagonal and `0.0` off it.
+/// Sparse anchor x anchor pooling-exponent matrix `K` (INFRA.md §5.1
+/// `kfeat`: "sparse: only non-default pairs"). Unlisted entries default
+/// to `1.0`.
+///
+/// - The diagonal `K(a, a) = w_a` is anchor `a`'s own exponent: repeated
+///   value on `a` pools as `l_(1/w_a)` (embedded mass `e = m^(1/w_a)` adds),
+///   so `n` equal hits grow like `n^w_a`. `1.0` means plain addition.
+/// - Off the diagonal, `K(a, b)` is the exponent at which `a` and `b` pool
+///   together: `1.0` is independent (they add), and `K(a, b) = w_a = w_b`
+///   makes them one box (twins). Meaningful values satisfy
+///   `max(w_a, w_b) <= K(a, b) <= 1`.
+///
+/// Scoring reads `K` through its single-linkage tree, so only its
+/// ultrametric closure matters (see [`crate::ultrametric_closure`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KFeatMatrix {
     pub pairs: BTreeMap<(AnchorId, AnchorId), f32>,
@@ -167,22 +170,22 @@ pub struct KFeatMatrix {
 
 impl KFeatMatrix {
     pub fn get(&self, a: &AnchorId, b: &AnchorId) -> f32 {
-        if a == b {
-            return 1.0;
-        }
         // The lookup key clones both `AnchorId` `String`s (a `BTreeMap<(K,
         // K), V>` has no borrowed-key query path for a tuple), so skip it
-        // entirely when there's nothing to find — the common case today,
-        // since nothing populates `pairs` yet (INFRA.md's `nrs-fit` phase),
-        // and this sits in `score()`'s O(cells^2) hot loop.
+        // entirely when there's nothing to find.
         if self.pairs.is_empty() {
-            return 0.0;
+            return 1.0;
         }
         self.pairs
             .get(&(a.clone(), b.clone()))
             .or_else(|| self.pairs.get(&(b.clone(), a.clone())))
             .copied()
-            .unwrap_or(0.0)
+            .unwrap_or(1.0)
+    }
+
+    /// Anchor `a`'s own exponent `w_a = K(a, a)`.
+    pub fn exponent(&self, a: &AnchorId) -> f32 {
+        self.get(a, a)
     }
 }
 
@@ -190,61 +193,6 @@ impl KFeatMatrix {
 pub struct Palette {
     pub anchors: Vec<Anchor>,
     pub k_feat: KFeatMatrix,
-}
-
-/// Deepest-shared-ancestor taxonomy feeding `k_src` (INFRA.md §5.1),
-/// derived from `Contains`/franchise relations rather than stored
-/// separately: `parent` maps a source to its immediate container, if
-/// any. Keyed by `SourceId` (not `EntryId`) because `k_src` compares
-/// sources (characters/scenes/works), which needn't all be top-level
-/// scoreable entries.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Taxonomy {
-    pub parent: BTreeMap<SourceId, SourceId>,
-}
-
-/// The ~5 taxonomy-distance levels feeding `k_src` (INFRA.md §4.2).
-/// Exact semantics are pinned down when `nrs-fit` lands (roadmap phase 6);
-/// frozen here only as a fixed-size fitted vector.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct KSrcLevels {
-    pub levels: [f32; 5],
-}
-
-/// Which redundancy functional to score with. The first two are the
-/// per-cell additive forms (notes §7.2, degree-1 vs degree-q
-/// homogeneity); `Spectral` is the bounded-slope spectral value
-/// (redesign-tex `spectral-bounded-slope.tex`), a structurally
-/// different construction that reads the spectrum of the mass-weighted
-/// kernel rather than a per-cell crowding sum.
-///
-/// `Eq` is intentionally not derived: `Spectral` carries an `f32`
-/// tuning constant, and `Params` (its only embedder) needs only
-/// `PartialEq`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Homogeneity {
-    Degree1,
-    DegreeQ,
-    /// Score via the eigenvalues `sigma_k` of the mass-weighted kernel
-    /// `G = M^{1/2} K M^{1/2}` with the concave, bounded-origin-slope
-    /// gauge `g(t) = beta * ln(1 + t/beta)`: `V = sum_k g(sigma_k)`.
-    ///
-    /// Unlike `DegreeQ` this is unconditionally monotone and exactly
-    /// splitting-invariant; unlike the Schatten spectral form it stays
-    /// finite under fixed-spread refinement, because `g` has finite
-    /// slope at the origin. It gives up exact degree-1 homogeneity
-    /// (which `DegreeQ` also lacks) — provably the price of that
-    /// convergence (see the note's impossibility theorem).
-    ///
-    /// `beta` is the saturation scale, in mass units: `beta -> inf`
-    /// recovers the kernel-blind `sum |mass|`, smaller `beta` sharpens
-    /// the redundancy discount. Overall output scale is left to the
-    /// downstream `calibration`, so there is no separate `alpha`.
-    Spectral {
-        beta: f32,
-    },
 }
 
 /// Monotone calibration `g`: piecewise-linear through sorted `(v, s)`
@@ -282,53 +230,12 @@ impl Isotonic {
     }
 }
 
-/// How a relation's raw transform weight (`Transform`'s scalar(s) —
-/// e.g. `killedBy`'s ~0.04 dilution) relates to the redundancy
-/// exponent `q`.
-///
-/// Under `Fixed`, a relation-borrowed atom's contribution once
-/// isolated is `(w*m)^q`; as `q -> 0`, `x^q -> 1` for *any* fixed
-/// `x > 0`, so the weight `w` washes out almost entirely no matter
-/// how small it is — a heavily-diluted relation ends up contributing
-/// close to full presence credit at low `q`. `PowQ` reparametrizes
-/// the weight as `w^(1/q)` before the relation solve, so the isolated
-/// contribution becomes `(m*w^(1/q))^q = m^q * w` — `w` comes out
-/// exactly linearly, for every `q`, matching what the dilution factor
-/// was semantically supposed to mean throughout the whole range, not
-/// just at `q=1`. `Contains`'s weight (`1.0`) is unaffected at any
-/// `q` under either mode (`1^x = 1`), so only genuinely-diluted
-/// relations (remix, killedBy, featureMusic) are touched.
-///
-/// `Fixed` is the default and matches INFRA.md/the redesign notes'
-/// original spec exactly (including Prop. "the double-count is
-/// identified and vanishes with saturation"'s closed form). `PowQ` is
-/// a deliberate amendment on top of that spec to fix the low-q
-/// pathology above; redesign-tex's notes prove `PowQ`'s `V(C) <=`
-/// `Fixed`'s `V(C)` for `q <= 1` (the saturation/breadth regime) — the
-/// reparametrization doesn't just fix the pathology, it provably
-/// tightens the same double-count bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum RelationScaling {
-    #[default]
-    Fixed,
-    PowQ,
-}
-
-/// `Theta` - the fitted knobs (INFRA.md §4.2). No kernel width here:
-/// `k_feat` and `k_src_levels` are already-realized lookup tables, not
-/// a distance formula, so there's nothing for a width to parameterize
-/// at this layer. A width belongs, if ever needed, to whatever
-/// offline process derives one of those tables from an anchor
-/// embedding — scoped to that step, not threaded through `score`.
+/// `Theta` - the fitted knobs (INFRA.md §4.2): the pooling-exponent
+/// matrix and the public-scale calibration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Params {
-    pub q: f32,
-    pub k_src_levels: KSrcLevels,
     pub k_feat: KFeatMatrix,
-    pub homogeneity: Homogeneity,
     pub calibration: Isotonic,
-    pub relation_scaling: RelationScaling,
 }
 
 /// `score`'s output: public scale `S_e` per entry.
@@ -337,14 +244,15 @@ pub struct Scores {
     pub values: BTreeMap<EntryId, f32>,
 }
 
-/// One `(source, anchor)` cell's contribution to an entry's value
-/// (INFRA.md §4.3 phase 3: `V = sum f * phi(c)`).
+/// One anchor's share of an entry's value. `embedded` is the resolved
+/// signed embedded mass `e`, `mass` its value-unit form
+/// `sgn(e) |e|^w`, and `contribution` its Euler share of the value
+/// (`mass * dV/dmass`; the shares sum to the value).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Contribution {
-    pub source: SourceId,
     pub anchor: AnchorId,
+    pub embedded: f32,
     pub mass: f32,
-    pub crowding: f32,
     pub contribution: f32,
 }
 
@@ -362,12 +270,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kfeat_defaults_to_identity_diagonal() {
+    fn kfeat_defaults_to_one_everywhere() {
         let m = KFeatMatrix::default();
         let a = AnchorId("gut-punch".into());
         let b = AnchorId("gorgeous-visuals".into());
-        assert_eq!(m.get(&a, &a), 1.0);
-        assert_eq!(m.get(&a, &b), 0.0);
+        assert_eq!(m.exponent(&a), 1.0);
+        assert_eq!(m.get(&a, &b), 1.0);
     }
 
     #[test]

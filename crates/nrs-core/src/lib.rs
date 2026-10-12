@@ -1,35 +1,29 @@
 //! The pure scoring engine (INFRA.md §4). I/O-free and deterministic:
 //! `score`/`explain` are the entire contract, everything else is the
 //! plain data they take and return.
+//!
+//! Pipeline: each impact embeds as signed `e = sgnpow(m, 1/w_anchor)` per
+//! anchor (phase 1); relations move capped fractions of substance, linear
+//! in `e` (phase 2); per entry, anchors pool by nested signed `l_p` over
+//! the single-linkage tree of `K` (phase 3); calibration maps the value
+//! to the public scale (phase 4).
 
-mod audit;
-mod linalg;
 mod measure;
-mod redundancy;
+mod pool;
 mod solve;
-mod taxonomy;
 pub mod types;
 
 use rayon::prelude::*;
 
-pub use audit::{audit_monotonicity, AuditReport, InsertionMargin};
-pub use taxonomy::derive_taxonomy;
+pub use pool::{apply_corrections, ultrametric_closure, KCorrection};
 pub use types::*;
 
-/// INFRA.md §4.3, phases 1-4: build measures, solve relations, apply the
-/// one nonlinearity, calibrate.
-///
-/// Entries score independently of one another (phase 3 only reads one
-/// entry's own resolved measure), so this fans the per-entry work out
-/// over `rayon`'s thread pool. Each task gets its own `SourceIndex`
-/// rather than sharing one: cross-entry chain memoization no longer
-/// pays for itself now that `redundancy::bucket_crowding` has cut most
-/// of the pairwise `k_src` traffic it existed to amortize, and a fresh
-/// per-task index avoids synchronizing mutable state across threads.
+/// INFRA.md §4.3, phases 1-4. Entries score independently once their
+/// measures are resolved, so phase 3 fans out over `rayon`.
 pub fn score(snap: &Snapshot, params: &Params) -> Scores {
-    let built = measure::build_measures(snap);
-    let resolved =
-        solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
+    let kernel = pool::Kernel::new(&params.k_feat);
+    let built = measure::build_measures(snap, &kernel);
+    let resolved = solve::solve_relations(built, &snap.relations);
 
     // Collected to a `Vec` first: rayon splits a slice for work-stealing
     // more cheaply than `BTreeMap`'s tree-shaped parallel iterator.
@@ -37,40 +31,23 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
     let values: std::collections::BTreeMap<EntryId, f32> = entries
         .par_iter()
         .map(|&(entry, f)| {
-            let mut src_index = redundancy::SourceIndex::new();
-            let v = redundancy::value_scalar(
-                f,
-                &params.k_feat,
-                &snap.taxonomy,
-                &mut src_index,
-                &params.k_src_levels,
-                params.q,
-                params.homogeneity,
-            );
+            let (v, _) = pool::value(f, &kernel);
             (entry.clone(), params.calibration.apply(v))
         })
         .collect();
     Scores { values }
 }
 
-/// Same contract as `score`, but returns one entry's per-`(source,
-/// anchor)` breakdown (INFRA.md §4.3 phase 3).
+/// Same contract as `score`, but returns one entry's per-anchor
+/// breakdown (INFRA.md §4.3 phase 3).
 pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation {
-    let built = measure::build_measures(snap);
-    let resolved =
-        solve::solve_relations(built, &snap.relations, params.q, params.relation_scaling);
+    let kernel = pool::Kernel::new(&params.k_feat);
+    let built = measure::build_measures(snap, &kernel);
+    let resolved = solve::solve_relations(built, &snap.relations);
 
     let empty = measure::Measure::new();
     let f = resolved.get(&entry).unwrap_or(&empty);
-    let (value, contributions) = redundancy::value(
-        f,
-        &params.k_feat,
-        &snap.taxonomy,
-        &mut redundancy::SourceIndex::new(),
-        &params.k_src_levels,
-        params.q,
-        params.homogeneity,
-    );
+    let (value, contributions) = pool::value(f, &kernel);
     let score = params.calibration.apply(value);
     Explanation {
         entry,

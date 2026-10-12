@@ -1,20 +1,33 @@
 //! Phase 1 (INFRA.md §4.3): fold every impact's atoms into each target
-//! entry's own measure. Pure addition — splittable (chopping a tail's
-//! time-support doesn't change its integrated area) and associative.
+//! entry's own measure.
+//!
+//! The measure is one signed **embedded** mass per anchor. A piece of
+//! value-unit mass `m` on anchor `a` embeds as `e = sgnpow(m, 1/w_a)`
+//! (`w_a = K(a, a)`), and embedded masses add. This is the `l_(1/w)`
+//! pooling of repeated value on one anchor, kept linear so that
+//! grouping never changes the answer: splitting an impact into pieces
+//! with the same features, or cancelling a positive against a negative,
+//! lands on the same `e` however the pieces are grouped. No impact or
+//! source identity survives into the measure.
 
 use std::collections::BTreeMap;
 
-use crate::types::{Atom, EntryId, Snapshot, TimeSupport};
+use crate::pool::Kernel;
+use crate::types::{AnchorId, Atom, EntryId, Snapshot, TimeSupport};
 
-/// Sparse per-entry measure: mass at each `(source, anchor)` cell
-/// (INFRA.md §4.3 phase 1's "sparse map (SourceId, AnchorId) -> f32").
-pub(crate) type Measure = BTreeMap<(crate::types::SourceId, crate::types::AnchorId), f32>;
+/// Sparse per-entry measure: signed embedded mass per anchor.
+pub(crate) type Measure = BTreeMap<AnchorId, f64>;
 
-/// The area under a time-support's intensity (notes ch. "Time: value as
-/// an integral"): a moment is mass `m` at an instant (area = 1, i.e. the
-/// atom's own magnitude passes through unscaled); a tail integrates
-/// `peak * exp(-lambda * t)` from `0` to `cutoff` — an infinite cutoff
-/// recovers the untruncated `peak / lambda`.
+/// `sgn(x) |x|^p`, the signed power that keeps embedding and reading
+/// back odd (so opposite masses cancel exactly in embedded units).
+pub(crate) fn sgnpow(x: f64, p: f64) -> f64 {
+    x.signum() * x.abs().powf(p)
+}
+
+/// The area under a time-support's intensity: a moment passes its
+/// magnitude through unscaled; a tail integrates `peak * exp(-lambda *
+/// t)` from `0` to `cutoff`. A tail is still one atom: its total enters
+/// as a single value-unit mass (time is not a feature yet).
 fn life(time: &TimeSupport) -> f32 {
     match *time {
         TimeSupport::Moment => 1.0,
@@ -30,10 +43,11 @@ fn atom_mass(atom: &Atom) -> f32 {
     atom.magnitude * life(&atom.time)
 }
 
-/// Build every entry's own measure from its impacts' atoms, before any
-/// relation is applied. An atom's mass splits across its blend anchors
-/// in proportion to the blend weights.
-pub(crate) fn build_measures(snap: &Snapshot) -> BTreeMap<EntryId, Measure> {
+/// Build every entry's own embedded measure from its impacts' atoms,
+/// before any relation is applied. An atom's mass splits across its
+/// blend anchors in proportion to the blend weights, and each share
+/// embeds with its own anchor's exponent.
+pub(crate) fn build_measures(snap: &Snapshot, kernel: &Kernel) -> BTreeMap<EntryId, Measure> {
     let mut measures: BTreeMap<EntryId, Measure> = BTreeMap::new();
     for entry in &snap.entries {
         measures.entry(entry.id.clone()).or_default();
@@ -41,11 +55,14 @@ pub(crate) fn build_measures(snap: &Snapshot) -> BTreeMap<EntryId, Measure> {
     for impact in &snap.impacts {
         let measure = measures.entry(impact.target.clone()).or_default();
         for atom in &impact.atoms {
-            let mass = atom_mass(atom);
+            let mass = f64::from(atom_mass(atom));
             for (anchor, frac) in &atom.blend {
-                *measure
-                    .entry((atom.source.clone(), anchor.clone()))
-                    .or_insert(0.0) += mass * frac;
+                let share = mass * f64::from(*frac);
+                if share == 0.0 {
+                    continue;
+                }
+                let w = kernel.exponent_of(anchor);
+                *measure.entry(anchor.clone()).or_insert(0.0) += sgnpow(share, 1.0 / w);
             }
         }
     }
@@ -69,27 +86,8 @@ mod tests {
     }
 
     #[test]
-    fn splitting_a_tail_preserves_total_area() {
-        // Splittability (P6): chopping a tail at any point and scoring
-        // the two pieces separately must sum to the whole (Prop.
-        // "splittability => additivity in time").
-        let peak = 2.0;
-        let lambda = 0.5;
-        let cutoff = 4.0;
-        let whole = life(&TimeSupport::Tail {
-            peak,
-            lambda,
-            cutoff,
-        });
-
-        let split_at = 1.7;
-        let first = peak * (1.0 - (-lambda * split_at).exp()) / lambda;
-        // The remainder is the same decaying tail, re-based at t=0 with
-        // a lower peak (its value at the cut point) and the leftover
-        // duration.
-        let remainder_peak = peak * (-lambda * split_at).exp();
-        let second = remainder_peak * (1.0 - (-lambda * (cutoff - split_at)).exp()) / lambda;
-
-        assert!((whole - (first + second)).abs() < 1e-5);
+    fn sgnpow_is_odd() {
+        assert_eq!(sgnpow(-8.0, 1.0 / 3.0), -sgnpow(8.0, 1.0 / 3.0));
+        assert_eq!(sgnpow(0.0, 2.5), 0.0);
     }
 }

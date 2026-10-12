@@ -4,15 +4,14 @@
 //! relations after import) - kept synthetic rather than depending on
 //! that external XML file so this benchmark is self-contained and
 //! portable. `nrs-app`'s per-request cost is exactly this call (it
-//! caches the parsed `Snapshot` and reruns `score()` live whenever the
-//! `q` slider changes), so this is the number that matters for "does
-//! the live-scoring web UI feel instant."
+//! caches the parsed `Snapshot` and reruns `score()` live whenever a
+//! knob changes), so this is the number that matters for "does the
+//! live-scoring web UI feel instant."
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use nrs_core::{
-    AnchorId, Atom, Entry, EntryId, Homogeneity, Impact, ImpactId, Isotonic, KFeatMatrix,
-    KSrcLevels, Palette, Params, RelKind, Relation, RelationScaling, Snapshot, SourceId, Taxonomy,
-    TimeSupport, Transform,
+    AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, KFeatMatrix, Palette, Params,
+    RelKind, Relation, Snapshot, SourceId, TimeSupport, Transform,
 };
 
 const ANCHORS: &[&str] = &[
@@ -36,7 +35,6 @@ fn generate_snapshot(n_leaf_entries: usize) -> Snapshot {
     let mut entries = Vec::new();
     let mut impacts = Vec::new();
     let mut relations = Vec::new();
-    let mut taxonomy = Taxonomy::default();
 
     let n_groups = n_leaf_entries.div_ceil(GROUP_SIZE);
     for g in 0..n_groups {
@@ -65,14 +63,9 @@ fn generate_snapshot(n_leaf_entries: usize) -> Snapshot {
                 to: entry_id.clone(),
                 transform: Transform::Scalar(1.0),
             });
-            taxonomy.parent.insert(
-                SourceId(entry_id.0.clone()),
-                SourceId(container_id.0.clone()),
-            );
 
             // 2-3 impacts per entry, each a moment atom at a rotating
-            // anchor with a source shared by nearby entries (so
-            // crowding has real work to do, not all-zero k_src).
+            // anchor.
             for k in 0..(2 + idx % 2) {
                 let anchor = AnchorId(ANCHORS[(idx + k) % ANCHORS.len()].to_string());
                 let source = SourceId(format!("char-{}", idx / 3));
@@ -116,64 +109,114 @@ fn generate_snapshot(n_leaf_entries: usize) -> Snapshot {
             anchors: Vec::new(),
             k_feat: KFeatMatrix::default(),
         },
-        taxonomy,
     }
 }
 
-fn params(homogeneity: Homogeneity) -> Params {
+/// The first half of `ANCHORS` pool as one group at 0.6 over box
+/// exponents of 0.4; the rest add.
+fn k_feat() -> KFeatMatrix {
+    let mut k = KFeatMatrix::default();
+    let group = &ANCHORS[..ANCHORS.len() / 2];
+    for (i, a) in group.iter().enumerate() {
+        k.pairs.insert((AnchorId((*a).into()), AnchorId((*a).into())), 0.4);
+        for b in &group[i + 1..] {
+            k.pairs.insert((AnchorId((*a).into()), AnchorId((*b).into())), 0.6);
+        }
+    }
+    k
+}
+
+fn params(k_feat: KFeatMatrix) -> Params {
     Params {
-        q: 0.6,
-        k_src_levels: KSrcLevels {
-            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
-        },
-        k_feat: KFeatMatrix::default(),
-        homogeneity,
+        k_feat,
         calibration: Isotonic::default(),
-        relation_scaling: RelationScaling::Fixed,
     }
 }
-
-/// The two scoring functionals, benchmarked on identical snapshots: the
-/// per-cell additive `DegreeQ` (O(cells^2) per entry) vs the spectral
-/// `Spectral` (an eigendecomposition per entry per sign class).
-const MODES: &[(&str, Homogeneity)] = &[
-    ("degreeq", Homogeneity::DegreeQ),
-    ("spectral", Homogeneity::Spectral { beta: 2.0 }),
-];
 
 fn bench_score(c: &mut Criterion) {
     let mut group = c.benchmark_group("score");
     // 1600 matches the real dataset's rough entry count.
+    let p = params(k_feat());
     for &n in &[100usize, 400, 1600] {
         let snapshot = generate_snapshot(n);
-        for &(name, homogeneity) in MODES {
-            let p = params(homogeneity);
-            group.bench_with_input(BenchmarkId::new(name, n), &snapshot, |b, snap| {
-                b.iter(|| nrs_core::score(std::hint::black_box(snap), std::hint::black_box(&p)));
-            });
-        }
-    }
-    group.finish();
-}
-
-fn bench_explain(c: &mut Criterion) {
-    let mut group = c.benchmark_group("explain");
-    let snapshot = generate_snapshot(1600);
-    let target = snapshot.entries[snapshot.entries.len() / 2].id.clone();
-    for &(name, homogeneity) in MODES {
-        let p = params(homogeneity);
-        group.bench_function(BenchmarkId::new(name, 1600), |b| {
-            b.iter(|| {
-                nrs_core::explain(
-                    std::hint::black_box(&snapshot),
-                    std::hint::black_box(&p),
-                    target.clone(),
-                )
-            });
+        group.bench_with_input(BenchmarkId::from_parameter(n), &snapshot, |b, snap| {
+            b.iter(|| nrs_core::score(std::hint::black_box(snap), std::hint::black_box(&p)));
         });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_score, bench_explain);
+fn bench_explain(c: &mut Criterion) {
+    let snapshot = generate_snapshot(1600);
+    let target = snapshot.entries[snapshot.entries.len() / 2].id.clone();
+    let p = params(k_feat());
+    c.bench_function("explain/1600", |b| {
+        b.iter(|| {
+            nrs_core::explain(
+                std::hint::black_box(&snapshot),
+                std::hint::black_box(&p),
+                target.clone(),
+            )
+        });
+    });
+}
+
+/// One entry with `n` anchors, every pair pooling below 1, so the
+/// single-linkage pass sees all `n^2 / 2` pairs.
+fn dense_snapshot(n: usize) -> (Snapshot, KFeatMatrix) {
+    let entry = EntryId("dense".into());
+    let source = SourceId("same-source".into());
+    let anchors: Vec<_> = (0..n).map(|i| AnchorId(format!("a{i}"))).collect();
+    let impacts = anchors
+        .iter()
+        .enumerate()
+        .map(|(i, anchor)| Impact {
+            id: ImpactId(format!("i{i}")),
+            target: entry.clone(),
+            atoms: vec![Atom {
+                source: source.clone(),
+                blend: vec![(anchor.clone(), 1.0)],
+                magnitude: 1.0,
+                time: TimeSupport::Moment,
+            }],
+        })
+        .collect();
+    let mut k_feat = KFeatMatrix::default();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            k_feat
+                .pairs
+                .insert((anchors[i].clone(), anchors[j].clone()), 0.5 + 0.4 * (i * j % 7) as f32 / 7.0);
+        }
+    }
+    let snapshot = Snapshot {
+        entries: vec![Entry {
+            id: entry,
+            store: "bench".into(),
+            store_id: "dense".into(),
+            title_cache: None,
+        }],
+        impacts,
+        relations: Vec::new(),
+        palette: Palette {
+            anchors: Vec::new(),
+            k_feat: KFeatMatrix::default(),
+        },
+    };
+    (snapshot, k_feat)
+}
+
+fn bench_dense(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dense");
+    for &n in &[8usize, 32, 128] {
+        let (snapshot, k_feat) = dense_snapshot(n);
+        let p = params(k_feat);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &snapshot, |b, snap| {
+            b.iter(|| nrs_core::score(std::hint::black_box(snap), std::hint::black_box(&p)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_score, bench_explain, bench_dense);
 criterion_main!(benches);
