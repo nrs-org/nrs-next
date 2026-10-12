@@ -246,13 +246,10 @@ async function renderScores() {
   const view = {
     sort: params.get("sort") || "value",
     dir: params.get("dir") || "desc",
-    rel: params.get("rel") || "fixed",
-    slope: params.get("slope") || "0.5",
     q: params.get("q") || "",
-    cmp_rel: params.get("cmp_rel") || "",
-    cmp_slope: params.get("cmp_slope") || "",
+    cmp_gen: params.get("cmp_gen") || "",
   };
-  const comparing = Boolean(view.cmp_rel || view.cmp_slope);
+  const comparing = Boolean(view.cmp_gen);
   const columns = [
     ["rank", "#", "value"],
     ...(comparing ? [["delta", "Δ", "delta"]] : []),
@@ -263,16 +260,10 @@ async function renderScores() {
   ];
   app.innerHTML = `
     <h1>scores</h1>
-    <p class="muted">Uncalibrated V from the redundancy functional -- not a public score yet.</p>
-    <form class="score-controls">
-      ${selectField({ mode: "credit" }, "mode", "mode", [["credit", "credit LP (monotone, block-additive)"]], "credit")}
-      ${textField(view, "slope", "slope (credit depth)", "0.5", "number", 'min="0" max="1" step="0.01"')}
-      ${selectField(view, "rel", "relation scaling", [["fixed", "fixed (spec default)"], ["powq", "powq (w^(1/q))"]], view.rel)}
-      <button class="button primary" type="submit">rerun</button>
-    </form>
+    <p class="muted">Uncalibrated V (nested pooling over <a href="/kfeat">K</a>) -- not a public score yet.</p>
     <div class="ledger-meta">
       <span class="score-count">Calculating…</span>
-      ${comparing ? `<span class="compare-note">Δ vs slope ${escapeHtml(view.cmp_slope || "0.5")} · ${escapeHtml(view.cmp_rel || "fixed")} <button class="edit-link" type="button" data-clear-compare>clear</button></span>` : ""}
+      ${comparing ? `<span class="compare-note">Δ vs version ${escapeHtml(view.cmp_gen)} <button class="edit-link" type="button" data-clear-compare>clear</button></span>` : `<span class="compare-note" hidden><button class="edit-link" type="button" data-start-compare>compare with the previous version</button></span>`}
       <a class="csv-link">download csv</a>
     </div>
     <div class="toolbar score-toolbar">
@@ -284,7 +275,7 @@ async function renderScores() {
           <dt><code>type:anime</code></dt><dd>${Object.keys(entryKinds).join(", ")}, or <code>music</code> for album + track + artist — several mean any of them (click a chip; shift-click excludes)</dd>
           <dt><code>store:mal</code></dt><dd>store contains it</dd>
           <dt><code>v>10</code> <code>rank<=100</code></dt><dd>compare with <code>&gt; &gt;= &lt; &lt;= =</code></dd>
-          <dt><code>delta>=5</code> <code>is:up</code> <code>is:down</code> <code>is:moved</code></dt><dd>rank changes, after a rerun with new parameters</dd>
+          <dt><code>delta>=5</code> <code>is:up</code> <code>is:down</code> <code>is:moved</code></dt><dd>rank changes since the compared version (after an edit)</dd>
         </dl>
       </div></details>
     </div>
@@ -298,7 +289,6 @@ async function renderScores() {
       <div class="score-sentinel"></div>
     </div>
     <p class="key-hint dim">j / k to move · enter to open · / to filter</p>`;
-  const controls = app.querySelector(".score-controls");
   const count = app.querySelector(".score-count");
   const csv = app.querySelector(".csv-link");
   const search = app.querySelector(".search");
@@ -307,9 +297,9 @@ async function renderScores() {
   const sentinel = app.querySelector(".score-sentinel");
   const chips = app.querySelector(".kind-chips");
   const warnings = app.querySelector(".filter-warnings");
-  if (!(controls instanceof HTMLFormElement) || !(count instanceof HTMLElement) || !(csv instanceof HTMLAnchorElement) || !(search instanceof HTMLInputElement) || !(table instanceof HTMLElement) || !(tbody instanceof HTMLElement) || !(sentinel instanceof HTMLElement) || !(chips instanceof HTMLElement) || !(warnings instanceof HTMLElement)) return;
+  if (!(count instanceof HTMLElement) || !(csv instanceof HTMLAnchorElement) || !(search instanceof HTMLInputElement) || !(table instanceof HTMLElement) || !(tbody instanceof HTMLElement) || !(sentinel instanceof HTMLElement) || !(chips instanceof HTMLElement) || !(warnings instanceof HTMLElement)) return;
 
-  const defaults = { sort: "value", dir: "desc", rel: "fixed", slope: "0.5" };
+  const defaults = { sort: "value", dir: "desc" };
   const query = (extra = {}) => new URLSearchParams(Object.entries({ ...view, ...extra }).filter(([, value]) => value !== ""));
   // The address bar only carries what differs from the defaults.
   const pageUrl = (extra = {}) => `/?${new URLSearchParams([...query(extra)].filter(([key, value]) => defaults[key] !== value))}`.replace(/\?$/, "");
@@ -321,7 +311,7 @@ async function renderScores() {
 
   const syncView = () => {
     history.replaceState(null, "", pageUrl());
-    const { cmp_rel, cmp_slope, ...exported } = view;
+    const { cmp_gen, ...exported } = view;
     csv.href = `/api/v1/scores.csv?${new URLSearchParams(Object.entries(exported).filter(([, value]) => value !== ""))}`;
     app.querySelectorAll(".sort-button").forEach((button) => {
       const active = button.getAttribute("data-sort") === view.sort;
@@ -345,7 +335,10 @@ async function renderScores() {
       const filtered = page.total < page.database_total;
       table.classList.toggle("filtered", filtered);
       tbody.insertAdjacentHTML("beforeend", page.rows.map((row) => scoreRow(row, comparing, filtered)).join(""));
-      if (page.offset === 0) paintFilters(page);
+      if (page.offset === 0) {
+        paintFilters(page);
+        noteGeneration(page);
+      }
       count.textContent = total === page.database_total ? `${total} entries` : `${total} of ${page.database_total} entries`;
       sentinel.innerHTML = loaded < total ? `<p class="loading">Loading more…</p>` : total ? "" : `<p class="empty">No matching entries.</p>`;
     } catch (error) {
@@ -372,6 +365,26 @@ async function renderScores() {
       + (comparing ? `<span class="chip-divider"></span>${statusTerms.map(([term, label]) => `<button class="status-chip" type="button" data-term="${term}" data-state="${present.has(term) ? "include" : ""}">${label}</button>`).join("")}` : "");
     warnings.hidden = !page.warnings.length;
     warnings.textContent = page.warnings.join(" · ");
+  }
+  // The last ranking version this tab saw, so an edit made elsewhere
+  // (an impact, a relation, K) can be compared against what it replaced.
+  const GENERATION_KEY = "nrs.scores.generation";
+  let previousGeneration = null;
+  function noteGeneration(page) {
+    let seen = null;
+    try {
+      seen = sessionStorage.getItem(GENERATION_KEY);
+      sessionStorage.setItem(GENERATION_KEY, String(page.generation));
+    } catch {}
+    const note = app.querySelector(".compare-note");
+    if (comparing) {
+      if (!page.comparing && note) note.textContent = `version ${view.cmp_gen} is no longer cached -- nothing to compare against`;
+      return;
+    }
+    if (seen !== null && seen !== String(page.generation) && note instanceof HTMLElement) {
+      previousGeneration = seen;
+      note.hidden = false;
+    }
   }
   function setQuery(q) {
     clearTimeout(searchTimer);
@@ -432,18 +445,10 @@ async function renderScores() {
   });
 
   app.querySelector("[data-clear-compare]")?.addEventListener("click", () => {
-    navigate(pageUrl({ cmp_rel: "", cmp_slope: "" }));
+    navigate(pageUrl({ cmp_gen: "" }));
   });
-
-  controls.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const form = new FormData(controls);
-    const rel = String(form.get("rel") || "fixed");
-    const slope = String(form.get("slope") || "0.5");
-    const changed = rel !== view.rel || Number(slope) !== Number(view.slope);
-    // Compare against the run being replaced, so Δ answers "what did
-    // this change do?".
-    navigate(pageUrl({ rel, slope, ...(changed ? { cmp_rel: view.rel, cmp_slope: view.slope } : {}) }));
+  app.querySelector("[data-start-compare]")?.addEventListener("click", () => {
+    if (previousGeneration !== null) navigate(pageUrl({ cmp_gen: previousGeneration }));
   });
 
   const select = (index) => {
@@ -1149,12 +1154,19 @@ async function renderCalibrate() {
 
 async function renderKfeat() {
   currentEntryData = null;
-  document.title = "k_feat — NRS";
-  app.innerHTML = `<h1>k_feat</h1><p class="muted">How redundant does each anchor pair feel? 0 = unrelated, 1 = fully redundant (the same signal counted twice).</p><p class="loading">Loading pairs…</p>`;
+  document.title = "K — NRS";
+  const intro = `<h1>K</h1><p class="muted">Pooling exponents. An anchor's own exponent <var>w</var> sets how repeats grow (<var>n</var> equal hits score like <var>n<sup>w</sup></var>; 1 = they simply add). A pair's exponent is where the two pool together: 1 = independent (they add), equal to both anchors' <var>w</var> = one box. Scoring merges pairs tightest-first, so only the hierarchy matters.</p>`;
+  app.innerHTML = `${intro}<p class="loading">Loading K…</p>`;
+  const row = (pair) => `<form class="kfeat-row"><span>${pair.a === pair.b ? escapeHtml(pair.a) : `${escapeHtml(pair.a)} ↔ ${escapeHtml(pair.b)}`}</span><input type="hidden" name="a" value="${escapeHtml(pair.a)}"><input type="hidden" name="b" value="${escapeHtml(pair.b)}"><input type="number" name="value" min="0.01" max="1" step="0.05" value="${escapeHtml(pair.value)}"><button type="submit">save</button></form>`;
   try {
     const data = await getJson("/api/v1/calibration/kfeat");
-    app.innerHTML = `<h1>k_feat</h1><p class="muted">How redundant does each anchor pair feel? 0 = unrelated, 1 = fully redundant (the same signal counted twice).</p>
-      <div class="kfeat-list">${data.pairs.map((pair) => `<form class="kfeat-row"><span>${escapeHtml(pair.a)} ↔ ${escapeHtml(pair.b)}</span><input type="hidden" name="a" value="${escapeHtml(pair.a)}"><input type="hidden" name="b" value="${escapeHtml(pair.b)}"><input type="number" name="value" min="0" max="1" step="0.05" value="${escapeHtml(pair.value)}"><button type="submit">save</button></form>`).join("")}</div>`;
+    const corrections = data.corrections.length
+      ? `<h2>implied by the hierarchy</h2><p class="muted">These pairs already pool tighter than written, through a chain of tighter links. Scoring uses the tighter value; loosen a link in the chain to undo it.</p><ul class="kfeat-corrections">${data.corrections.map((c) => `<li>${escapeHtml(c.a)} ↔ ${escapeHtml(c.b)}: ${escapeHtml(c.from)} → <strong>${escapeHtml(c.to)}</strong> <span class="dim">via ${c.via.map(escapeHtml).join(" → ")}</span></li>`).join("")}</ul>`
+      : "";
+    app.innerHTML = `${intro}
+      <h2>anchor exponents</h2><div class="kfeat-list">${data.exponents.map(row).join("")}</div>
+      ${corrections}
+      <h2>pair exponents</h2><div class="kfeat-list">${data.pairs.map(row).join("")}</div>`;
     app.querySelectorAll(".kfeat-row").forEach((form) => form.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (!(form instanceof HTMLFormElement)) return;
@@ -1162,7 +1174,8 @@ async function renderKfeat() {
       payload.value = Number(payload.value);
       try {
         await sendJson("/api/v1/calibration/kfeat", "PUT", payload);
-        showToast(`${payload.a} ↔ ${payload.b} saved`);
+        showToast(payload.a === payload.b ? `${payload.a} saved` : `${payload.a} ↔ ${payload.b} saved`);
+        renderKfeat();
       } catch (error) {
         showToast(error?.message || String(error), "error");
       }

@@ -8,13 +8,13 @@ server serves the client and the versioned JSON API from the same origin; any
 non-API path falls back to `index.html` so client routes survive a reload.
 
 The client covers scores, entry search and ingestion, impacts, relations,
-palette, pairwise calibration, k_feat, and the review queue.
+palette, pairwise calibration, K (pooling exponents), and the review queue.
 
 ## API
 
 | Route | Methods | Purpose |
 | --- | --- | --- |
-| `/api/v1/scores` | GET | Live ranking; `sort`, `dir`, `rel`, `slope` |
+| `/api/v1/scores` | GET | Live ranking; `sort`, `dir`, `q`, and `cmp_gen` (rank changes since an earlier store generation) |
 | `/api/v1/scores.csv` | GET | CSV from the same live ranking |
 | `/api/v1/entries` | GET | Search and pagination; `q`, `offset`, `limit` |
 | `/api/v1/entries/ingest` | POST | Ingest through the configured anime store |
@@ -27,7 +27,7 @@ palette, pairwise calibration, k_feat, and the review queue.
 | `/api/v1/entries/{entry}/relations/{relation}` | PUT, DELETE | Edit or remove a relation |
 | `/api/v1/palette` | GET | Anchor list and live similarity matrix |
 | `/api/v1/calibration/pair` | GET, POST | Fetch a pair or record a preference |
-| `/api/v1/calibration/kfeat` | GET, PUT | Read anchor pairs or set a similarity value |
+| `/api/v1/calibration/kfeat` | GET, PUT | Read K (anchor exponents, pair exponents, implied corrections) or set one exponent in (0, 1] |
 | `/api/v1/review` | GET | Entries awaiting review |
 
 Standards writes use the existing form-field shape (`{"kind":"nei","factor":"0.5",...}`).

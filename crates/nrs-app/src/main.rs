@@ -26,8 +26,7 @@ use std::sync::{Arc, Mutex};
 use axum::routing::{get, post, put};
 use axum::Router;
 use nrs_core::{
-    AnchorId, Atom, Entry, EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params,
-    RelKind, RelationScaling, Snapshot, SourceId,
+    AnchorId, Atom, Entry, EntryId, Isotonic, KFeatMatrix, Params, RelKind, Snapshot, SourceId,
 };
 use nrs_entry_store::HttpEntryStore;
 use nrs_store::Store;
@@ -216,14 +215,6 @@ async fn main() {
 // Scores.
 // ---------------------------------------------------------------
 
-/// Which supported redundancy functional to score with.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum Mode {
-    #[default]
-    Credit,
-}
-
 #[derive(Deserialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum SortBy {
@@ -241,42 +232,10 @@ enum SortDir {
     Asc,
 }
 
-/// Mirrors `nrs_core::RelationScaling` (kept as a separate app-local
-/// enum so `nrs-core` doesn't need a serde dependency for this).
-#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum RelScaling {
-    #[default]
-    Fixed,
-    Powq,
-}
-
-impl RelScaling {
-    fn to_core(self) -> RelationScaling {
-        match self {
-            RelScaling::Fixed => RelationScaling::Fixed,
-            RelScaling::Powq => RelationScaling::PowQ,
-        }
-    }
-}
-
-fn params(rel: RelScaling, mode: Mode, slope: f32, k_feat: KFeatMatrix) -> Params {
-    let homogeneity = match mode {
-        Mode::Credit => Homogeneity::Credit {
-            slope: slope.clamp(0.0, 1.0),
-        },
-    };
+fn params(k_feat: KFeatMatrix) -> Params {
     Params {
-        // Credit scoring currently does not use q; powq uses this fixed
-        // value when adjusting diluted relation weights.
-        q: 0.6,
-        k_src_levels: KSrcLevels {
-            levels: [0.5, 0.3, 0.15, 0.0, 0.0],
-        },
         k_feat,
-        homogeneity,
         calibration: Isotonic::default(),
-        relation_scaling: rel.to_core(),
     }
 }
 
@@ -287,17 +246,8 @@ struct Row<'a> {
     value: f32,
 }
 
-#[allow(clippy::too_many_arguments)] // one flat view-state struct's worth of knobs
-fn rows(
-    snapshot: &Snapshot,
-    sort: SortBy,
-    dir: SortDir,
-    rel: RelScaling,
-    mode: Mode,
-    slope: f32,
-    k_feat: KFeatMatrix,
-) -> Vec<Row<'_>> {
-    let p = params(rel, mode, slope, k_feat);
+fn rows(snapshot: &Snapshot, sort: SortBy, dir: SortDir, k_feat: KFeatMatrix) -> Vec<Row<'_>> {
+    let p = params(k_feat);
     let scores = nrs_core::score(snapshot, &p);
 
     let mut rows: Vec<Row> = snapshot
@@ -1096,7 +1046,7 @@ fn build_relation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nrs_core::{Entry, Impact, ImpactId, Palette, Taxonomy};
+    use nrs_core::{Entry, Impact, ImpactId, Palette};
 
     #[test]
     fn csv_field_quotes_and_escapes_embedded_quotes() {
@@ -1148,7 +1098,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: KFeatMatrix::default(),
             },
-            taxonomy: Taxonomy::default(),
         }
     }
 
@@ -1159,9 +1108,6 @@ mod tests {
             &snap,
             SortBy::Value,
             SortDir::Desc,
-            RelScaling::Fixed,
-            Mode::Credit,
-            0.5,
             KFeatMatrix::default(),
         );
         assert_eq!(r[0].id.0, "a");
@@ -1175,9 +1121,6 @@ mod tests {
             &snap,
             SortBy::Title,
             SortDir::Asc,
-            RelScaling::Fixed,
-            Mode::Credit,
-            0.5,
             KFeatMatrix::default(),
         );
         assert_eq!(r[0].title, "Apple");
@@ -1185,15 +1128,12 @@ mod tests {
     }
 
     #[test]
-    fn credit_is_the_default_mode_and_produces_finite_values() {
+    fn scoring_produces_finite_values() {
         let snap = tiny_snapshot();
         let r = rows(
             &snap,
             SortBy::Value,
             SortDir::Desc,
-            RelScaling::Fixed,
-            Mode::Credit,
-            0.5,
             KFeatMatrix::default(),
         );
         for row in &r {

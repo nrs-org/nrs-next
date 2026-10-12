@@ -122,7 +122,7 @@ impl ScoreFilter {
         let needs_comparison = |filter: &mut Self| {
             if !comparing {
                 filter.warnings.push(format!(
-                    "`{body}` needs a comparison -- change slope or relation scaling and rerun first"
+                    "`{body}` needs a comparison -- edit something, then compare against the previous version"
                 ));
             }
             comparing

@@ -16,7 +16,7 @@ use super::{
     build_impact_atoms, build_relation, dah_factor_field, dah_params_json, entry_display_name,
     entry_kind, impact_anchor_mix, impact_kind_presentation, impact_period_summary,
     impact_primary_metric, impact_section, normalize_duration_fields, normalize_period_fields,
-    parsed_dah_params, rows, used_anchors, AppState, ImpactSection, KindHints, Mode, RelScaling,
+    parsed_dah_params, rows, used_anchors, AppState, ImpactSection, KindHints,
     SortBy, SortDir, TrackedStore, ENTRY_KINDS,
 };
 
@@ -141,28 +141,16 @@ pub(super) async fn entry_ingest(
 pub(super) struct ScoresQuery {
     sort: Option<String>,
     dir: Option<String>,
-    rel: Option<String>,
-    slope: Option<f32>,
     /// The filter language in `score_filter`.
     #[serde(default)]
     q: String,
     offset: Option<usize>,
     limit: Option<usize>,
-    /// Another run to report rank changes against (`delta`) -- the
-    /// client passes the parameters from before the last rerun.
-    cmp_rel: Option<String>,
-    cmp_slope: Option<f32>,
-}
-
-fn rel_param(value: Option<&str>) -> RelScaling {
-    match value {
-        Some("powq") => RelScaling::Powq,
-        _ => RelScaling::Fixed,
-    }
-}
-
-fn slope_param(value: Option<f32>) -> f32 {
-    value.unwrap_or(0.5).clamp(0.0, 1.0)
+    /// An earlier store generation to report rank changes against
+    /// (`delta`) -- the client passes the generation it last saw, so an
+    /// edit (an impact, a relation, `K`) shows what it moved. Only
+    /// rankings still in `ScoresCache` can be compared.
+    cmp_gen: Option<u64>,
 }
 
 /// One entry of a full ranking; `rank` 1 is the highest V.
@@ -177,99 +165,78 @@ pub(super) struct Scored {
     rank: usize,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct ScoresKey {
-    rel: RelScaling,
-    slope_bits: u32,
-    generation: u64,
-}
-
-/// The last few rankings computed: the current run, the run it's
-/// compared against, and a little back-and-forth between them.
+/// The last few rankings computed, one per store generation: the
+/// current one and the ones before the latest edits, to compare against.
 #[derive(Default)]
-pub(super) struct ScoresCache(std::sync::Mutex<Vec<(ScoresKey, Arc<Vec<Scored>>)>>);
+pub(super) struct ScoresCache(std::sync::Mutex<Vec<(u64, Arc<Vec<Scored>>)>>);
 
 const SCORES_CACHE_SIZE: usize = 4;
 
-/// The full ranking for one parameter set, in rank order. Scoring every
-/// entry is the expensive part of the scores view, so rankings are
-/// cached until the next store write (`TrackedStore::generation`).
-fn scored(
-    state: &AppState,
-    rel: RelScaling,
-    slope: f32,
-) -> Result<Arc<Vec<Scored>>, (StatusCode, Json<ApiError>)> {
+/// A ranking and the store generation it was scored at.
+type Ranking = (u64, Arc<Vec<Scored>>);
+
+/// The full ranking at the current store generation, in rank order.
+/// Scoring every entry is the expensive part of the scores view, so
+/// rankings are cached per generation (`TrackedStore::generation`).
+fn scored(state: &AppState) -> Result<Ranking, (StatusCode, Json<ApiError>)> {
     let rank = |snapshot: &nrs_core::Snapshot, k_feat| -> Vec<Scored> {
         let hints = KindHints::new(snapshot);
-        rows(
-            snapshot,
-            SortBy::Value,
-            SortDir::Desc,
-            rel,
-            Mode::Credit,
-            slope,
-            k_feat,
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| Scored {
-            id: row.id.0.clone(),
-            title: row.title.to_string(),
-            store: row.store.to_string(),
-            kind: entry_kind(&row.id.0, row.store, &hints),
-            haystack: format!("{} {} {}", row.title, row.id.0, row.store).to_lowercase(),
-            value: row.value,
-            rank: index + 1,
-        })
-        .collect()
-    };
-    let cached = |key: ScoresKey| {
-        let cache = state.scores_cache.0.lock().ok()?;
-        cache
-            .iter()
-            .find(|(cached, _)| *cached == key)
-            .map(|(_, ranking)| ranking.clone())
-    };
-    let key = |generation| ScoresKey {
-        rel,
-        slope_bits: slope.to_bits(),
-        generation,
+        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat)
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| Scored {
+                id: row.id.0.clone(),
+                title: row.title.to_string(),
+                store: row.store.to_string(),
+                kind: entry_kind(&row.id.0, row.store, &hints),
+                haystack: format!("{} {} {}", row.title, row.id.0, row.store).to_lowercase(),
+                value: row.value,
+                rank: index + 1,
+            })
+            .collect()
     };
 
-    let (key, ranking) = if let Some(store) = &state.store {
+    let (generation, ranking) = if let Some(store) = &state.store {
         let store = store
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-        let key = key(store.generation);
-        if let Some(hit) = cached(key) {
-            return Ok(hit);
+        let generation = store.generation;
+        if let Some(hit) = cached_ranking(state, generation) {
+            return Ok((generation, hit));
         }
         let (snapshot, params) = store
             .load_snapshot()
             .map_err(|error| store_error("load scores", error))?;
         drop(store);
-        (key, rank(&snapshot, params.k_feat))
+        (generation, rank(&snapshot, params.k_feat))
     } else {
-        let key = key(0);
-        if let Some(hit) = cached(key) {
-            return Ok(hit);
+        if let Some(hit) = cached_ranking(state, 0) {
+            return Ok((0, hit));
         }
-        (key, rank(&state.snapshot, nrs_core::KFeatMatrix::default()))
+        (0, rank(&state.snapshot, state.snapshot.palette.k_feat.clone()))
     };
 
     let ranking = Arc::new(ranking);
     if let Ok(mut cache) = state.scores_cache.0.lock() {
-        // Rankings from before a write can never be hit again.
-        cache.retain(|(cached, _)| cached.generation == key.generation);
-        cache.insert(0, (key, ranking.clone()));
+        cache.retain(|(cached, _)| *cached != generation);
+        cache.insert(0, (generation, ranking.clone()));
         cache.truncate(SCORES_CACHE_SIZE);
     }
-    Ok(ranking)
+    Ok((generation, ranking))
+}
+
+fn cached_ranking(state: &AppState, generation: u64) -> Option<Arc<Vec<Scored>>> {
+    let cache = state.scores_cache.0.lock().ok()?;
+    cache
+        .iter()
+        .find(|(cached, _)| *cached == generation)
+        .map(|(_, ranking)| ranking.clone())
 }
 
 /// A ranking as one request sees it: the run asked for, the run it's
 /// compared against (if any), and the parsed filter.
 struct ScoresView {
+    generation: u64,
     ranking: Arc<Vec<Scored>>,
     previous_rank: Option<HashMap<String, usize>>,
     filter: ScoreFilter,
@@ -288,27 +255,19 @@ pub(super) struct KindCount {
 
 impl ScoresView {
     fn new(state: &AppState, query: &ScoresQuery) -> Result<Self, (StatusCode, Json<ApiError>)> {
-        let rel = rel_param(query.rel.as_deref());
-        let slope = slope_param(query.slope);
-        let ranking = scored(state, rel, slope)?;
-        let previous_rank = match (query.cmp_rel.as_deref(), query.cmp_slope) {
-            (None, None) => None,
-            (cmp_rel, cmp_slope) => {
-                let cmp_rel = rel_param(cmp_rel);
-                let cmp_slope = slope_param(cmp_slope);
-                (cmp_rel != rel || cmp_slope != slope)
-                    .then(|| scored(state, cmp_rel, cmp_slope))
-                    .transpose()?
-                    .map(|previous| {
-                        previous
-                            .iter()
-                            .map(|row| (row.id.clone(), row.rank))
-                            .collect()
-                    })
-            }
-        };
+        let (generation, ranking) = scored(state)?;
+        let previous_rank = query
+            .cmp_gen
+            .and_then(|cmp| cached_ranking(state, cmp))
+            .map(|previous| {
+                previous
+                    .iter()
+                    .map(|row| (row.id.clone(), row.rank))
+                    .collect()
+            });
         let filter = ScoreFilter::parse(&query.q, previous_rank.is_some());
         Ok(Self {
+            generation,
             ranking,
             previous_rank,
             filter,
@@ -436,8 +395,9 @@ pub(super) struct ScoreRow {
     value: f32,
     /// Overall rank by V; filter terms like `rank<=10` use this.
     rank: usize,
-    /// Places gained since the `cmp_*` run (negative: lost). Absent
-    /// when nothing is being compared, or for an entry that run lacked.
+    /// Places gained since the `cmp_gen` ranking (negative: lost).
+    /// Absent when nothing is being compared, or for an entry that
+    /// ranking lacked.
     delta: Option<i64>,
     /// `rank` and `delta` among this filter's matches only.
     filtered_rank: usize,
@@ -447,6 +407,11 @@ pub(super) struct ScoreRow {
 #[derive(Serialize)]
 pub(super) struct ScoresPage {
     rows: Vec<ScoreRow>,
+    /// The store generation this ranking was scored at; pass it back as
+    /// `cmp_gen` after an edit to see what moved.
+    generation: u64,
+    /// Whether `cmp_gen` was honoured (its ranking was still cached).
+    comparing: bool,
     /// Rows matching `q`.
     total: usize,
     database_total: usize,
@@ -489,6 +454,8 @@ pub(super) async fn scores(
         .collect();
     Ok(Json(ScoresPage {
         rows,
+        generation: view.generation,
+        comparing: view.previous_rank.is_some(),
         total,
         database_total: view.ranking.len(),
         offset,
@@ -706,9 +673,24 @@ struct KfeatPair {
     value: f32,
 }
 
+/// An entry the ultrametric closure tightens: scoring already pools
+/// `a` and `b` at `to`, forced by the chain `via`.
+#[derive(Serialize)]
+struct KfeatCorrection {
+    a: String,
+    b: String,
+    from: f32,
+    to: f32,
+    via: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub(super) struct KfeatResponse {
+    /// Each anchor's own exponent `K(a, a)`.
+    exponents: Vec<KfeatPair>,
+    /// The exponent each pair pools at, `K(a, b)`.
     pairs: Vec<KfeatPair>,
+    corrections: Vec<KfeatCorrection>,
 }
 
 pub(super) async fn kfeat_get(State(state): State<Arc<AppState>>) -> ApiResult<KfeatResponse> {
@@ -724,7 +706,31 @@ pub(super) async fn kfeat_get(State(state): State<Arc<AppState>>) -> ApiResult<K
     let (snapshot, params) = store
         .load_snapshot()
         .map_err(|error| store_error("load k_feat", error))?;
-    let anchors = used_anchors(&snapshot);
+    let mut anchors = used_anchors(&snapshot);
+    for anchor in &snapshot.palette.anchors {
+        if !anchors.contains(&anchor.id) {
+            anchors.push(anchor.id.clone());
+        }
+    }
+    anchors.sort();
+    let exponents = anchors
+        .iter()
+        .map(|a| KfeatPair {
+            a: a.0.clone(),
+            b: a.0.clone(),
+            value: params.k_feat.exponent(a),
+        })
+        .collect();
+    let corrections = nrs_core::ultrametric_closure(&params.k_feat, &anchors)
+        .into_iter()
+        .map(|c| KfeatCorrection {
+            a: c.a.0,
+            b: c.b.0,
+            from: c.from,
+            to: c.to,
+            via: c.via.into_iter().map(|a| a.0).collect(),
+        })
+        .collect();
     let mut pairs = Vec::new();
     for (index, a) in anchors.iter().enumerate() {
         for b in anchors.iter().skip(index + 1) {
@@ -735,7 +741,11 @@ pub(super) async fn kfeat_get(State(state): State<Arc<AppState>>) -> ApiResult<K
             });
         }
     }
-    Ok(Json(KfeatResponse { pairs }))
+    Ok(Json(KfeatResponse {
+        exponents,
+        pairs,
+        corrections,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -749,6 +759,12 @@ pub(super) async fn kfeat_set(
     State(state): State<Arc<AppState>>,
     Json(update): Json<KfeatUpdate>,
 ) -> ApiResult<MutationResponse> {
+    if !(update.value > 0.0 && update.value <= 1.0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "a pooling exponent must lie in (0, 1]",
+        ));
+    }
     let store = state.store.as_ref().ok_or_else(|| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -762,7 +778,7 @@ pub(super) async fn kfeat_set(
         .set_kfeat_pair(
             &nrs_core::AnchorId(update.a),
             &nrs_core::AnchorId(update.b),
-            update.value.clamp(0.0, 1.0),
+            update.value,
         )
         .map_err(|error| store_error("save k_feat", error))?;
     Ok(Json(MutationResponse { ok: true, id: None }))
@@ -1731,8 +1747,14 @@ mod tests {
             (0, 2, 0)
         );
 
+        let generation = page(ScoresQuery::default())
+            .await
+            .ok()
+            .unwrap()
+            .0
+            .generation;
         let compared = page(ScoresQuery {
-            cmp_slope: Some(0.2),
+            cmp_gen: Some(generation),
             ..Default::default()
         })
         .await
@@ -1745,7 +1767,7 @@ mod tests {
         // rank alongside.
         let filtered = page(ScoresQuery {
             q: "rank>=2".into(),
-            cmp_slope: Some(0.2),
+            cmp_gen: Some(generation),
             ..Default::default()
         })
         .await
