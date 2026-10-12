@@ -56,14 +56,8 @@ fn main() {
     }
 
     let params = nrs_core::Params {
-        q: 0.6,
-        k_src_levels: nrs_core::KSrcLevels {
-            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
-        },
-        k_feat: nrs_core::KFeatMatrix::default(),
-        homogeneity: nrs_core::Homogeneity::DegreeQ,
+        k_feat: snapshot.palette.k_feat.clone(),
         calibration: nrs_core::Isotonic::default(),
-        relation_scaling: nrs_core::RelationScaling::Fixed,
     };
     let scores = nrs_core::score(&snapshot, &params);
     let non_finite = scores.values.values().filter(|v| !v.is_finite()).count();

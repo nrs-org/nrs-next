@@ -633,16 +633,14 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, BuildExtras, Vec<Strin
         }
     }
 
-    let taxonomy = nrs_core::derive_taxonomy(&relations);
     let snapshot = Snapshot {
         entries,
         impacts,
         relations,
         palette: Palette {
             anchors: Vec::new(),
-            k_feat: Default::default(),
+            k_feat: crate::anchors::legacy_k_feat(),
         },
-        taxonomy,
     };
     (snapshot, extras, warnings)
 }

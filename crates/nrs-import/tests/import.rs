@@ -9,14 +9,8 @@ use time::macros::date;
 
 fn params() -> Params {
     Params {
-        q: 0.6,
-        k_src_levels: KSrcLevels {
-            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
-        },
-        k_feat: KFeatMatrix::default(),
-        homogeneity: Homogeneity::DegreeQ,
+        k_feat: nrs_import::anchors::legacy_k_feat(),
         calibration: Isotonic::default(),
-        relation_scaling: RelationScaling::Fixed,
     }
 }
 
@@ -83,34 +77,6 @@ fn parses_and_scores_a_franchise_shaped_document() {
     // The franchise borrows both works' measures via Contains, so its
     // score must be nonzero (it has no direct impacts of its own).
     assert!(scores.values[&franchise] != 0.0);
-}
-
-/// The two works share the franchise as their nested-Contains container,
-/// so `derive_taxonomy` must place them as siblings under it -- and that
-/// must actually change scoring (k_src going live for the franchise's
-/// `nei`, which borrows from both), not just sit unused in the Snapshot.
-#[test]
-fn contains_relations_populate_taxonomy_and_change_scoring() {
-    let doc = parse_str(DOC, date!(2026 - 07 - 31)).expect("parse");
-    let (snapshot, _extras, conversion_warnings) = build_snapshot(&doc);
-    assert!(conversion_warnings.is_empty(), "{conversion_warnings:?}");
-
-    let franchise = SourceId("F-VGMDB-1018".into());
-    let work_a = SourceId("A-MAL-2167".into());
-    let work_b = SourceId("A-MAL-4181".into());
-    assert_eq!(snapshot.taxonomy.parent.get(&work_a), Some(&franchise));
-    assert_eq!(snapshot.taxonomy.parent.get(&work_b), Some(&franchise));
-
-    let mut without_taxonomy = snapshot.clone();
-    without_taxonomy.taxonomy = Taxonomy::default();
-
-    let with = score(&snapshot, &params());
-    let without = score(&without_taxonomy, &params());
-    let franchise_entry = EntryId("F-VGMDB-1018".into());
-    assert_ne!(
-        with.values[&franchise_entry], without.values[&franchise_entry],
-        "k_src should be live now that Contains-derived taxonomy is populated"
-    );
 }
 
 /// Roadmap phase 3's "-> nrs.db" half (INFRA.md §12): the same franchise
@@ -345,7 +311,10 @@ fn build_snapshot_captures_comments_and_flags_ambiguous_anchors() {
         .find(|i| extras.needs_review.contains(&i.id))
         .expect("the AP-coded impact should be flagged");
     assert_eq!(
-        extras.source_comments.get(&ap_impact.id).map(String::as_str),
+        extras
+            .source_comments
+            .get(&ap_impact.id)
+            .map(String::as_str),
         Some("comedy was weak ngl")
     );
 
@@ -355,7 +324,10 @@ fn build_snapshot_captures_comments_and_flags_ambiguous_anchors() {
         .find(|i| !extras.needs_review.contains(&i.id))
         .expect("the AU-coded impact should not be flagged");
     assert_eq!(
-        extras.source_comments.get(&au_impact.id).map(String::as_str),
+        extras
+            .source_comments
+            .get(&au_impact.id)
+            .map(String::as_str),
         Some("suicidal undertones")
     );
 }
@@ -393,19 +365,21 @@ fn anchor_relabeling_does_not_change_scores() {
 
     let relabeled = relabel_snapshot(&snapshot, &reverse);
 
-    let p = params();
-    let original_scores = score(&snapshot, &p);
-    let relabeled_scores = score(&relabeled, &p);
+    // Each snapshot scores with its own palette's `K`, relabeled along
+    // with everything else.
+    let with_k = |snap: &Snapshot| Params {
+        k_feat: snap.palette.k_feat.clone(),
+        calibration: Isotonic::default(),
+    };
+    let original_scores = score(&snapshot, &with_k(&snapshot));
+    let relabeled_scores = score(&relabeled, &with_k(&relabeled));
     // Not bit-exact: BTreeMaps are keyed by the anchor strings
     // themselves, so relabeling can shift floating-point summation
     // order enough to move the last ULP (nrs-core's own types.rs docs
     // note summation order, and so exact bit-pattern, depends on
     // BTreeMap iteration order) -- the actual claim under test is
     // "the same score", not "the same bit pattern".
-    assert_eq!(
-        original_scores.values.len(),
-        relabeled_scores.values.len()
-    );
+    assert_eq!(original_scores.values.len(), relabeled_scores.values.len());
     for (entry, original) in &original_scores.values {
         let relabeled = relabeled_scores.values[entry];
         assert!(
@@ -432,11 +406,7 @@ fn relabel_snapshot(
                 .iter()
                 .map(|atom| Atom {
                     source: atom.source.clone(),
-                    blend: atom
-                        .blend
-                        .iter()
-                        .map(|(a, w)| (relabel(a), *w))
-                        .collect(),
+                    blend: atom.blend.iter().map(|(a, w)| (relabel(a), *w)).collect(),
                     magnitude: atom.magnitude,
                     time: atom.time,
                 })
@@ -491,6 +461,46 @@ fn relabel_snapshot(
             anchors,
             k_feat: KFeatMatrix { pairs },
         },
-        taxonomy: snap.taxonomy.clone(),
     }
+}
+
+#[test]
+fn shared_impacts_and_relation_contributors_reach_the_snapshot() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="A-1" />
+            <entry id="B-1" />
+            <entry id="K-1" />
+            <aei base="0.5" emotions="CP">
+                <contributor id="B-1" factor="0.25" />
+                <contributor id="A-1" factor="0.75" />
+            </aei>
+            <remix id="K-1">
+                <contributor id="A-1" factor="0.5" />
+                <contributor id="B-1" factor="0.25" />
+            </remix>
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    let (snapshot, _extras, warnings) = build_snapshot(&doc);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // Both shares come from one source: the largest contributor.
+    assert_eq!(snapshot.impacts.len(), 2);
+    for impact in &snapshot.impacts {
+        for atom in &impact.atoms {
+            assert_eq!(atom.source, SourceId("A-1".into()));
+        }
+    }
+
+    let remix_weight = |from: &str| {
+        snapshot
+            .relations
+            .iter()
+            .find(|r| r.kind == RelKind::Remix && r.from == EntryId(from.into()))
+            .map(|r| r.transform.clone())
+    };
+    assert_eq!(remix_weight("A-1"), Some(Transform::Scalar(0.2 * 0.5)));
+    assert_eq!(remix_weight("B-1"), Some(Transform::Scalar(0.2 * 0.25)));
 }
