@@ -178,6 +178,33 @@ pub fn osu_song(source: SourceId, personal: f32, community: f32) -> Vec<Atom> {
 
 // --- Duration-decayed impacts (already-collapsed magnitudes) ---------
 
+/// The `Interval` time support for one calendar period of ISO dates
+/// `[from, to)`, in days since 1970-01-01. `None` if either date doesn't
+/// parse.
+pub fn period_support(from: &str, to: &str) -> Option<TimeSupport> {
+    let format = time::format_description::well_known::Iso8601::DATE;
+    let day = |s: &str| -> Option<i32> {
+        let date = time::Date::parse(s.trim(), &format).ok()?;
+        Some(date.to_julian_day() - time::macros::date!(1970 - 01 - 01).to_julian_day())
+    };
+    Some(TimeSupport::Interval {
+        from: day(from)?,
+        to: day(to)?,
+    })
+}
+
+/// Dates `atoms` over one calendar period (see [`period_support`]); left
+/// undated if the dates don't parse. The magnitudes stay the value of the
+/// whole period.
+pub fn dated(mut atoms: Vec<Atom>, from: &str, to: &str) -> Vec<Atom> {
+    if let Some(time) = period_support(from, to) {
+        for atom in &mut atoms {
+            atom.time = time;
+        }
+    }
+    atoms
+}
+
 pub fn waifu(source: SourceId, days: f32) -> Vec<Atom> {
     let base = 1.2 * (days / 90.0).powf(0.35); // MP.factorWeight
     flat_atom(source, anchors::waifu(), base)
@@ -389,6 +416,18 @@ mod tests {
     fn nei_single_anchor_is_identity() {
         let atom = only(nei(s("e"), 0.6, 1.0, &[(anchors::comedy(), 1.0)]));
         assert!((atom.magnitude - 1.2).abs() < 1e-5, "{}", atom.magnitude);
+    }
+
+    #[test]
+    fn period_support_counts_days_from_the_epoch() {
+        assert_eq!(
+            period_support("2021-06-02", "2021-06-16"),
+            Some(TimeSupport::Interval {
+                from: 18780,
+                to: 18794
+            })
+        );
+        assert_eq!(period_support("bad", "2021-06-16"), None);
     }
 
     #[test]

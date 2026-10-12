@@ -57,6 +57,7 @@ fn main() {
 
     let params = nrs_core::Params {
         k_feat: snapshot.palette.k_feat.clone(),
+        time: Default::default(),
         calibration: nrs_core::Isotonic::default(),
     };
     let scores = nrs_core::score(&snapshot, &params);

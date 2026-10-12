@@ -10,6 +10,7 @@ use time::macros::date;
 fn params() -> Params {
     Params {
         k_feat: nrs_import::anchors::legacy_k_feat(),
+        time: Default::default(),
         calibration: Isotonic::default(),
     }
 }
@@ -369,6 +370,7 @@ fn anchor_relabeling_does_not_change_scores() {
     // with everything else.
     let with_k = |snap: &Snapshot| Params {
         k_feat: snap.palette.k_feat.clone(),
+        time: Default::default(),
         calibration: Isotonic::default(),
     };
     let original_scores = score(&snapshot, &with_k(&snapshot));

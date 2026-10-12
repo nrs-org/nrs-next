@@ -45,6 +45,7 @@ fn main() {
 
     let p = Params {
         k_feat: snap.palette.k_feat.clone(),
+        time: Default::default(),
         calibration: Isotonic::default(),
     };
 

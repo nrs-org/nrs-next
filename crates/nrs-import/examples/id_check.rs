@@ -6,6 +6,7 @@ fn main() {
 
     let params = nrs_core::Params {
         k_feat: snap.palette.k_feat.clone(),
+        time: Default::default(),
         calibration: nrs_core::Isotonic::default(),
     };
     let scores = nrs_core::score(&snap, &params);

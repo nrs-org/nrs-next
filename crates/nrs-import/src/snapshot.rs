@@ -175,6 +175,16 @@ fn add_period_params(params: &mut BTreeMap<String, String>, ranges: &[PeriodRang
     }
 }
 
+/// Dates a period kind's atoms when it has exactly one calendar period
+/// (several disjoint periods stay undated, as `add_period_params` keeps
+/// them duration-only).
+fn with_period(atoms: Vec<Atom>, ranges: &[PeriodRange]) -> Vec<Atom> {
+    match ranges {
+        [range] => legacy::dated(atoms, &range.from, &range.to),
+        _ => atoms,
+    }
+}
+
 /// The DAH_standards kind slug + the exact form-field params that
 /// kind's manual-entry form would submit -- see `atoms_for`.
 type ImpactDah = (&'static str, BTreeMap<String, String>);
@@ -231,12 +241,18 @@ fn atoms_for(
             params.insert("days".into(), days.to_string());
             add_period_params(&mut params, ranges);
             add_blend_params(&mut params, &anchors);
-            (legacy::pads(source, *days, &anchors), Some("pads"))
+            (
+                with_period(legacy::pads(source, *days, &anchors), ranges),
+                Some("pads"),
+            )
         }
         ImpactKind::Waifu { days, ranges } => {
             params.insert("days".into(), days.to_string());
             add_period_params(&mut params, ranges);
-            (legacy::waifu(source, *days), Some("waifu"))
+            (
+                with_period(legacy::waifu(source, *days), ranges),
+                Some("waifu"),
+            )
         }
         ImpactKind::Ehi { blend } => {
             let anchors = blend_anchors(blend, context, warnings);
@@ -284,7 +300,10 @@ fn atoms_for(
                 params.insert("strength".into(), strength.to_string());
                 params.insert("days".into(), days.to_string());
                 add_period_params(&mut params, ranges);
-                (legacy::meme(source, *strength, *days), Some("meme"))
+                (
+                    with_period(legacy::meme(source, *strength, *days), ranges),
+                    Some("meme"),
+                )
             }
         }
         ImpactKind::Music { base } => {
