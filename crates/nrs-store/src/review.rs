@@ -63,12 +63,26 @@ impl ReviewLog {
         self.save()
     }
 
+    /// Drops the state of impacts that no longer exist (one file write).
+    pub(crate) fn remove_bulk<'a>(
+        &mut self,
+        impact_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        for id in impact_ids {
+            self.entries.remove(id);
+        }
+        self.save()
+    }
+
     pub(crate) fn get(&self, impact_id: &str) -> ReviewState {
         self.entries.get(impact_id).cloned().unwrap_or_default()
     }
 
     pub(crate) fn clear_needs_review(&mut self, impact_id: &str) -> Result<()> {
-        self.entries.entry(impact_id.to_string()).or_default().needs_review = false;
+        self.entries
+            .entry(impact_id.to_string())
+            .or_default()
+            .needs_review = false;
         self.save()
     }
 }
@@ -118,7 +132,8 @@ mod tests {
 
     #[test]
     fn survives_a_reload_from_disk() {
-        let dir = std::env::temp_dir().join(format!("nrs-store-review-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nrs-store-review-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nrs.review.json");
 

@@ -16,6 +16,7 @@ pub enum EventKind {
     ParamSet,
     CalibrationSet,
     SnapshotImport,
+    SnapshotResync,
     PreferenceRecord,
 }
 
@@ -35,6 +36,7 @@ impl EventKind {
             EventKind::ParamSet => "param.set",
             EventKind::CalibrationSet => "calibration.set",
             EventKind::SnapshotImport => "snapshot.import",
+            EventKind::SnapshotResync => "snapshot.resync",
             EventKind::PreferenceRecord => "preference.record",
         }
     }
