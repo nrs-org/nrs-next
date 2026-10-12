@@ -20,6 +20,9 @@
           rust-analyzer
           rustfmt
           clippy
+          cmake
+          clang
+          llvmPackages.libclang
           sqlite
           pkg-config
           uv
@@ -27,6 +30,7 @@
         ];
 
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
     };
 }
