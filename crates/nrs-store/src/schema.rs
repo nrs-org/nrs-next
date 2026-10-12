@@ -210,8 +210,29 @@ INSERT OR IGNORE INTO kfeat (a, b, k) VALUES
     ('waifu', 'wistful', 0.6);
 "#;
 
+const SCHEMA_V7: &str = r#"
+-- Date the legacy dated impacts (meme, waifu, pads with one calendar
+-- period in `dah_params`): their atoms get `Interval` time supports over
+-- [period_from, period_to), in days since 1970-01-01, so scoring can
+-- integrate them over time. Magnitudes are unchanged: an `Interval`
+-- atom's magnitude is still the value of its whole period.
+UPDATE impact_atom
+SET time = json_object('Interval', json_object(
+    'from', CAST(round(julianday(json_extract(i.dah_params, '$.period_from')) - 2440587.5) AS INTEGER),
+    'to',   CAST(round(julianday(json_extract(i.dah_params, '$.period_to'))   - 2440587.5) AS INTEGER)))
+FROM impact i
+WHERE i.id = impact_atom.impact
+  AND impact_atom.time = '"Moment"'
+  AND julianday(json_extract(i.dah_params, '$.period_from')) IS NOT NULL
+  AND julianday(json_extract(i.dah_params, '$.period_to')) IS NOT NULL;
+INSERT INTO event (ts, kind, target, before, after, note)
+SELECT CAST(strftime('%s', 'now') AS INTEGER), 'schema.migrate', NULL, NULL, NULL,
+       'V7: ' || changes() || ' legacy dated atoms get Interval time supports'
+WHERE changes() > 0;
+"#;
+
 const MIGRATIONS: &[&str] = &[
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -252,6 +273,37 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn migration_dates_single_period_impacts() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..6] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO entry (id, store, store_id) VALUES ('e', 's', '1');
+               INSERT INTO impact (id, target, created, dah_kind, dah_params)
+                 VALUES ('dated', 'e', 0, 'meme', '{"days":"14","period_from":"2021-06-02","period_to":"2021-06-16"}'),
+                        ('plain', 'e', 0, 'cry', '{}');
+               INSERT INTO impact_atom (impact, source, blend, magnitude, time)
+                 VALUES ('dated', 's', '[["meme",1.0]]', 1.0, '"Moment"'),
+                        ('plain', 's', '[["cozy",1.0]]', 1.0, '"Moment"');"#,
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let time = |impact: &str| -> String {
+            conn.query_row(
+                "SELECT time FROM impact_atom WHERE impact = ?1",
+                [impact],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // 2021-06-02 is day 18780 after 1970-01-01.
+        assert_eq!(time("dated"), r#"{"Interval":{"from":18780,"to":18794}}"#);
+        assert_eq!(time("plain"), r#""Moment""#);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use nrs_core::{
 };
 
 use crate::error::Result;
-use crate::DEFAULT_MEDIUM;
+use crate::{StoredParams, DEFAULT_MEDIUM};
 use crate::relkind::rel_kind_from_str;
 use crate::Store;
 
@@ -176,8 +176,18 @@ impl Store {
             None => Isotonic::default(),
         };
 
+        let stored: Option<String> = self
+            .conn
+            .query_row("SELECT json FROM params WHERE id = 1", [], |row| row.get(0))
+            .optional()?;
+        let stored: StoredParams = match stored {
+            Some(json) => serde_json::from_str(&json)?,
+            None => StoredParams::default(),
+        };
+
         Ok(Params {
             k_feat: k_feat.clone(),
+            time: stored.time,
             calibration,
         })
     }

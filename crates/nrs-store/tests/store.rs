@@ -312,3 +312,24 @@ fn tempdir_path() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+#[test]
+fn time_params_default_and_round_trip() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, params) = store.load_snapshot().unwrap();
+    assert_eq!(params.time, nrs_core::TimeParams::default());
+
+    let time = nrs_core::TimeParams {
+        shared: 0.9,
+        length_days: 90.0,
+    };
+    store.set_time_params(&time).unwrap();
+    let (_, params) = store.load_snapshot().unwrap();
+    assert_eq!(params.time, time);
+
+    let bad = nrs_core::TimeParams {
+        shared: 1.5,
+        length_days: 90.0,
+    };
+    assert!(store.set_time_params(&bad).is_err());
+}

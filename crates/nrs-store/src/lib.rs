@@ -35,6 +35,15 @@ use review::ReviewLog;
 /// #5); until that decision is made there is one curve under this key.
 pub(crate) const DEFAULT_MEDIUM: &str = "default";
 
+/// The `params` table's JSON: the knobs without a table of their own
+/// (`K` lives in `kfeat`, calibration in `calibration`). Older blobs'
+/// unknown fields are ignored.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredParams {
+    #[serde(default)]
+    pub time: nrs_core::TimeParams,
+}
+
 pub struct Store {
     conn: Connection,
     review: ReviewLog,

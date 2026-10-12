@@ -7,13 +7,13 @@ use ulid::Ulid;
 
 use nrs_core::{
     Anchor, AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, RelKind, Relation,
-    SourceId, Transform,
+    SourceId, TimeParams, Transform,
 };
 
 use crate::error::{Result, StoreError};
 use crate::event::EventKind;
 use crate::relkind::{rel_kind_from_str, rel_kind_to_str};
-use crate::{Store, DEFAULT_MEDIUM};
+use crate::{Store, StoredParams, DEFAULT_MEDIUM};
 
 fn now_ts() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -556,6 +556,40 @@ impl Store {
             Some(&target),
             to_json(before.as_ref())?.as_deref(),
             to_json(Some(&k))?.as_deref(),
+            None,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sets how dated mass decorrelates over time (`nrs_core::TimeParams`).
+    pub fn set_time_params(&mut self, time: &TimeParams) -> Result<()> {
+        if !((0.0..=1.0).contains(&time.shared) && time.length_days > 0.0) {
+            return Err(StoreError::InvalidData(format!(
+                "time params need shared in [0, 1] and length_days > 0, got {time:?}"
+            )));
+        }
+        let tx = self.conn.transaction()?;
+        let before: Option<String> = tx
+            .query_row("SELECT json FROM params WHERE id = 1", [], |row| row.get(0))
+            .optional()?;
+        let mut stored: StoredParams = match &before {
+            Some(json) => serde_json::from_str(json)?,
+            None => StoredParams::default(),
+        };
+        stored.time = *time;
+        let after = serde_json::to_string(&stored)?;
+        tx.execute(
+            "INSERT INTO params (id, json) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+            params![after],
+        )?;
+        append_event(
+            &tx,
+            EventKind::ParamSet,
+            None,
+            before.as_deref(),
+            Some(&after),
             None,
         )?;
         tx.commit()?;
