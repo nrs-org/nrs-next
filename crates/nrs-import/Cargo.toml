@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-boa_engine = { version = "0.21.1", optional = true }
+boa_engine = { version = "0.22.0", optional = true }
 nrs-core = { path = "../nrs-core" }
 nrs-store = { path = "../nrs-store" }
 roxmltree = "0.21.1"
@@ -13,3 +13,9 @@ time = { version = "0.3.54", features = ["parsing", "macros"] }
 
 [features]
 scripting = ["dep:boa_engine", "dep:serde_json"]
+
+# Re-parsing without scripts would revert every script-driven
+# contributor split, so the resync tool only exists with them.
+[[bin]]
+name = "resync"
+required-features = ["scripting"]

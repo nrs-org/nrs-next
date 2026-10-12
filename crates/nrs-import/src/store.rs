@@ -11,9 +11,21 @@ use nrs_store::{ImportExtras, Result, Store};
 use crate::snapshot::BuildExtras;
 
 pub fn write_snapshot(store: &mut Store, snapshot: &Snapshot, extras: &BuildExtras) -> Result<()> {
-    let import_extras = ImportExtras {
+    store.import_snapshot(snapshot, &import_extras(extras))
+}
+
+/// `BuildExtras` in the shape `nrs-store` persists.
+pub fn import_extras(extras: &BuildExtras) -> ImportExtras {
+    ImportExtras {
         comments: extras.source_comments.clone(),
         needs_review: extras.needs_review.clone(),
-    };
-    store.import_snapshot(snapshot, &import_extras)
+        credit_roles: extras.credit_roles.clone(),
+        impact_dah: extras
+            .impact_dah
+            .iter()
+            .map(|(id, (kind, params, factor))| {
+                (id.clone(), (kind.to_string(), params.clone(), *factor))
+            })
+            .collect(),
+    }
 }

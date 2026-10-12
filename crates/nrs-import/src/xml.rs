@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use time::Date;
 
-use crate::script::ScriptEngine;
+use crate::script::{ScopeId, ScriptEngine};
 use crate::xtree::{self, XNode};
 
 #[derive(Debug)]
@@ -89,6 +89,11 @@ pub struct ParsedImpact {
     /// becoming `impact.note` directly (INFRA.md's review UI confirms
     /// or edits it first).
     pub source_comment: Option<String>,
+    /// Optional provenance for an explicit `anchors="..."` refinement.
+    /// These stay attached to the parsed impact so automated migrations can
+    /// be audited without changing the core snapshot format.
+    pub anchor_source: Option<String>,
+    pub anchor_confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,14 +111,19 @@ pub enum ImpactKind {
     },
     Pads {
         days: f32,
+        ranges: Vec<PeriodRange>,
         blend: Vec<(String, f32)>,
     },
     Waifu {
         days: f32,
+        ranges: Vec<PeriodRange>,
     },
-    Ehi,
+    Ehi {
+        blend: Vec<(String, f32)>,
+    },
     Epi {
         factor: f32,
+        blend: Vec<(String, f32)>,
     },
     Jumpscare,
     SleeplessNight,
@@ -125,6 +135,7 @@ pub enum ImpactKind {
     Meme {
         strength: f32,
         days: f32,
+        ranges: Vec<PeriodRange>,
     },
     Music {
         base: f32,
@@ -168,6 +179,16 @@ pub enum ImpactKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeriodRange {
+    pub from: String,
+    pub to: String,
+    /// Original dynamic expression, when resolving the endpoint lost
+    /// information (for example `today` versus a literal date equal to today).
+    pub from_expression: Option<String>,
+    pub to_expression: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedRelation {
     Remix {
@@ -193,9 +214,27 @@ pub struct ParsedRole {
     pub roles_expr: String,
 }
 
+/// A relation whose borrowers are its explicit `<contributor>`
+/// children rather than the enclosing entry: the real engine's
+/// `createRelationMaps` gives each contributor its own copy of the
+/// relation, scaled by that contributor's factor, and the enclosing
+/// entry (if any) only stands in when no contributor is listed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedRelation {
+    pub relation: ParsedRelation,
+    pub contributors: Vec<(String, f32)>,
+}
+
 #[derive(Debug, Default)]
 pub struct ParsedDocument {
     pub entries: Vec<ParsedEntry>,
+    /// Impacts declared at document level, outside any `<entry>` -
+    /// typically one event split across several works via
+    /// `<contributor>` children (shared memes, cross-franchise `aei`s).
+    pub shared_impacts: Vec<ParsedImpact>,
+    /// Relations carrying explicit `<contributor>` children, whether
+    /// declared inside an entry or at document level.
+    pub shared_relations: Vec<SharedRelation>,
     pub warnings: Vec<String>,
 }
 
@@ -263,16 +302,78 @@ fn build_document(nodes: Vec<XNode>, today: Date) -> ParsedDocument {
     let expanded = xtree::expand_refs(nodes, &macros, &mut warnings);
 
     let mut entries = Vec::new();
+    let mut shared_impacts = Vec::new();
+    let mut shared_relations = Vec::new();
     let mut engine = ScriptEngine::new();
     for node in &expanded {
-        match node.tag_name() {
-            "entry" => parse_entry(node, today, &mut entries, &mut warnings, &mut engine, None),
+        let tag = node.tag_name();
+        match tag {
+            "entry" => parse_entry(
+                node,
+                today,
+                &mut entries,
+                &mut shared_relations,
+                &mut warnings,
+                &mut engine,
+                ScriptEngine::ROOT,
+            ),
             "def" => {} // already collected by collect_macros
-            other => warnings.push(format!("unexpected top-level element <{other}>, skipped")),
+            "script" => engine.run_script(ScriptEngine::ROOT, node, &mut warnings),
+            "remix" | "featureMusic" | "killedBy" => {
+                let context = "document";
+                let contributors =
+                    engine.relation_contributors(ScriptEngine::ROOT, node, &mut warnings);
+                if contributors.is_empty() {
+                    warnings.push(format!(
+                        "{context}: top-level <{tag}> has no <contributor>, so nothing borrows through it; skipped"
+                    ));
+                } else if let Some(relation) =
+                    parse_relation(node, tag, None, context, &mut warnings)
+                {
+                    shared_relations.push(SharedRelation {
+                        relation,
+                        contributors,
+                    });
+                }
+            }
+            _ => {
+                let context = "document";
+                let kinds = parse_impact_kinds(node, tag, today, context, &mut warnings);
+                if kinds.is_empty() {
+                    continue;
+                }
+                let per_impact = engine.impact_contributors(
+                    ScriptEngine::ROOT,
+                    node,
+                    kinds.len(),
+                    &mut warnings,
+                );
+                for (kind, contributors) in kinds.into_iter().zip(per_impact) {
+                    // No enclosing entry to fall back to.
+                    if contributors.is_empty() {
+                        warnings.push(format!(
+                            "{context}: top-level <{tag}> has no <contributor>, so it has no target; skipped"
+                        ));
+                        continue;
+                    }
+                    shared_impacts.push(parsed_impact(
+                        node,
+                        kind,
+                        contributors,
+                        context,
+                        &mut warnings,
+                    ));
+                }
+            }
         }
     }
     warn_duplicate_entry_ids(&entries, &mut warnings);
-    ParsedDocument { entries, warnings }
+    ParsedDocument {
+        entries,
+        shared_impacts,
+        shared_relations,
+        warnings,
+    }
 }
 
 /// A genuine duplicate `<entry id="...">` declaration (the same id
@@ -305,7 +406,7 @@ fn warn_duplicate_entry_ids(entries: &[ParsedEntry], warnings: &mut Vec<String>)
 /// A top-level entry (no enclosing entry) leaves `$` untouched,
 /// matching the real engine's guard - moot in practice since
 /// top-level entries always carry a real external id.
-fn transform_id(id: &str, current_entry_id: Option<&str>) -> String {
+pub(crate) fn transform_id(id: &str, current_entry_id: Option<&str>) -> String {
     match current_entry_id {
         Some(cur) => id.replace('$', cur),
         None => id.to_string(),
@@ -316,9 +417,10 @@ fn parse_entry(
     node: &XNode,
     today: Date,
     entries: &mut Vec<ParsedEntry>,
+    shared_relations: &mut Vec<SharedRelation>,
     warnings: &mut Vec<String>,
     engine: &mut ScriptEngine,
-    parent_entry_id: Option<&str>,
+    parent: ScopeId,
 ) {
     let Some(raw_id) = node.attribute("id") else {
         warnings.push(
@@ -326,8 +428,9 @@ fn parse_entry(
         );
         return;
     };
-    let id = transform_id(raw_id, parent_entry_id);
+    let id = transform_id(raw_id, engine.entry_id(parent));
     let title = node.attribute("title").unwrap_or("").to_string();
+    let scope = engine.open_entry(parent, &id, &title, node.attribute("entrytype"));
     let context_prefix = format!("entry {id}");
 
     let mut entry = ParsedEntry {
@@ -341,12 +444,6 @@ fn parse_entry(
         roles: Vec::new(),
         music_var: None,
     };
-
-    // Entry-scope <script> children run once, in document order,
-    // sharing one `local` object across them - independent of where
-    // they sit among the other children (real scripts don't depend on
-    // this exact interleaving; see script.rs's module docs).
-    engine.run_entry_scripts(node, &id, warnings);
 
     for child in node.children() {
         let tag = child.tag_name();
@@ -364,7 +461,15 @@ fn parse_entry(
                         "{context_prefix}: nested <entry> missing required attribute 'id', skipped"
                     )),
                 }
-                parse_entry(child, today, entries, warnings, engine, Some(&id));
+                parse_entry(
+                    child,
+                    today,
+                    entries,
+                    shared_relations,
+                    warnings,
+                    engine,
+                    scope,
+                );
             }
             "source" => parse_source(child, &mut entry),
             "bestGirl" => entry.best_girl = child.attribute("name").map(String::from),
@@ -389,8 +494,18 @@ fn parse_entry(
                 }
             }
             "remix" | "featureMusic" | "killedBy" => {
-                if let Some(relation) = parse_relation(child, tag, &id, &context_prefix, warnings) {
-                    entry.relations.push(relation);
+                if let Some(relation) =
+                    parse_relation(child, tag, Some(&id), &context_prefix, warnings)
+                {
+                    let contributors = engine.relation_contributors(scope, child, warnings);
+                    if contributors == [(id.clone(), 1.0)] {
+                        entry.relations.push(relation);
+                    } else {
+                        shared_relations.push(SharedRelation {
+                            relation,
+                            contributors,
+                        });
+                    }
                 }
             }
             "musicvar" => {
@@ -403,22 +518,45 @@ fn parse_entry(
                     feat: child.attribute("feat").map(|s| s == "true"),
                 });
             }
-            "queue" | "validatorSuppress" | "def" | "script" => {} // pure metadata / already-expanded macro decl / already run above
+            "script" => engine.run_script(scope, child, warnings),
+            "queue" | "validatorSuppress" | "def" => {} // pure metadata / already-expanded macro decl
             _ => {
-                if let Some(kind) = parse_impact_kind(child, tag, today, &context_prefix, warnings)
-                {
-                    let contributors = parse_contributors(child, &id, engine, warnings);
-                    entry.impacts.push(ParsedImpact {
+                let kinds = parse_impact_kinds(child, tag, today, &context_prefix, warnings);
+                if kinds.is_empty() {
+                    continue;
+                }
+                let per_impact = engine.impact_contributors(scope, child, kinds.len(), warnings);
+                for (kind, contributors) in kinds.into_iter().zip(per_impact) {
+                    entry.impacts.push(parsed_impact(
+                        child,
                         kind,
                         contributors,
-                        source_comment: child.preceding_comment().map(String::from),
-                    });
+                        &context_prefix,
+                        warnings,
+                    ));
                 }
             }
         }
     }
 
+    engine.close_entry(scope);
     entries.push(entry);
+}
+
+fn parsed_impact(
+    node: &XNode,
+    kind: ImpactKind,
+    contributors: Vec<(String, f32)>,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> ParsedImpact {
+    ParsedImpact {
+        kind,
+        contributors,
+        source_comment: node.preceding_comment().map(String::from),
+        anchor_source: node.attribute("anchorSource").map(String::from),
+        anchor_confidence: parse_anchor_confidence(node, context, warnings),
+    }
 }
 
 fn parse_source(node: &XNode, entry: &mut ParsedEntry) {
@@ -473,7 +611,7 @@ fn parse_contains(
     result
 }
 
-fn parse_fraction(s: &str) -> f32 {
+pub(crate) fn parse_fraction(s: &str) -> f32 {
     if let Some((num, den)) = s.split_once('/') {
         let n: f32 = num.trim().parse().unwrap_or(1.0);
         let d: f32 = den.trim().parse().unwrap_or(1.0);
@@ -483,43 +621,15 @@ fn parse_fraction(s: &str) -> f32 {
     }
 }
 
-/// `<contributor>` tags and `<script>`-set contributors share one map
-/// in the real engine (`impacts[0].contributors`, mutated by both in
-/// document order) - seed from `<contributor>` tags, let scripts add
-/// to/overwrite that, then fall back to the identity self-contributor
-/// only if the combined result is still empty, matching `acceptImpact`.
-fn parse_contributors(
-    node: &XNode,
-    self_id: &str,
-    engine: &mut ScriptEngine,
-    warnings: &mut Vec<String>,
-) -> Vec<(String, f32)> {
-    let seed: Vec<(String, f32)> = node
-        .children()
-        .filter(|c| c.tag_name() == "contributor")
-        .filter_map(|c| {
-            let id = transform_id(c.attribute("id")?, Some(self_id));
-            let factor = c.attribute("factor").map(parse_fraction).unwrap_or(1.0);
-            Some((id, factor))
-        })
-        .collect();
-    let contributors = engine.run_impact_scripts(node, self_id, &seed, warnings);
-    if contributors.is_empty() {
-        vec![(self_id.to_string(), 1.0)]
-    } else {
-        contributors
-    }
-}
-
 fn parse_relation(
     node: &XNode,
     tag: &str,
-    current_entry_id: &str,
+    current_entry_id: Option<&str>,
     context: &str,
     warnings: &mut Vec<String>,
 ) -> Option<ParsedRelation> {
     let to = match node.attribute("id") {
-        Some(id) => transform_id(id, Some(current_entry_id)),
+        Some(id) => transform_id(id, current_entry_id),
         None => {
             warnings.push(format!(
                 "{context}: <{tag}> missing required attribute 'id', skipped"
@@ -562,6 +672,20 @@ fn opt_f32(node: &XNode, name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+fn parse_anchor_confidence(node: &XNode, context: &str, warnings: &mut Vec<String>) -> Option<f32> {
+    let raw = node.attribute("anchorConfidence")?;
+    match raw.parse::<f32>() {
+        Ok(value) if (0.0..=1.0).contains(&value) => Some(value),
+        _ => {
+            warnings.push(format!(
+                "{context}: <{}> has invalid anchorConfidence '{raw}' (expected 0..1), ignored",
+                node.tag_name()
+            ));
+            None
+        }
+    }
+}
+
 /// `EIEmotions`: either a bare code (`"MU"`, implicit weight 1.0) or a
 /// colon-separated list of `CODE-weight` pairs (`"CU-0.5:CP-0.5"`).
 fn parse_emotions(s: &str) -> Vec<(String, f32)> {
@@ -574,6 +698,77 @@ fn parse_emotions(s: &str) -> Vec<(String, f32)> {
             Some((code.to_string(), w.parse().ok()?))
         })
         .collect()
+}
+
+fn is_canonical_anchor(code: &str) -> bool {
+    matches!(
+        code,
+        "comedy"
+            | "hype"
+            | "tragedy"
+            | "wistful"
+            | "cozy"
+            | "heartwarming"
+            | "hate"
+            | "discomfort"
+            | "waifu"
+            | "meme"
+            | "hooked"
+            | "worldview"
+            | "gateway"
+            | "writing"
+            | "visual"
+            | "music"
+            | "boredom"
+            | "additional"
+    )
+}
+
+fn parse_explicit_anchors(
+    raw: &str,
+    node: &XNode,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<(String, f32)>> {
+    let parsed = parse_emotions(raw);
+    let unique: BTreeSet<&str> = parsed.iter().map(|(code, _)| code.as_str()).collect();
+    let sum: f32 = parsed.iter().map(|(_, weight)| *weight).sum();
+    let valid = !parsed.is_empty()
+        && parsed.iter().all(|(code, weight)| {
+            is_canonical_anchor(code) && weight.is_finite() && *weight >= 0.0
+        })
+        && unique.len() == parsed.len()
+        && (sum - 1.0).abs() <= 0.001;
+    if !valid {
+        warnings.push(format!(
+            "{context}: <{}> has invalid anchors '{raw}' (use unique canonical ids with non-negative weights summing to 1), skipped",
+            node.tag_name()
+        ));
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+/// Prefer the refined canonical `anchors` vocabulary when present, while
+/// accepting the old six-box `emotions` vocabulary during migration.
+fn parse_anchor_blend(
+    node: &XNode,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<(String, f32)>> {
+    match (node.attribute("anchors"), node.attribute("emotions")) {
+        (Some(anchors), Some(_)) => {
+            warnings.push(format!(
+                "{context}: <{}> has both 'anchors' and legacy 'emotions'; using 'anchors'",
+                node.tag_name()
+            ));
+            parse_explicit_anchors(anchors, node, context, warnings)
+        }
+        (Some(anchors), None) => parse_explicit_anchors(anchors, node, context, warnings),
+        (None, Some(emotions)) => Some(parse_emotions(emotions)),
+        (None, None) => Some(Vec::new()),
+    }
 }
 
 /// `Duration` (`"(\d+:)?\d\d?:\d{2}"`, i.e. `MM:SS` or `HH:MM:SS`) to
@@ -614,28 +809,54 @@ fn parse_date(s: &str, today: Date) -> Option<Date> {
 /// any nested `<periods>` children, all summed (INFRA's
 /// `DatePeriod[]`). Returns `0.0` (with a warning) if nothing usable
 /// is present, rather than failing the whole entry.
-fn period_days(node: &XNode, today: Date, context: &str, warnings: &mut Vec<String>) -> f32 {
-    let one = |n: &XNode| -> Option<f32> {
+fn period_days(
+    node: &XNode,
+    today: Date,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> (f32, Vec<PeriodRange>) {
+    let one = |n: &XNode| -> Option<(f32, Option<PeriodRange>)> {
         if let Some(len) = n.attribute("length") {
-            return len.parse().ok();
+            return len.parse().ok().map(|days| (days, None));
         }
-        let from = n.attribute("from").and_then(|s| parse_date(s, today))?;
-        let to = n
-            .attribute("to")
-            .and_then(|s| parse_date(s, today))
-            .unwrap_or(today);
-        Some((to - from).whole_days() as f32)
+        let from_source = n.attribute("from")?;
+        let from = parse_date(from_source, today)?;
+        let (to, to_expression) = match n.attribute("to") {
+            Some(to_source) => (
+                parse_date(to_source, today)?,
+                to_source
+                    .starts_with("today")
+                    .then(|| to_source.to_string()),
+            ),
+            // nrsml treats an omitted end as an interval continuing through
+            // today. Preserve that dynamic meaning as well as its resolution.
+            None => (today, Some("today".into())),
+        };
+        Some((
+            (to - from).whole_days() as f32,
+            Some(PeriodRange {
+                from: from.to_string(),
+                to: to.to_string(),
+                from_expression: from_source
+                    .starts_with("today")
+                    .then(|| from_source.to_string()),
+                to_expression,
+            }),
+        ))
     };
 
     let mut total = 0.0;
+    let mut ranges = Vec::new();
     let mut found = false;
-    if let Some(d) = one(node) {
+    if let Some((d, range)) = one(node) {
         total += d;
+        ranges.extend(range);
         found = true;
     }
     for child in node.children().filter(|c| c.tag_name() == "periods") {
-        if let Some(d) = one(child) {
+        if let Some((d, range)) = one(child) {
             total += d;
+            ranges.extend(range);
             found = true;
         }
     }
@@ -645,7 +866,32 @@ fn period_days(node: &XNode, today: Date, context: &str, warnings: &mut Vec<Stri
             node.tag_name()
         ));
     }
-    total
+    (total, ranges)
+}
+
+/// The impacts one tag stands for. Most tags are a single impact, but
+/// `maxAEIPADS` and `cryPADS` are the real engine's shorthands for a
+/// pair (`DAH_standards.ts`): a full-strength `aei` (factor 1.0) or a
+/// `cry`, plus a `pads` over the same emotions and period.
+fn parse_impact_kinds(
+    node: &XNode,
+    tag: &str,
+    today: Date,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<ImpactKind> {
+    let Some(pads) = parse_impact_kind(node, tag, today, context, warnings) else {
+        return Vec::new();
+    };
+    let ImpactKind::Pads { blend, .. } = &pads else {
+        return vec![pads];
+    };
+    let blend = blend.clone();
+    match tag {
+        "maxAEIPADS" => vec![ImpactKind::Aei { base: 1.0, blend }, pads],
+        "cryPADS" => vec![ImpactKind::Cry { blend }, pads],
+        _ => vec![pads],
+    }
 }
 
 fn parse_impact_kind(
@@ -655,34 +901,36 @@ fn parse_impact_kind(
     context: &str,
     warnings: &mut Vec<String>,
 ) -> Option<ImpactKind> {
-    let emotions = |n: &XNode| {
-        n.attribute("emotions")
-            .map(parse_emotions)
-            .unwrap_or_default()
-    };
-
     match tag {
         "cry" => Some(ImpactKind::Cry {
-            blend: emotions(node),
+            blend: parse_anchor_blend(node, context, warnings)?,
         }),
         "nei" => Some(ImpactKind::Nei {
             base: req_f32(node, "base", context, warnings)?,
-            blend: emotions(node),
+            blend: parse_anchor_blend(node, context, warnings)?,
         }),
         "aei" => Some(ImpactKind::Aei {
             base: req_f32(node, "base", context, warnings)?,
-            blend: emotions(node),
+            blend: parse_anchor_blend(node, context, warnings)?,
         }),
-        "pads" | "maxAEIPADS" | "cryPADS" => Some(ImpactKind::Pads {
-            days: period_days(node, today, context, warnings),
-            blend: emotions(node),
+        "pads" | "maxAEIPADS" | "cryPADS" => {
+            let (days, ranges) = period_days(node, today, context, warnings);
+            Some(ImpactKind::Pads {
+                days,
+                ranges,
+                blend: parse_anchor_blend(node, context, warnings)?,
+            })
+        }
+        "waifu" => {
+            let (days, ranges) = period_days(node, today, context, warnings);
+            Some(ImpactKind::Waifu { days, ranges })
+        }
+        "ehi" => Some(ImpactKind::Ehi {
+            blend: parse_anchor_blend(node, context, warnings)?,
         }),
-        "waifu" => Some(ImpactKind::Waifu {
-            days: period_days(node, today, context, warnings),
-        }),
-        "ehi" => Some(ImpactKind::Ehi),
         "epi" => Some(ImpactKind::Epi {
             factor: req_f32(node, "base", context, warnings)?,
+            blend: parse_anchor_blend(node, context, warnings)?,
         }),
         "jumpscare" => Some(ImpactKind::Jumpscare),
         "sleeplessNight" => Some(ImpactKind::SleeplessNight),
@@ -691,10 +939,14 @@ fn parse_impact_kind(
             new_field: node.attribute("new").map(|s| s == "true").unwrap_or(false),
         }),
         "dropped" => Some(ImpactKind::Dropped),
-        "meme" => Some(ImpactKind::Meme {
-            strength: req_f32(node, "strength", context, warnings)?,
-            days: period_days(node, today, context, warnings),
-        }),
+        "meme" => {
+            let (days, ranges) = period_days(node, today, context, warnings);
+            Some(ImpactKind::Meme {
+                strength: req_f32(node, "strength", context, warnings)?,
+                days,
+                ranges,
+            })
+        }
         "music" => Some(ImpactKind::Music {
             base: req_f32(node, "base", context, warnings)?,
         }),
@@ -792,23 +1044,39 @@ fn parse_impact_kind(
 /// from an id that just hasn't been parsed yet.
 pub fn referenced_ids(doc: &ParsedDocument) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
-    for entry in &doc.entries {
-        for impact in &entry.impacts {
-            for (id, _) in &impact.contributors {
-                ids.insert(id.clone());
-            }
+    let impacts = doc
+        .entries
+        .iter()
+        .flat_map(|e| &e.impacts)
+        .chain(&doc.shared_impacts);
+    for impact in impacts {
+        for (id, _) in &impact.contributors {
+            ids.insert(id.clone());
         }
+    }
+    for entry in &doc.entries {
         for relation in &entry.relations {
-            let to = match relation {
-                ParsedRelation::Remix { to }
-                | ParsedRelation::FeatureMusic { to }
-                | ParsedRelation::KilledBy { to, .. }
-                | ParsedRelation::Contains { to, .. } => to,
-            };
-            ids.insert(to.clone());
+            ids.insert(relation.target().to_string());
+        }
+    }
+    for shared in &doc.shared_relations {
+        ids.insert(shared.relation.target().to_string());
+        for (id, _) in &shared.contributors {
+            ids.insert(id.clone());
         }
     }
     ids
+}
+
+impl ParsedRelation {
+    pub fn target(&self) -> &str {
+        match self {
+            ParsedRelation::Remix { to }
+            | ParsedRelation::FeatureMusic { to }
+            | ParsedRelation::KilledBy { to, .. }
+            | ParsedRelation::Contains { to, .. } => to,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -850,6 +1118,150 @@ mod tests {
             }
         );
         assert_eq!(e.impacts[0].contributors, vec![("A-1".into(), 1.0)]);
+    }
+
+    #[test]
+    fn canonical_anchors_override_legacy_emotions_with_provenance() {
+        let doc = parse_str(
+            r#"<document><entry id="A-1">
+                <ehi anchors="hype-0.7:comedy-0.3" emotions="AP"
+                     anchorSource="luna-v1" anchorConfidence="0.91" />
+            </entry></document>"#,
+            today(),
+        )
+        .unwrap();
+        let impact = &entry(&doc, "A-1").impacts[0];
+        assert_eq!(
+            impact.kind,
+            ImpactKind::Ehi {
+                blend: vec![("hype".into(), 0.7), ("comedy".into(), 0.3)]
+            }
+        );
+        assert_eq!(impact.anchor_source.as_deref(), Some("luna-v1"));
+        assert_eq!(impact.anchor_confidence, Some(0.91));
+        assert!(doc
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("both 'anchors' and legacy 'emotions'")));
+    }
+
+    #[test]
+    fn malformed_canonical_anchors_are_skipped_without_legacy_fallback() {
+        let doc = parse_str(
+            r#"<document><entry id="A-1">
+                <ehi anchors="made-up-1.0" emotions="AP" />
+            </entry></document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(entry(&doc, "A-1").impacts.is_empty());
+        assert!(doc
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("invalid anchors")));
+    }
+
+    #[test]
+    fn max_aei_pads_and_cry_pads_expand_to_both_impacts() {
+        let doc = parse_str(
+            r#"<document><entry id="A-1">
+                <maxAEIPADS emotions="CU" from="2020-01-01" to="2020-01-02" />
+                <cryPADS emotions="MU" from="2020-01-01" to="2020-01-02" />
+            </entry></document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let kinds: Vec<_> = entry(&doc, "A-1").impacts.iter().map(|i| &i.kind).collect();
+        assert_eq!(kinds.len(), 4);
+        assert_eq!(
+            kinds[0],
+            &ImpactKind::Aei {
+                base: 1.0,
+                blend: vec![("CU".into(), 1.0)]
+            }
+        );
+        assert!(matches!(kinds[1], ImpactKind::Pads { .. }));
+        assert_eq!(
+            kinds[2],
+            &ImpactKind::Cry {
+                blend: vec![("MU".into(), 1.0)]
+            }
+        );
+        assert!(matches!(kinds[3], ImpactKind::Pads { .. }));
+    }
+
+    #[test]
+    fn top_level_impacts_and_relations_are_kept() {
+        let doc = parse_str(
+            r#"<document>
+                <entry id="A-1" />
+                <entry id="B-1" />
+                <entry id="K-1" />
+                <meme strength="1.0" from="2020-01-01" to="2020-01-10">
+                    <contributor id="A-1" factor="0.75" />
+                    <contributor id="B-1" factor="0.25" />
+                </meme>
+                <killedBy id="K-1" potential="0.4" effect="0.9">
+                    <contributor id="A-1" factor="0.8" />
+                </killedBy>
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        assert_eq!(doc.shared_impacts.len(), 1);
+        assert_eq!(
+            doc.shared_impacts[0].contributors,
+            vec![("A-1".into(), 0.75), ("B-1".into(), 0.25)]
+        );
+        assert_eq!(
+            doc.shared_relations,
+            vec![SharedRelation {
+                relation: ParsedRelation::KilledBy {
+                    to: "K-1".into(),
+                    potential: 0.4,
+                    effect: 0.9,
+                },
+                contributors: vec![("A-1".into(), 0.8)],
+            }]
+        );
+    }
+
+    #[test]
+    fn top_level_impact_without_contributors_warns() {
+        let doc = parse_str(
+            r#"<document><aei base="0.5" emotions="AP" /></document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.shared_impacts.is_empty());
+        assert!(doc
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no <contributor>")));
+    }
+
+    #[test]
+    fn relation_contributors_replace_the_enclosing_entry() {
+        let doc = parse_str(
+            r#"<document><entry id="F-1">
+                <entry id="A-1" />
+                <killedBy id="K-1" potential="0.4" effect="0.9">
+                    <contributor id="A-1" factor="0.8" />
+                    <contributor id="F-1" factor="0.2" />
+                </killedBy>
+            </entry></document>"#,
+            today(),
+        )
+        .unwrap();
+        // Only the nested-entry Contains stays on F-1 itself.
+        assert_eq!(entry(&doc, "F-1").relations.len(), 1);
+        assert_eq!(doc.shared_relations.len(), 1);
+        assert_eq!(
+            doc.shared_relations[0].contributors,
+            vec![("A-1".into(), 0.8), ("F-1".into(), 0.2)]
+        );
     }
 
     #[test]
@@ -987,7 +1399,13 @@ mod tests {
             entry(&doc, "A-1").impacts[0].kind,
             ImpactKind::Meme {
                 strength: 0.5,
-                days: 10.0
+                days: 10.0,
+                ranges: vec![PeriodRange {
+                    from: "2020-01-01".into(),
+                    to: "2020-01-11".into(),
+                    from_expression: None,
+                    to_expression: None,
+                }],
             }
         );
     }
@@ -1007,7 +1425,13 @@ mod tests {
             entry(&doc, "A-1").impacts[0].kind,
             ImpactKind::Meme {
                 strength: 0.5,
-                days: 10.0
+                days: 10.0,
+                ranges: vec![PeriodRange {
+                    from: "2020-01-01".into(),
+                    to: "2020-01-11".into(),
+                    from_expression: None,
+                    to_expression: Some("today".into()),
+                }],
             }
         );
     }
@@ -1023,7 +1447,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             entry(&doc, "A-1").impacts[0].kind,
-            ImpactKind::Waifu { days: 0.0 }
+            ImpactKind::Waifu {
+                days: 0.0,
+                ranges: Vec::new(),
+            }
         );
         assert!(doc
             .warnings

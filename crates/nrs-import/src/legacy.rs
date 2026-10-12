@@ -102,9 +102,18 @@ pub fn ehi(source: SourceId) -> Vec<Atom> {
     emotion_atoms(source, 3.5, &[(anchors::comedy(), 1.0)])
 }
 
+pub fn ehi_with_blend(source: SourceId, blend: &[(AnchorId, f32)]) -> Vec<Atom> {
+    emotion_atoms(source, 3.5, blend)
+}
+
 pub fn epi(source: SourceId, factor: f32) -> Vec<Atom> {
     let base = remap(factor, 0.0, 1.0, 3.5, 4.5);
     emotion_atoms(source, base, &[(anchors::comedy(), 1.0)])
+}
+
+pub fn epi_with_blend(source: SourceId, factor: f32, blend: &[(AnchorId, f32)]) -> Vec<Atom> {
+    let base = remap(factor, 0.0, 1.0, 3.5, 4.5);
+    emotion_atoms(source, base, blend)
 }
 
 pub fn jumpscare(source: SourceId) -> Vec<Atom> {

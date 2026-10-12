@@ -233,7 +233,10 @@ fn calc(role: RoleType, vars: &MusicVars) -> Vec11 {
         Atomic(Lyrics) => mul(
             calc(Composite(VocalLyrics), vars),
             add(
-                add(scalar(vars.emolyrics), at(IDX_WRITING, 1.0 - vars.emolyrics)),
+                add(
+                    scalar(vars.emolyrics),
+                    at(IDX_WRITING, 1.0 - vars.emolyrics),
+                ),
                 at(IDX_MUSIC, vars.lyricsmusic - vars.emolyrics),
             ),
         ),
@@ -246,7 +249,10 @@ fn calc(role: RoleType, vars: &MusicVars) -> Vec11 {
                 calc(Composite(MusicTotal), vars),
                 calc(Composite(ImageTotal), vars),
             ),
-            add(scalar(vars.vocallyrics), at(IDX_WRITING, 1.0 - vars.vocallyrics)),
+            add(
+                scalar(vars.vocallyrics),
+                at(IDX_WRITING, 1.0 - vars.vocallyrics),
+            ),
         ),
         Composite(InstTotal) => sub(
             sub(
