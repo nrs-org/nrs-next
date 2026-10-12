@@ -6,15 +6,14 @@ use serde::Serialize;
 use ulid::Ulid;
 
 use nrs_core::{
-    Anchor, AnchorId, Atom, Entry, EntryId, Homogeneity, Impact, ImpactId, Isotonic, KSrcLevels,
-    RelKind, Relation, RelationScaling, SourceId, Transform,
+    Anchor, AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, RelKind, Relation,
+    SourceId, Transform,
 };
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::event::EventKind;
-use crate::params_blob::{ParamsBlob, DEFAULT_MEDIUM};
 use crate::relkind::{rel_kind_from_str, rel_kind_to_str};
-use crate::Store;
+use crate::{Store, DEFAULT_MEDIUM};
 
 fn now_ts() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -155,7 +154,34 @@ fn ensure_anchor_exists(tx: &Transaction, id: &AnchorId) -> Result<()> {
     Ok(())
 }
 
+/// A relation as the entry page needs to see it: the graded transform,
+/// plus (when set) the DAH_standards params it was built from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryRelation {
+    pub id: String,
+    pub kind: RelKind,
+    pub from: EntryId,
+    pub to: EntryId,
+    pub transform: Transform,
+    pub dah_params: Option<String>,
+}
+
 impl Store {
+    /// Looks up the NRS entry that references one type-store entry.
+    /// `store_id` is opaque: provider IDs and cross-provider identity
+    /// remain private to the type store.
+    pub fn find_entry(&self, store: &str, store_id: &str) -> Result<Option<EntryId>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM entry WHERE store = ?1 AND store_id = ?2",
+                params![store, store_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|opt| opt.map(EntryId))
+            .map_err(Into::into)
+    }
+
     pub fn add_entry(
         &mut self,
         store: &str,
@@ -216,6 +242,32 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(ImpactId(id))
+    }
+
+    /// Records the DAH_standards kind + params an impact was built
+    /// from (INFRA.md's "kind-based forms" UI), so the entry page can
+    /// show that instead of a raw anchor blend. `factor` is the
+    /// contributor share (1.0 for a plain manually-created impact) the
+    /// kind editor multiplies the formula's output by before saving --
+    /// see `dah_factor`'s schema comment. A separate call from
+    /// `add_impact`/`edit_impact` rather than an extra parameter on
+    /// them, since the atoms and the provenance are independently
+    /// useful (tests, the raw chip editor) without one requiring the
+    /// other. No event append -- this is presentation metadata, not a
+    /// scoring-relevant change; the atom edit it accompanies already
+    /// logs its own event.
+    pub fn set_impact_dah(
+        &mut self,
+        id: &ImpactId,
+        kind: &str,
+        params_json: &str,
+        factor: f32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE impact SET dah_kind = ?2, dah_params = ?3, dah_factor = ?4 WHERE id = ?1",
+            params![id.0, kind, params_json, factor],
+        )?;
+        Ok(())
     }
 
     pub fn edit_impact(&mut self, id: &ImpactId, atoms: &[Atom], note: Option<&str>) -> Result<()> {
@@ -373,6 +425,50 @@ impl Store {
         Ok(())
     }
 
+    /// See `set_impact_dah` -- same idea, but `relation.kind` already
+    /// doubles as the DAH kind for the four relation kinds
+    /// DAH_standards covers, so only the params need a dedicated column.
+    pub fn set_relation_dah(&mut self, id: &str, params_json: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE relation SET dah_params = ?2 WHERE id = ?1",
+            params![id, params_json],
+        )?;
+        Ok(())
+    }
+
+    /// Every relation touching `entry` on either side, in insertion
+    /// order -- the entry page's unified impact/relation view needs
+    /// both directions (an entry can be a `Contains` parent or child,
+    /// a `killed_by` source or target, ...).
+    pub fn relations_for_entry(&self, entry: &EntryId) -> Result<Vec<EntryRelation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, from_e, to_e, transform, dah_params FROM relation \
+             WHERE from_e = ?1 OR to_e = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![entry.0], |row| {
+            let id: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let from: String = row.get(2)?;
+            let to: String = row.get(3)?;
+            let transform: String = row.get(4)?;
+            let dah_params: Option<String> = row.get(5)?;
+            Ok((id, kind, from, to, transform, dah_params))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, from, to, transform, dah_params) = row?;
+            out.push(EntryRelation {
+                id,
+                kind: rel_kind_from_str(&kind)?,
+                from: EntryId(from),
+                to: EntryId(to),
+                transform: serde_json::from_str(&transform)?,
+                dah_params,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn delete_relation(&mut self, id: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         let before = read_relation(&tx, id)?;
@@ -419,7 +515,17 @@ impl Store {
         Ok(())
     }
 
+    /// Sets one entry of the pooling-exponent matrix `K`
+    /// (`nrs_core::KFeatMatrix`): `a == b` sets that anchor's own
+    /// exponent, otherwise the exponent the pair pools at. Must lie in
+    /// `(0, 1]`; 1 is the default (additive).
     pub fn set_kfeat_pair(&mut self, a: &AnchorId, b: &AnchorId, k: f32) -> Result<()> {
+        if !(k > 0.0 && k <= 1.0) {
+            return Err(StoreError::InvalidData(format!(
+                "kfeat exponent {k} for {}:{} is outside (0, 1]",
+                a.0, b.0
+            )));
+        }
         let tx = self.conn.transaction()?;
         // `kfeat.a`/`kfeat.b` are FK-constrained to `anchor(id)`, but
         // `nrs-import` doesn't populate `Palette.anchors` yet -- so an
@@ -450,41 +556,6 @@ impl Store {
             Some(&target),
             to_json(before.as_ref())?.as_deref(),
             to_json(Some(&k))?.as_deref(),
-            None,
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn set_params(
-        &mut self,
-        q: f32,
-        k_src_levels: KSrcLevels,
-        homogeneity: Homogeneity,
-        relation_scaling: RelationScaling,
-    ) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let before: Option<String> = tx
-            .query_row("SELECT json FROM params WHERE id = 1", [], |row| row.get(0))
-            .optional()?;
-        let blob = ParamsBlob {
-            q,
-            k_src_levels,
-            homogeneity,
-            relation_scaling,
-        };
-        let after = serde_json::to_string(&blob)?;
-        tx.execute(
-            "INSERT INTO params (id, json) VALUES (1, ?1) \
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-            params![after],
-        )?;
-        append_event(
-            &tx,
-            EventKind::ParamSet,
-            None,
-            before.as_deref(),
-            Some(&after),
             None,
         )?;
         tx.commit()?;
@@ -523,7 +594,7 @@ impl Store {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use nrs_core::{AnchorId, Atom, Entry, Palette, Snapshot, SourceId, Taxonomy, TimeSupport};
+    use nrs_core::{AnchorId, Atom, Entry, Palette, Snapshot, SourceId, TimeSupport};
 
     use super::*;
     use crate::ImportExtras;
@@ -573,7 +644,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: Default::default(),
             },
-            taxonomy: Taxonomy::default(),
         };
         let mut comments = BTreeMap::new();
         if let Some(comment) = comment {
@@ -589,6 +659,7 @@ mod tests {
                 &ImportExtras {
                     comments,
                     needs_review: needs_review_set,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -601,7 +672,10 @@ mod tests {
 
         store.confirm_impact(&impact_id).unwrap();
 
-        assert_eq!(read_note(&store, &impact_id).as_deref(), Some("the hype is unreal"));
+        assert_eq!(
+            read_note(&store, &impact_id).as_deref(),
+            Some("the hype is unreal")
+        );
         assert!(!store.review.get(&impact_id.0).needs_review);
     }
 

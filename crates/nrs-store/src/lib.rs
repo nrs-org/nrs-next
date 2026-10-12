@@ -8,9 +8,9 @@ mod error;
 mod event;
 mod events;
 mod import;
-mod params_blob;
 mod preferences;
 mod relkind;
+mod resync;
 mod review;
 mod review_queue;
 mod schema;
@@ -20,14 +20,20 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+pub use crud::EntryRelation;
 pub use error::{Result, StoreError};
 pub use event::EventKind;
 pub use events::EventRecord;
 pub use import::ImportExtras;
 pub use preferences::Preference;
+pub use resync::ResyncPlan;
 pub use review_queue::ReviewImpact;
 
 use review::ReviewLog;
+
+/// The `calibration` table is keyed by `medium` (INFRA.md open decision
+/// #5); until that decision is made there is one curve under this key.
+pub(crate) const DEFAULT_MEDIUM: &str = "default";
 
 pub struct Store {
     conn: Connection,

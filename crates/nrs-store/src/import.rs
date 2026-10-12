@@ -11,7 +11,7 @@ use rusqlite::{params, Transaction};
 use serde::Serialize;
 use ulid::Ulid;
 
-use nrs_core::{ImpactId, Relation, Snapshot};
+use nrs_core::{EntryId, ImpactId, RelKind, Relation, Snapshot};
 
 use crate::error::Result;
 use crate::event::EventKind;
@@ -26,6 +26,19 @@ use crate::Store;
 pub struct ImportExtras {
     pub comments: BTreeMap<ImpactId, String>,
     pub needs_review: BTreeSet<ImpactId>,
+    /// The raw `DAH_entry_roles` expression(s) behind each imported
+    /// Credit relation, keyed by (contributor, work) -- see
+    /// `nrs_import::snapshot::BuildExtras::credit_roles`. Stored into
+    /// `relation.dah_params` as `{"roles": "..."}` so the Credit UI
+    /// can show the roles rather than only the computed weight vector.
+    pub credit_roles: BTreeMap<(EntryId, EntryId), String>,
+    /// The DAH_standards kind + form params each imported impact's
+    /// atoms were derived from, plus its `<contributor factor="..">`
+    /// share -- see `nrs_import::snapshot::BuildExtras::impact_dah`.
+    /// Stored into `impact.dah_kind`/`dah_params`/`dah_factor` so
+    /// nrs-app's kind-based editor works on bulk-imported impacts too,
+    /// not only ones created through it.
+    pub impact_dah: BTreeMap<ImpactId, (String, BTreeMap<String, String>, f32)>,
 }
 
 fn now_ts() -> i64 {
@@ -40,19 +53,20 @@ struct ImportSummary {
     anchors: usize,
 }
 
-fn insert_relation(tx: &Transaction, relation: &Relation) -> Result<()> {
+fn insert_relation(tx: &Transaction, relation: &Relation, dah_params: Option<&str>) -> Result<()> {
     // `Relation` carries no id (INFRA.md's frozen contract) — mint a
     // store-only one, same as `add_relation`.
     let id = Ulid::new().to_string();
     let transform = serde_json::to_string(&relation.transform)?;
     tx.execute(
-        "INSERT INTO relation (id, kind, from_e, to_e, transform) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO relation (id, kind, from_e, to_e, transform, dah_params) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             id,
             rel_kind_to_str(relation.kind),
             relation.from.0,
             relation.to.0,
-            transform
+            transform,
+            dah_params
         ],
     )?;
     Ok(())
@@ -74,18 +88,65 @@ impl Store {
     pub fn import_snapshot(&mut self, snap: &Snapshot, extras: &ImportExtras) -> Result<()> {
         let tx = self.conn.transaction()?;
 
+        // The XML parser sometimes emits the same `<entry id=...>` node
+        // twice into `snap.entries` for one logical entry (it warns
+        // "declared 2 times... merged into one entry" — the *content*
+        // gets merged, but the entry row itself doesn't) — skip the
+        // repeat rather than violating the `id` primary key.
+        let mut seen_ids = BTreeSet::new();
+        // Separately, legacy XML occasionally cites the same type-store
+        // entry from two genuinely distinct entries (a copy-paste in
+        // `nrs-impl`'s source data). `(store, store_id)` is UNIQUE, so a
+        // second claimant falls back to the same "no known store entry"
+        // shape unclaimed entries already use — `entry.id` is the raw XML
+        // id and is guaranteed unique on its own.
+        let mut seen_external = BTreeSet::new();
         for entry in &snap.entries {
+            if !seen_ids.insert(entry.id.0.clone()) {
+                continue;
+            }
+            let (store, store_id) =
+                if seen_external.insert((entry.store.clone(), entry.store_id.clone())) {
+                    (entry.store.as_str(), entry.store_id.as_str())
+                } else {
+                    ("none", entry.id.0.as_str())
+                };
             tx.execute(
                 "INSERT INTO entry (id, store, store_id, title_cache) VALUES (?1, ?2, ?3, ?4)",
-                params![entry.id.0, entry.store, entry.store_id, entry.title_cache],
+                params![entry.id.0, store, store_id, entry.title_cache],
             )?;
         }
 
         let mut review_states = Vec::with_capacity(snap.impacts.len());
         for impact in &snap.impacts {
+            let dah = extras
+                .impact_dah
+                .get(&impact.id)
+                .map(|(kind, params, factor)| {
+                    Ok::<_, crate::error::StoreError>((
+                        kind,
+                        serde_json::to_string(params)?,
+                        *factor,
+                    ))
+                })
+                .transpose()?;
+            let (dah_kind, dah_params, dah_factor) = match &dah {
+                Some((kind, params, factor)) => {
+                    (Some(kind.as_str()), Some(params.as_str()), Some(*factor))
+                }
+                None => (None, None, None),
+            };
             tx.execute(
-                "INSERT INTO impact (id, target, note, created) VALUES (?1, ?2, NULL, ?3)",
-                params![impact.id.0, impact.target.0, now_ts()],
+                "INSERT INTO impact (id, target, note, created, dah_kind, dah_params, dah_factor) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                params![
+                    impact.id.0,
+                    impact.target.0,
+                    now_ts(),
+                    dah_kind,
+                    dah_params,
+                    dah_factor
+                ],
             )?;
             for atom in &impact.atoms {
                 let blend = serde_json::to_string(&atom.blend)?;
@@ -111,18 +172,30 @@ impl Store {
         }
 
         for relation in &snap.relations {
-            insert_relation(&tx, relation)?;
+            let dah_params = if relation.kind == RelKind::Credit {
+                extras
+                    .credit_roles
+                    .get(&(relation.from.clone(), relation.to.clone()))
+                    .map(|roles| serde_json::json!({ "roles": roles }).to_string())
+            } else {
+                None
+            };
+            insert_relation(&tx, relation, dah_params.as_deref())?;
         }
 
         for anchor in &snap.palette.anchors {
             tx.execute(
-                "INSERT INTO anchor (id, label, family) VALUES (?1, ?2, ?3)",
+                "INSERT INTO anchor (id, label, family) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET label = excluded.label, family = excluded.family",
                 params![anchor.id.0, anchor.label, anchor.family],
             )?;
         }
+        // The schema seeds the default `K`; an imported palette overrides
+        // the entries it lists.
         for ((a, b), k) in &snap.palette.k_feat.pairs {
             tx.execute(
-                "INSERT INTO kfeat (a, b, k) VALUES (?1, ?2, ?3)",
+                "INSERT INTO kfeat (a, b, k) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(a, b) DO UPDATE SET k = excluded.k",
                 params![a.0, b.0, k],
             )?;
         }
@@ -150,7 +223,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use nrs_core::{
-        Atom, Entry, EntryId, Impact, ImpactId, Palette, Snapshot, SourceId, Taxonomy, TimeSupport,
+        Atom, Entry, EntryId, Impact, ImpactId, Palette, Snapshot, SourceId, TimeSupport,
     };
 
     use super::ImportExtras;
@@ -187,7 +260,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: Default::default(),
             },
-            taxonomy: Taxonomy::default(),
         }
     }
 
@@ -203,12 +275,16 @@ mod tests {
         let extras = ImportExtras {
             comments,
             needs_review,
+            ..Default::default()
         };
 
         store.import_snapshot(&snap, &extras).unwrap();
 
         let flagged = store.review.get("i1");
-        assert_eq!(flagged.source_comment.as_deref(), Some("the hype is unreal"));
+        assert_eq!(
+            flagged.source_comment.as_deref(),
+            Some("the hype is unreal")
+        );
         assert!(flagged.needs_review);
 
         // i2 got neither a comment nor a needs-review flag -- untouched.

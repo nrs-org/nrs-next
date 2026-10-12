@@ -23,23 +23,40 @@ pub struct ReviewImpact {
     pub note: Option<String>,
     pub source_comment: Option<String>,
     pub needs_review: bool,
+    /// The DAH_standards kind (e.g. "nei") this impact was built from,
+    /// if it was created or edited through the kind-based form. `None`
+    /// for bulk-imported or raw-edited impacts, which have no such
+    /// provenance.
+    pub dah_kind: Option<String>,
+    /// That kind's own parameters as a JSON object of form fields
+    /// (e.g. `{"factor":"0.5","sign":"1"}`), alongside `dah_kind`.
+    pub dah_params: Option<String>,
+    /// The contributor share (see `dah_factor`'s schema comment) the
+    /// kind editor multiplies the formula's recomputed output by
+    /// before saving -- `None` alongside `dah_kind: None`; `Some(1.0)`
+    /// for an unscaled DAH-built impact.
+    pub dah_factor: Option<f32>,
 }
 
 impl Store {
     /// Every impact on `entry`, in insertion order.
     pub fn impacts_for_entry(&self, entry: &EntryId) -> Result<Vec<ReviewImpact>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, note FROM impact WHERE target = ?1 ORDER BY rowid")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, note, dah_kind, dah_params, dah_factor FROM impact \
+             WHERE target = ?1 ORDER BY rowid",
+        )?;
         let rows = stmt.query_map(params![entry.0], |row| {
             let id: String = row.get(0)?;
             let note: Option<String> = row.get(1)?;
-            Ok((id, note))
+            let dah_kind: Option<String> = row.get(2)?;
+            let dah_params: Option<String> = row.get(3)?;
+            let dah_factor: Option<f32> = row.get(4)?;
+            Ok((id, note, dah_kind, dah_params, dah_factor))
         })?;
 
         let mut impacts = Vec::new();
         for row in rows {
-            let (id, note) = row?;
+            let (id, note, dah_kind, dah_params, dah_factor) = row?;
             let atoms = self.load_atoms(&id)?;
             let review = self.review.get(&id);
             impacts.push(ReviewImpact {
@@ -49,6 +66,9 @@ impl Store {
                 note,
                 source_comment: review.source_comment,
                 needs_review: review.needs_review,
+                dah_kind,
+                dah_params,
+                dah_factor,
             });
         }
         Ok(impacts)
@@ -119,7 +139,7 @@ impl Store {
 mod tests {
     use std::collections::BTreeMap;
 
-    use nrs_core::{AnchorId, Entry, Impact, Palette, Snapshot, Taxonomy, TimeSupport};
+    use nrs_core::{AnchorId, Entry, Impact, Palette, Snapshot, TimeSupport};
 
     use super::*;
     use crate::ImportExtras;
@@ -176,7 +196,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: Default::default(),
             },
-            taxonomy: Taxonomy::default(),
         };
         let mut comments = BTreeMap::new();
         comments.insert(ImpactId("i1".into()), "the hype is unreal".to_string());
@@ -188,6 +207,7 @@ mod tests {
                 &ImportExtras {
                     comments,
                     needs_review,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -241,7 +261,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: Default::default(),
             },
-            taxonomy: Taxonomy::default(),
         };
         let mut comments = BTreeMap::new();
         comments.insert(ImpactId("i1".into()), "comfy af".to_string());
@@ -250,7 +269,7 @@ mod tests {
                 &snap,
                 &ImportExtras {
                     comments,
-                    needs_review: Default::default(),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -258,6 +277,9 @@ mod tests {
         assert_eq!(store.entries_needing_review().unwrap(), vec![entry.clone()]);
 
         store.confirm_impact(&ImpactId("i1".into())).unwrap();
-        assert_eq!(store.entries_needing_review().unwrap(), Vec::<EntryId>::new());
+        assert_eq!(
+            store.entries_needing_review().unwrap(),
+            Vec::<EntryId>::new()
+        );
     }
 }

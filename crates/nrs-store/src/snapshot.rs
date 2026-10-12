@@ -10,22 +10,18 @@ use nrs_core::{
 };
 
 use crate::error::Result;
-use crate::params_blob::{ParamsBlob, DEFAULT_MEDIUM};
+use crate::DEFAULT_MEDIUM;
 use crate::relkind::rel_kind_from_str;
 use crate::Store;
 
 impl Store {
-    /// Loads the whole scoring substrate. `taxonomy` is derived from the
-    /// loaded `Contains` relations (`nrs_core::derive_taxonomy`) rather
-    /// than stored — INFRA.md §5.1: "the taxonomy for `k_src`... needs
-    /// no separate table".
+    /// Loads the whole scoring substrate.
     pub fn load_snapshot(&self) -> Result<(Snapshot, Params)> {
         let entries = self.load_entries()?;
         let impacts = self.load_impacts()?;
         let relations = self.load_relations()?;
         let palette = self.load_palette()?;
         let params = self.load_params(&palette.k_feat)?;
-        let taxonomy = nrs_core::derive_taxonomy(&relations);
 
         Ok((
             Snapshot {
@@ -33,10 +29,17 @@ impl Store {
                 impacts,
                 relations,
                 palette,
-                taxonomy,
             },
             params,
         ))
+    }
+
+    /// Live entry list, bypassing whatever `Snapshot` an app-level
+    /// caller loaded at startup — for UI that needs to see entries
+    /// created since then (e.g. picking an import's target for a new
+    /// impact/relation).
+    pub fn list_entries(&self) -> Result<Vec<Entry>> {
+        self.load_entries()
     }
 
     fn load_entries(&self) -> Result<Vec<Entry>> {
@@ -153,7 +156,6 @@ impl Store {
             let (a, b, k) = row?;
             pairs.insert((AnchorId(a), AnchorId(b)), k);
         }
-
         Ok(Palette {
             anchors,
             k_feat: KFeatMatrix { pairs },
@@ -161,15 +163,6 @@ impl Store {
     }
 
     fn load_params(&self, k_feat: &KFeatMatrix) -> Result<Params> {
-        let blob: Option<String> = self
-            .conn
-            .query_row("SELECT json FROM params WHERE id = 1", [], |row| row.get(0))
-            .optional()?;
-        let blob: ParamsBlob = match blob {
-            Some(json) => serde_json::from_str(&json)?,
-            None => ParamsBlob::default(),
-        };
-
         let isotonic: Option<String> = self
             .conn
             .query_row(
@@ -184,12 +177,8 @@ impl Store {
         };
 
         Ok(Params {
-            q: blob.q,
-            k_src_levels: blob.k_src_levels,
             k_feat: k_feat.clone(),
-            homogeneity: blob.homogeneity,
             calibration,
-            relation_scaling: blob.relation_scaling,
         })
     }
 }

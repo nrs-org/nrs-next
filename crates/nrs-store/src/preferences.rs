@@ -1,7 +1,7 @@
 //! Pairwise "A beats B" corrections (INFRA.md §8's fitting fuel for
 //! `nrs-fit`), persisted purely as events (INFRA.md §6: "the corrections
 //! and brackets you record are events `nrs-fit` reads") -- no separate
-//! table, the same way the `k_src` taxonomy needs none.
+//! table.
 
 use serde::{Deserialize, Serialize};
 

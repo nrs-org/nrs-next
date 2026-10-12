@@ -1,7 +1,4 @@
-use nrs_core::{
-    AnchorId, Atom, Homogeneity, Isotonic, KSrcLevels, RelKind, RelationScaling, SourceId,
-    TimeSupport, Transform,
-};
+use nrs_core::{AnchorId, Atom, Isotonic, RelKind, SourceId, TimeSupport, Transform};
 use nrs_store::Store;
 
 fn sample_atom(anchor: &str, source: &str, magnitude: f32) -> Atom {
@@ -14,20 +11,18 @@ fn sample_atom(anchor: &str, source: &str, magnitude: f32) -> Atom {
 }
 
 #[test]
-fn fresh_db_has_empty_snapshot_and_default_params() {
+fn fresh_db_has_empty_snapshot_and_the_seeded_palette() {
     let store = Store::open_in_memory().unwrap();
     let (snap, params) = store.load_snapshot().unwrap();
 
     assert!(snap.entries.is_empty());
     assert!(snap.impacts.is_empty());
     assert!(snap.relations.is_empty());
-    assert!(snap.palette.anchors.is_empty());
-    assert!(snap.taxonomy.parent.is_empty());
+    assert_eq!(snap.palette.anchors.len(), 18);
 
-    assert_eq!(params.q, 0.6);
-    assert_eq!(params.k_src_levels.levels, [0.95, 0.5, 0.3, 0.15, 0.0]);
-    assert_eq!(params.homogeneity, Homogeneity::DegreeQ);
-    assert_eq!(params.relation_scaling, RelationScaling::Fixed);
+    let waifu = AnchorId("waifu".into());
+    assert_eq!(params.k_feat.exponent(&waifu), 0.35);
+    assert_eq!(params.k_feat, snap.palette.k_feat);
     assert_eq!(params.calibration, Isotonic::default());
 }
 
@@ -74,16 +69,6 @@ fn round_trip_preserves_snapshot_and_score() {
         .unwrap();
 
     store
-        .set_params(
-            0.6,
-            KSrcLevels {
-                levels: [0.95, 0.5, 0.3, 0.15, 0.0],
-            },
-            Homogeneity::DegreeQ,
-            RelationScaling::Fixed,
-        )
-        .unwrap();
-    store
         .set_calibration(&Isotonic {
             knots: vec![(0.0, 0.0), (10.0, 100.0)],
         })
@@ -106,7 +91,7 @@ fn round_trip_preserves_snapshot_and_score() {
     assert_eq!(snap.relations[0].to, album_b);
     assert_eq!(snap.relations[0].transform, Transform::Scalar(1.0));
 
-    assert_eq!(snap.palette.anchors.len(), 2);
+    assert_eq!(snap.palette.anchors.len(), 18 + 2);
     assert_eq!(
         snap.palette.k_feat.get(
             &AnchorId("gut-punch".into()),
@@ -115,7 +100,6 @@ fn round_trip_preserves_snapshot_and_score() {
         0.3
     );
 
-    assert_eq!(params.q, 0.6);
     assert_eq!(
         params.calibration,
         Isotonic {
@@ -310,7 +294,16 @@ fn set_kfeat_pair_auto_registers_unknown_anchors() {
 
     let (snap, _) = store.load_snapshot().unwrap();
     assert_eq!(snap.palette.k_feat.get(&a, &b), 0.4);
-    assert_eq!(snap.palette.anchors.len(), 2);
+    assert_eq!(snap.palette.anchors.len(), 18 + 2);
+}
+
+#[test]
+fn set_kfeat_pair_rejects_exponents_outside_unit_interval() {
+    let mut store = Store::open_in_memory().unwrap();
+    let a = AnchorId("hype".into());
+    assert!(store.set_kfeat_pair(&a, &a, 0.0).is_err());
+    assert!(store.set_kfeat_pair(&a, &a, 1.5).is_err());
+    assert!(store.set_kfeat_pair(&a, &a, 0.25).is_ok());
 }
 
 fn tempdir_path() -> std::path::PathBuf {

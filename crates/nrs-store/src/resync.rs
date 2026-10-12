@@ -608,7 +608,7 @@ mod tests {
 
     use nrs_core::{
         AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Palette, RelKind, Relation, Snapshot,
-        SourceId, Taxonomy, TimeSupport, Transform,
+        SourceId, TimeSupport, Transform,
     };
 
     use crate::{ImportExtras, Store};
@@ -653,7 +653,6 @@ mod tests {
                 anchors: vec![],
                 k_feat: Default::default(),
             },
-            taxonomy: Taxonomy::default(),
         }
     }
 
