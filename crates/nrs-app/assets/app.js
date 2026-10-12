@@ -247,9 +247,18 @@ async function renderScores() {
     sort: params.get("sort") || "value",
     dir: params.get("dir") || "desc",
     q: params.get("q") || "",
+    shared: params.get("shared") || "",
+    length: params.get("length") || "",
     cmp_gen: params.get("cmp_gen") || "",
+    cmp_shared: params.get("cmp_shared") || "",
+    cmp_length: params.get("cmp_length") || "",
   };
-  const comparing = Boolean(view.cmp_gen);
+  const comparing = Boolean(view.cmp_gen || view.cmp_shared || view.cmp_length);
+  const compareLabel = [
+    view.cmp_gen ? `version ${view.cmp_gen}` : "",
+    view.cmp_shared ? `λ ${view.cmp_shared}` : "",
+    view.cmp_length ? `L ${view.cmp_length} days` : "",
+  ].filter(Boolean).join(" · ");
   const columns = [
     ["rank", "#", "value"],
     ...(comparing ? [["delta", "Δ", "delta"]] : []),
@@ -261,9 +270,15 @@ async function renderScores() {
   app.innerHTML = `
     <h1>scores</h1>
     <p class="muted">Uncalibrated V (nested pooling over <a href="/kfeat">K</a>) -- not a public score yet.</p>
+    <form class="score-controls">
+      ${textField(view, "shared", "time: shared λ (1 = ignore dates)", "", "number", 'min="0" max="1" step="0.05"')}
+      ${textField(view, "length", "time: length L (days)", "", "number", 'min="1" step="1"')}
+      <button class="button primary" type="submit">rerun</button>
+      <button class="button" type="button" data-save-time>save as default</button>
+    </form>
     <div class="ledger-meta">
       <span class="score-count">Calculating…</span>
-      ${comparing ? `<span class="compare-note">Δ vs version ${escapeHtml(view.cmp_gen)} <button class="edit-link" type="button" data-clear-compare>clear</button></span>` : `<span class="compare-note" hidden><button class="edit-link" type="button" data-start-compare>compare with the previous version</button></span>`}
+      ${comparing ? `<span class="compare-note">Δ vs ${escapeHtml(compareLabel)} <button class="edit-link" type="button" data-clear-compare>clear</button></span>` : `<span class="compare-note" hidden><button class="edit-link" type="button" data-start-compare>compare with the previous version</button></span>`}
       <a class="csv-link">download csv</a>
     </div>
     <div class="toolbar score-toolbar">
@@ -275,7 +290,7 @@ async function renderScores() {
           <dt><code>type:anime</code></dt><dd>${Object.keys(entryKinds).join(", ")}, or <code>music</code> for album + track + artist — several mean any of them (click a chip; shift-click excludes)</dd>
           <dt><code>store:mal</code></dt><dd>store contains it</dd>
           <dt><code>v>10</code> <code>rank<=100</code></dt><dd>compare with <code>&gt; &gt;= &lt; &lt;= =</code></dd>
-          <dt><code>delta>=5</code> <code>is:up</code> <code>is:down</code> <code>is:moved</code></dt><dd>rank changes since the compared version (after an edit)</dd>
+          <dt><code>delta>=5</code> <code>is:up</code> <code>is:down</code> <code>is:moved</code></dt><dd>rank changes since the compared run (after an edit or a rerun)</dd>
         </dl>
       </div></details>
     </div>
@@ -289,6 +304,7 @@ async function renderScores() {
       <div class="score-sentinel"></div>
     </div>
     <p class="key-hint dim">j / k to move · enter to open · / to filter</p>`;
+  const controls = app.querySelector(".score-controls");
   const count = app.querySelector(".score-count");
   const csv = app.querySelector(".csv-link");
   const search = app.querySelector(".search");
@@ -297,7 +313,7 @@ async function renderScores() {
   const sentinel = app.querySelector(".score-sentinel");
   const chips = app.querySelector(".kind-chips");
   const warnings = app.querySelector(".filter-warnings");
-  if (!(count instanceof HTMLElement) || !(csv instanceof HTMLAnchorElement) || !(search instanceof HTMLInputElement) || !(table instanceof HTMLElement) || !(tbody instanceof HTMLElement) || !(sentinel instanceof HTMLElement) || !(chips instanceof HTMLElement) || !(warnings instanceof HTMLElement)) return;
+  if (!(controls instanceof HTMLFormElement) || !(count instanceof HTMLElement) || !(csv instanceof HTMLAnchorElement) || !(search instanceof HTMLInputElement) || !(table instanceof HTMLElement) || !(tbody instanceof HTMLElement) || !(sentinel instanceof HTMLElement) || !(chips instanceof HTMLElement) || !(warnings instanceof HTMLElement)) return;
 
   const defaults = { sort: "value", dir: "desc" };
   const query = (extra = {}) => new URLSearchParams(Object.entries({ ...view, ...extra }).filter(([, value]) => value !== ""));
@@ -311,7 +327,7 @@ async function renderScores() {
 
   const syncView = () => {
     history.replaceState(null, "", pageUrl());
-    const { cmp_gen, ...exported } = view;
+    const { cmp_gen, cmp_shared, cmp_length, ...exported } = view;
     csv.href = `/api/v1/scores.csv?${new URLSearchParams(Object.entries(exported).filter(([, value]) => value !== ""))}`;
     app.querySelectorAll(".sort-button").forEach((button) => {
       const active = button.getAttribute("data-sort") === view.sort;
@@ -338,6 +354,12 @@ async function renderScores() {
       if (page.offset === 0) {
         paintFilters(page);
         noteGeneration(page);
+        effective = page.time;
+        stored = page.stored_time;
+        const sharedInput = controls.elements.namedItem("shared");
+        const lengthInput = controls.elements.namedItem("length");
+        if (sharedInput instanceof HTMLInputElement) sharedInput.placeholder = String(stored.shared);
+        if (lengthInput instanceof HTMLInputElement) lengthInput.placeholder = String(stored.length_days);
       }
       count.textContent = total === page.database_total ? `${total} entries` : `${total} of ${page.database_total} entries`;
       sentinel.innerHTML = loaded < total ? `<p class="loading">Loading more…</p>` : total ? "" : `<p class="empty">No matching entries.</p>`;
@@ -366,6 +388,9 @@ async function renderScores() {
     warnings.hidden = !page.warnings.length;
     warnings.textContent = page.warnings.join(" · ");
   }
+  // The time settings the current ranking used, and the stored defaults.
+  let effective = null;
+  let stored = null;
   // The last ranking version this tab saw, so an edit made elsewhere
   // (an impact, a relation, K) can be compared against what it replaced.
   const GENERATION_KEY = "nrs.scores.generation";
@@ -449,6 +474,33 @@ async function renderScores() {
   });
   app.querySelector("[data-start-compare]")?.addEventListener("click", () => {
     if (previousGeneration !== null) navigate(pageUrl({ cmp_gen: previousGeneration }));
+  });
+
+  const timeInputs = () => {
+    const form = new FormData(controls);
+    return { shared: String(form.get("shared") || "").trim(), length: String(form.get("length") || "").trim() };
+  };
+  controls.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const { shared, length } = timeInputs();
+    const before = effective;
+    const next = { shared: shared === "" ? stored?.shared : Number(shared), length: length === "" ? stored?.length_days : Number(length) };
+    const changed = before && (next.shared !== before.shared || next.length !== before.length_days);
+    // Compare against the run being replaced, so Δ answers "what did
+    // this change do?".
+    navigate(pageUrl({ shared, length, cmp_gen: "", ...(changed ? { cmp_shared: String(before.shared), cmp_length: String(before.length_days) } : { cmp_shared: "", cmp_length: "" }) }));
+  });
+  app.querySelector("[data-save-time]")?.addEventListener("click", async () => {
+    if (!effective) return;
+    const { shared, length } = timeInputs();
+    const payload = { shared: shared === "" ? effective.shared : Number(shared), length_days: length === "" ? effective.length_days : Number(length) };
+    try {
+      await sendJson("/api/v1/calibration/time", "PUT", payload);
+      showToast(`time saved: λ ${payload.shared} · L ${payload.length_days} days`);
+      navigate(pageUrl({ shared: "", length: "" }));
+    } catch (error) {
+      showToast(error?.message || String(error), "error");
+    }
   });
 
   const select = (index) => {

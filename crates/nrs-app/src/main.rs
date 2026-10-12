@@ -27,6 +27,7 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use nrs_core::{
     AnchorId, Atom, Entry, EntryId, Isotonic, KFeatMatrix, Params, RelKind, Snapshot, SourceId,
+    TimeParams,
 };
 use nrs_entry_store::HttpEntryStore;
 use nrs_store::Store;
@@ -172,6 +173,7 @@ async fn main() {
             "/calibration/kfeat",
             get(api::kfeat_get).put(api::kfeat_set),
         )
+        .route("/calibration/time", put(api::time_set))
         .route("/review", get(api::review_queue))
         .route("/entries", get(api::entries_index))
         .route("/entries/ingest", post(api::entry_ingest))
@@ -232,9 +234,10 @@ enum SortDir {
     Asc,
 }
 
-fn params(k_feat: KFeatMatrix) -> Params {
+fn params(k_feat: KFeatMatrix, time: TimeParams) -> Params {
     Params {
         k_feat,
+        time,
         calibration: Isotonic::default(),
     }
 }
@@ -246,8 +249,14 @@ struct Row<'a> {
     value: f32,
 }
 
-fn rows(snapshot: &Snapshot, sort: SortBy, dir: SortDir, k_feat: KFeatMatrix) -> Vec<Row<'_>> {
-    let p = params(k_feat);
+fn rows(
+    snapshot: &Snapshot,
+    sort: SortBy,
+    dir: SortDir,
+    k_feat: KFeatMatrix,
+    time: TimeParams,
+) -> Vec<Row<'_>> {
+    let p = params(k_feat, time);
     let scores = nrs_core::score(snapshot, &p);
 
     let mut rows: Vec<Row> = snapshot
@@ -1109,6 +1118,7 @@ mod tests {
             SortBy::Value,
             SortDir::Desc,
             KFeatMatrix::default(),
+            TimeParams::default(),
         );
         assert_eq!(r[0].id.0, "a");
         assert_eq!(r[1].id.0, "b");
@@ -1122,6 +1132,7 @@ mod tests {
             SortBy::Title,
             SortDir::Asc,
             KFeatMatrix::default(),
+            TimeParams::default(),
         );
         assert_eq!(r[0].title, "Apple");
         assert_eq!(r[1].title, "Zebra");
@@ -1135,6 +1146,7 @@ mod tests {
             SortBy::Value,
             SortDir::Desc,
             KFeatMatrix::default(),
+            TimeParams::default(),
         );
         for row in &r {
             assert!(row.value.is_finite());

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use nrs_core::{Entry, EntryId, ImpactId, RelKind, SourceId, TimeSupport, Transform};
+use nrs_core::{Entry, EntryId, ImpactId, RelKind, SourceId, TimeParams, TimeSupport, Transform};
 use nrs_entry_store::EntryStore as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -146,11 +146,44 @@ pub(super) struct ScoresQuery {
     q: String,
     offset: Option<usize>,
     limit: Option<usize>,
-    /// An earlier store generation to report rank changes against
-    /// (`delta`) -- the client passes the generation it last saw, so an
-    /// edit (an impact, a relation, `K`) shows what it moved. Only
-    /// rankings still in `ScoresCache` can be compared.
+    /// Time decorrelation overriding the stored `TimeParams` for this
+    /// view: the shared fraction `λ` and the length `L` in days.
+    shared: Option<f32>,
+    length: Option<f32>,
+    /// Another ranking to report rank changes against (`delta`): an
+    /// earlier store generation (the one the client last saw, so an edit
+    /// shows what it moved) and/or other time settings. Omitted parts
+    /// default to this view's. An earlier generation can only be compared
+    /// while its ranking is still in `ScoresCache`.
     cmp_gen: Option<u64>,
+    cmp_shared: Option<f32>,
+    cmp_length: Option<f32>,
+}
+
+/// Which ranking: a store generation under some time settings.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct ScoresKey {
+    generation: u64,
+    shared_bits: u32,
+    length_bits: u32,
+}
+
+impl ScoresKey {
+    fn time(&self) -> TimeParams {
+        TimeParams {
+            shared: f32::from_bits(self.shared_bits),
+            length_days: f32::from_bits(self.length_bits),
+        }
+    }
+}
+
+fn time_override(stored: TimeParams, shared: Option<f32>, length: Option<f32>) -> TimeParams {
+    TimeParams {
+        shared: shared.map_or(stored.shared, |v| v.clamp(0.0, 1.0)),
+        length_days: length
+            .filter(|v| *v > 0.0)
+            .unwrap_or(stored.length_days),
+    }
 }
 
 /// One entry of a full ranking; `rank` 1 is the highest V.
@@ -165,23 +198,44 @@ pub(super) struct Scored {
     rank: usize,
 }
 
-/// The last few rankings computed, one per store generation: the
-/// current one and the ones before the latest edits, to compare against.
+/// The last few rankings computed: the current one, the ones before the
+/// latest edits or time changes, and a little back-and-forth, to compare
+/// against.
 #[derive(Default)]
-pub(super) struct ScoresCache(std::sync::Mutex<Vec<(u64, Arc<Vec<Scored>>)>>);
+pub(super) struct ScoresCache(std::sync::Mutex<Vec<(ScoresKey, Arc<Vec<Scored>>)>>);
 
 const SCORES_CACHE_SIZE: usize = 4;
 
-/// A ranking and the store generation it was scored at.
-type Ranking = (u64, Arc<Vec<Scored>>);
+/// The store generation and stored time settings right now.
+fn current(state: &AppState) -> Result<(u64, TimeParams), (StatusCode, Json<ApiError>)> {
+    match &state.store {
+        Some(store) => {
+            let store = store
+                .lock()
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+            let (_, params) = store
+                .load_snapshot()
+                .map_err(|error| store_error("load params", error))?;
+            Ok((store.generation, params.time))
+        }
+        None => Ok((0, TimeParams::default())),
+    }
+}
 
-/// The full ranking at the current store generation, in rank order.
-/// Scoring every entry is the expensive part of the scores view, so
-/// rankings are cached per generation (`TrackedStore::generation`).
-fn scored(state: &AppState) -> Result<Ranking, (StatusCode, Json<ApiError>)> {
+/// A full ranking, if it could be produced.
+type MaybeRanking = Option<Arc<Vec<Scored>>>;
+
+/// The full ranking for `key`, in rank order. Scoring every entry is the
+/// expensive part of the scores view, so rankings are cached per key.
+/// Only the current generation can be scored; an earlier one is served
+/// from the cache or not at all.
+fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode, Json<ApiError>)> {
+    if let Some(hit) = cached_ranking(state, key) {
+        return Ok(Some(hit));
+    }
     let rank = |snapshot: &nrs_core::Snapshot, k_feat| -> Vec<Scored> {
         let hints = KindHints::new(snapshot);
-        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat)
+        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat, key.time())
             .into_iter()
             .enumerate()
             .map(|(index, row)| Scored {
@@ -195,41 +249,36 @@ fn scored(state: &AppState) -> Result<Ranking, (StatusCode, Json<ApiError>)> {
             })
             .collect()
     };
-
-    let (generation, ranking) = if let Some(store) = &state.store {
+    let ranking = if let Some(store) = &state.store {
         let store = store
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-        let generation = store.generation;
-        if let Some(hit) = cached_ranking(state, generation) {
-            return Ok((generation, hit));
+        if store.generation != key.generation {
+            return Ok(None);
         }
         let (snapshot, params) = store
             .load_snapshot()
             .map_err(|error| store_error("load scores", error))?;
         drop(store);
-        (generation, rank(&snapshot, params.k_feat))
+        rank(&snapshot, params.k_feat)
     } else {
-        if let Some(hit) = cached_ranking(state, 0) {
-            return Ok((0, hit));
-        }
-        (0, rank(&state.snapshot, state.snapshot.palette.k_feat.clone()))
+        rank(&state.snapshot, state.snapshot.palette.k_feat.clone())
     };
 
     let ranking = Arc::new(ranking);
     if let Ok(mut cache) = state.scores_cache.0.lock() {
-        cache.retain(|(cached, _)| *cached != generation);
-        cache.insert(0, (generation, ranking.clone()));
+        cache.retain(|(cached, _)| *cached != key);
+        cache.insert(0, (key, ranking.clone()));
         cache.truncate(SCORES_CACHE_SIZE);
     }
-    Ok((generation, ranking))
+    Ok(Some(ranking))
 }
 
-fn cached_ranking(state: &AppState, generation: u64) -> Option<Arc<Vec<Scored>>> {
+fn cached_ranking(state: &AppState, key: ScoresKey) -> Option<Arc<Vec<Scored>>> {
     let cache = state.scores_cache.0.lock().ok()?;
     cache
         .iter()
-        .find(|(cached, _)| *cached == generation)
+        .find(|(cached, _)| *cached == key)
         .map(|(_, ranking)| ranking.clone())
 }
 
@@ -237,6 +286,8 @@ fn cached_ranking(state: &AppState, generation: u64) -> Option<Arc<Vec<Scored>>>
 /// compared against (if any), and the parsed filter.
 struct ScoresView {
     generation: u64,
+    time: TimeParams,
+    stored_time: TimeParams,
     ranking: Arc<Vec<Scored>>,
     previous_rank: Option<HashMap<String, usize>>,
     filter: ScoreFilter,
@@ -255,19 +306,39 @@ pub(super) struct KindCount {
 
 impl ScoresView {
     fn new(state: &AppState, query: &ScoresQuery) -> Result<Self, (StatusCode, Json<ApiError>)> {
-        let (generation, ranking) = scored(state)?;
-        let previous_rank = query
-            .cmp_gen
-            .and_then(|cmp| cached_ranking(state, cmp))
-            .map(|previous| {
+        let (generation, stored_time) = current(state)?;
+        let time = time_override(stored_time, query.shared, query.length);
+        let key = ScoresKey {
+            generation,
+            shared_bits: time.shared.to_bits(),
+            length_bits: time.length_days.to_bits(),
+        };
+        let ranking = scored(state, key)?.ok_or_else(|| {
+            api_error(StatusCode::CONFLICT, "the store changed while scoring; retry")
+        })?;
+        let comparing =
+            query.cmp_gen.is_some() || query.cmp_shared.is_some() || query.cmp_length.is_some();
+        let previous_rank = if comparing {
+            let cmp_time = time_override(time, query.cmp_shared, query.cmp_length);
+            let cmp_key = ScoresKey {
+                generation: query.cmp_gen.unwrap_or(generation),
+                shared_bits: cmp_time.shared.to_bits(),
+                length_bits: cmp_time.length_days.to_bits(),
+            };
+            scored(state, cmp_key)?.map(|previous| {
                 previous
                     .iter()
                     .map(|row| (row.id.clone(), row.rank))
                     .collect()
-            });
+            })
+        } else {
+            None
+        };
         let filter = ScoreFilter::parse(&query.q, previous_rank.is_some());
         Ok(Self {
             generation,
+            time,
+            stored_time,
             ranking,
             previous_rank,
             filter,
@@ -410,8 +481,12 @@ pub(super) struct ScoresPage {
     /// The store generation this ranking was scored at; pass it back as
     /// `cmp_gen` after an edit to see what moved.
     generation: u64,
-    /// Whether `cmp_gen` was honoured (its ranking was still cached).
+    /// Whether the comparison was honoured (an earlier generation's
+    /// ranking may have left the cache).
     comparing: bool,
+    /// The time settings this ranking used, and the stored defaults.
+    time: TimeParams,
+    stored_time: TimeParams,
     /// Rows matching `q`.
     total: usize,
     database_total: usize,
@@ -456,6 +531,8 @@ pub(super) async fn scores(
         rows,
         generation: view.generation,
         comparing: view.previous_rank.is_some(),
+        time: view.time,
+        stored_time: view.stored_time,
         total,
         database_total: view.ranking.len(),
         offset,
@@ -755,6 +832,41 @@ pub(super) struct KfeatUpdate {
     value: f32,
 }
 
+#[derive(Deserialize)]
+pub(super) struct TimeUpdate {
+    shared: f32,
+    length_days: f32,
+}
+
+/// Stores new default time settings.
+pub(super) async fn time_set(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<TimeUpdate>,
+) -> ApiResult<MutationResponse> {
+    if !((0.0..=1.0).contains(&update.shared) && update.length_days > 0.0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "time needs shared in [0, 1] and length_days > 0",
+        ));
+    }
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "time settings require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    store
+        .set_time_params(&TimeParams {
+            shared: update.shared,
+            length_days: update.length_days,
+        })
+        .map_err(|error| store_error("save time settings", error))?;
+    Ok(Json(MutationResponse { ok: true, id: None }))
+}
+
 pub(super) async fn kfeat_set(
     State(state): State<Arc<AppState>>,
     Json(update): Json<KfeatUpdate>,
@@ -1030,6 +1142,7 @@ fn section_name(section: ImpactSection) -> &'static str {
 fn time_value(time: TimeSupport) -> Value {
     match time {
         TimeSupport::Moment => json!({ "type": "moment" }),
+        TimeSupport::Interval { from, to } => json!({ "type": "interval", "from": from, "to": to }),
         TimeSupport::Tail {
             peak,
             lambda,
@@ -1373,6 +1486,11 @@ fn prepare_impact(
     fields.insert("source".into(), source.clone());
     let mut atoms = build_impact_atoms(&kind, SourceId(source), &fields)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    if matches!(kind.as_str(), "pads" | "waifu" | "meme") {
+        if let (Some(from), Some(to)) = (fields.get("period_from"), fields.get("period_to")) {
+            atoms = nrs_import::dated(atoms, from, to);
+        }
+    }
     let factor = dah_factor_field(&fields);
     for atom in &mut atoms {
         atom.magnitude *= factor;
@@ -1762,6 +1880,22 @@ mod tests {
         .unwrap()
         .0;
         assert!(compared.rows.iter().all(|row| row.delta == Some(0)));
+
+        // Time settings override the stored defaults per view, and can be
+        // compared against each other.
+        let knobs = page(ScoresQuery {
+            shared: Some(1.0),
+            length: Some(90.0),
+            cmp_shared: Some(0.5),
+            ..Default::default()
+        })
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert_eq!((knobs.time.shared, knobs.time.length_days), (1.0, 90.0));
+        assert_eq!(knobs.stored_time, TimeParams::default());
+        assert!(knobs.comparing);
 
         // A filtered view ranks its matches 1..N, keeping the overall
         // rank alongside.
