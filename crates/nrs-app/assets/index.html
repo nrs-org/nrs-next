@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>NRS client</title>
+    <link rel="stylesheet" href="/app.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <aside class="rail">
+      <a class="brand" href="/" data-link>NRS</a>
+      <p class="brand-subtitle">specimen ledger</p>
+      <nav>
+        <a href="/" data-link data-nav="scores">scores</a>
+        <a href="/palette" data-link data-nav="palette">palette</a>
+        <a href="/calibrate" data-link data-nav="calibrate">calibrate</a>
+        <a href="/kfeat" data-link data-nav="kfeat">k_feat</a>
+        <a href="/review" data-link data-nav="review">review</a>
+        <a href="/entries" data-link data-nav="entries">entries</a>
+      </nav>
+    </aside>
+    <main id="app" tabindex="-1" aria-live="polite">
+      <div class="loading">Loading…</div>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

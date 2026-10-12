@@ -1,45 +1,83 @@
-//! A tiny local server for browsing scores over a real `nrsml`
-//! dataset — the "just let me look at this without needing a
-//! spreadsheet app" tool. Loads + scores the dataset once at
-//! startup and caches the resulting `Snapshot`; each request just
-//! re-runs `nrs_core::score()` (cheap at this scale, since the whole
-//! document is a few thousand atoms), so the `q` (redundancy
-//! exponent) box on the page reruns live.
+//! A local server for browsing and curating a real `nrsml`/`nrs.db`
+//! dataset -- the "just let me look at this without needing a
+//! spreadsheet app" tool, in `.db` mode also the write surface for
+//! everything CRUD (INFRA.md roadmap phase 5).
 //!
-//! No calibration/fitting exists yet (`nrs-fit`, INFRA.md roadmap
-//! phase 6), so what's shown is the raw `V` value from the
-//! redundancy functional, not a calibrated public score — labelled
-//! honestly as "V (raw)" rather than "Score".
+//! What's shown is the raw `V` value from the redundancy functional,
+//! not a calibrated public score -- labelled honestly as "V (raw)"
+//! rather than "Score".
 //!
 //! Usage: `cargo run -p nrs-app -- /path/to/NRSImplMain.xml [port]`
-//! or `cargo run -p nrs-app -- /path/to/nrs.db [port]` (a path
-//! ending in `.db` loads via `nrs-store` instead of re-parsing XML;
-//! CRUD against it is a later pass, INFRA.md roadmap phase 5 — this
-//! only reads).
+//! or `cargo run -p nrs-app -- /path/to/nrs.db [port]` (a path ending
+//! in `.db` loads via `nrs-store` instead of re-parsing XML; write
+//! routes need this mode).
+//!
+//! Frontend: the dependency-free client app (plain HTML, CSS, and
+//! native ES modules in `assets/`) is served at `/`, backed by the JSON
+//! API under `/api/v1`.
 
-use std::fmt::Write as _;
+mod api;
+mod score_filter;
+
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Form, Path, Query, State};
-use axum::http::header;
-use axum::response::{Html, IntoResponse, Redirect};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::{get, post, put};
+use axum::Router;
 use nrs_core::{
-    AnchorId, Atom, EntryId, Homogeneity, ImpactId, Isotonic, KFeatMatrix, KSrcLevels, Params,
-    RelationScaling, Snapshot, SourceId, TimeSupport,
+    AnchorId, Atom, Entry, EntryId, Homogeneity, Isotonic, KFeatMatrix, KSrcLevels, Params,
+    RelKind, RelationScaling, Snapshot, SourceId,
 };
+use nrs_entry_store::HttpEntryStore;
 use nrs_store::Store;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use tower_http::services::{ServeDir, ServeFile};
 
 struct AppState {
     snapshot: Snapshot,
-    warnings: Vec<String>,
-    /// Only set when launched against a `.db` path — the calibration UI
-    /// (INFRA.md roadmap phase 6) needs write access, which the
-    /// read-only XML-mode doesn't have.
-    store: Option<Mutex<Store>>,
+    /// Only set when launched against a `.db` path -- writes need the
+    /// store, which the read-only XML-mode doesn't have.
+    store: Option<Mutex<TrackedStore>>,
+    anime_store: HttpEntryStore,
+    /// Recently scored rankings, so paging and re-sorting the scores
+    /// table don't re-run the whole functional (see `api::scored`).
+    scores_cache: api::ScoresCache,
+    /// `KindHints` as of a store generation (see `api::kind_hints`).
+    kind_hints: Mutex<Option<(u64, Arc<KindHints>)>>,
+}
+
+/// The store plus a count of its writes. Every `Store` write takes
+/// `&mut self` and every read `&self`, so bumping on `DerefMut` counts
+/// writes without each handler having to remember to -- anything
+/// cached from the store keys on `generation` to know it's stale.
+struct TrackedStore {
+    store: Store,
+    generation: u64,
+}
+
+impl TrackedStore {
+    fn new(store: Store) -> Self {
+        Self {
+            store,
+            generation: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for TrackedStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for TrackedStore {
+    fn deref_mut(&mut self) -> &mut Store {
+        self.generation += 1;
+        &mut self.store
+    }
 }
 
 #[tokio::main]
@@ -101,28 +139,71 @@ async fn main() {
         warnings.len()
     );
     if store.is_none() {
-        eprintln!("(read-only XML mode -- /calibrate needs a .db path)");
+        eprintln!("(read-only XML mode -- write routes need a .db path)");
     }
+
+    let anime_store_url =
+        std::env::var("NRS_ANIME_STORE_URL").unwrap_or_else(|_| "http://127.0.0.1:3738".into());
+    let anime_store = match HttpEntryStore::new(&anime_store_url) {
+        Ok(store) => store.expecting_store("anime"),
+        Err(error) => {
+            eprintln!("invalid NRS_ANIME_STORE_URL: {error}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("anime entry store: {anime_store_url}");
 
     let state = Arc::new(AppState {
         snapshot,
-        warnings,
-        store: store.map(Mutex::new),
+        store: store.map(|store| Mutex::new(TrackedStore::new(store))),
+        anime_store,
+        scores_cache: Default::default(),
+        kind_hints: Default::default(),
     });
+    let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
+    let api = Router::new()
+        .route("/scores", get(api::scores))
+        .route("/scores.csv", get(api::scores_csv))
+        .route("/palette", get(api::palette))
+        .route(
+            "/calibration/pair",
+            get(api::calibration_get).post(api::calibration_vote),
+        )
+        .route(
+            "/calibration/kfeat",
+            get(api::kfeat_get).put(api::kfeat_set),
+        )
+        .route("/review", get(api::review_queue))
+        .route("/entries", get(api::entries_index))
+        .route("/entries/ingest", post(api::entry_ingest))
+        .route("/entries/{entry_id}", get(api::entry_detail))
+        .route("/entries/{entry_id}/impacts", post(api::impact_add))
+        .route(
+            "/entries/{entry_id}/impacts/{impact_id}",
+            put(api::impact_edit).delete(api::impact_delete),
+        )
+        .route(
+            "/entries/{entry_id}/impacts/{impact_id}/confirm",
+            post(api::impact_confirm),
+        )
+        .route(
+            "/entries/{entry_id}/impacts/{impact_id}/raw",
+            put(api::impact_raw_edit),
+        )
+        .route("/entries/{entry_id}/relations", post(api::relation_add))
+        .route(
+            "/entries/{entry_id}/relations/{relation_id}",
+            put(api::relation_edit).delete(api::relation_delete),
+        )
+        .fallback(api::not_found);
+    // Everything outside `/api/v1` is the client app: real files are
+    // served as-is, any other path gets `index.html` so client-side
+    // routes survive a reload.
     let app = Router::new()
-        .route("/", get(index))
-        .route("/scores.csv", get(scores_csv))
-        .route("/scores.json", get(scores_json))
-        .route("/calibrate", get(calibrate))
-        .route("/calibrate/vote", post(calibrate_vote))
-        .route("/calibrate/fit", get(calibrate_fit))
-        .route("/calibrate/fit/save", post(calibrate_fit_save))
-        .route("/calibrate/kfeat", get(calibrate_kfeat))
-        .route("/calibrate/kfeat/set", post(calibrate_kfeat_set))
-        .route("/review", get(review_index))
-        .route("/review/{entry_id}", get(review_entry))
-        .route("/review/{entry_id}/confirm", post(review_confirm))
-        .route("/review/{entry_id}/save", post(review_save))
+        .nest("/api/v1", api)
+        .fallback_service(
+            ServeDir::new(assets_dir).fallback(ServeFile::new(format!("{assets_dir}/index.html"))),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -131,48 +212,16 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-#[derive(Deserialize)]
-struct ViewParams {
-    #[serde(default = "default_q")]
-    q: f32,
-    #[serde(default)]
-    sort: SortBy,
-    #[serde(default)]
-    dir: SortDir,
-    #[serde(default)]
-    rel: RelScaling,
-    #[serde(default)]
-    mode: Mode,
-    #[serde(default = "default_beta")]
-    beta: f32,
-}
+// ---------------------------------------------------------------
+// Scores.
+// ---------------------------------------------------------------
 
-fn default_q() -> f32 {
-    0.6
-}
-
-fn default_beta() -> f32 {
-    2.0
-}
-
-/// Which redundancy functional to score with. `q` still applies under
-/// both (it drives the relation borrow-solve, and is `DegreeQ`'s
-/// exponent); `beta` only bites under `Spectral`.
+/// Which supported redundancy functional to score with.
 #[derive(Deserialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Mode {
     #[default]
-    Degreeq,
-    Spectral,
-}
-
-impl Mode {
-    fn name(self) -> &'static str {
-        match self {
-            Mode::Degreeq => "degreeq",
-            Mode::Spectral => "spectral",
-        }
-    }
+    Credit,
 }
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq)]
@@ -209,44 +258,25 @@ impl RelScaling {
             RelScaling::Powq => RelationScaling::PowQ,
         }
     }
-    fn name(self) -> &'static str {
-        match self {
-            RelScaling::Fixed => "fixed",
-            RelScaling::Powq => "powq",
-        }
-    }
 }
 
-fn params(rel: RelScaling, mode: Mode, beta: f32, k_feat: KFeatMatrix) -> Params {
+fn params(rel: RelScaling, mode: Mode, slope: f32, k_feat: KFeatMatrix) -> Params {
     let homogeneity = match mode {
-        Mode::Degreeq => Homogeneity::DegreeQ,
-        Mode::Spectral => Homogeneity::Spectral {
-            beta: beta.clamp(1e-3, 1e6),
+        Mode::Credit => Homogeneity::Credit {
+            slope: slope.clamp(0.0, 1.0),
         },
     };
     Params {
+        // Credit scoring currently does not use q; powq uses this fixed
+        // value when adjusting diluted relation weights.
         q: 0.6,
         k_src_levels: KSrcLevels {
-            levels: [0.95, 0.5, 0.3, 0.15, 0.0],
+            levels: [0.5, 0.3, 0.15, 0.0, 0.0],
         },
         k_feat,
         homogeneity,
         calibration: Isotonic::default(),
         relation_scaling: rel.to_core(),
-    }
-}
-
-/// The live `k_feat` calibrated via `/calibrate/kfeat`, when running
-/// against a `.db` -- otherwise the identity default. Without this, the
-/// scores view would be completely blind to anything calibrated there.
-fn live_k_feat(state: &AppState) -> KFeatMatrix {
-    let Some(store_lock) = &state.store else {
-        return KFeatMatrix::default();
-    };
-    let store = store_lock.lock().unwrap();
-    match store.load_snapshot() {
-        Ok((_, params)) => params.k_feat,
-        Err(_) => KFeatMatrix::default(),
     }
 }
 
@@ -260,16 +290,14 @@ struct Row<'a> {
 #[allow(clippy::too_many_arguments)] // one flat view-state struct's worth of knobs
 fn rows(
     snapshot: &Snapshot,
-    q: f32,
     sort: SortBy,
     dir: SortDir,
     rel: RelScaling,
     mode: Mode,
-    beta: f32,
+    slope: f32,
     k_feat: KFeatMatrix,
 ) -> Vec<Row<'_>> {
-    let mut p = params(rel, mode, beta, k_feat);
-    p.q = q.clamp(0.001, 4.0);
+    let p = params(rel, mode, slope, k_feat);
     let scores = nrs_core::score(snapshot, &p);
 
     let mut rows: Vec<Row> = snapshot
@@ -297,434 +325,13 @@ fn rows(
     rows
 }
 
-async fn index(
-    State(state): State<Arc<AppState>>,
-    Query(view): Query<ViewParams>,
-) -> impl IntoResponse {
-    let k_feat = live_k_feat(&state);
-    let rows = rows(
-        &state.snapshot,
-        view.q,
-        view.sort,
-        view.dir,
-        view.rel,
-        view.mode,
-        view.beta,
-        k_feat,
-    );
-
-    let mut body = String::new();
-    write!(
-        body,
-        r#"<!doctype html><html><head><meta charset="utf-8">
-<title>nrs scores</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.css">
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }}
-  h1 {{ font-size: 1.3rem; }}
-  .meta {{ color: #888; font-size: 0.85rem; margin-bottom: 1rem; }}
-  form {{ margin-bottom: 1rem; display: flex; gap: 0.5rem; align-items: center; }}
-  #grid {{ width: 100%; }}
-</style></head><body>
-<h1>nrs scores</h1>
-<div class="meta">{} entries · {} warnings during import · uncalibrated (raw <em>V</em>, not a public score) · <a href="/scores.csv?q={}&rel={}&mode={}&beta={}">download CSV</a> · <a href="/calibrate">calibrate</a></div>
-<form method="get">
-  <label>mode:
-    <select name="mode">
-      <option value="degreeq" {}>degreeq (V = &Sigma; m&middot;c^(q-1))</option>
-      <option value="spectral" {}>spectral (V = &Sigma; &beta;&middot;ln(1+&sigma;/&beta;), monotone)</option>
-    </select>
-  </label>
-  <label>q (redundancy exponent): <input type="number" name="q" value="{}" step="any" min="0.001" max="4"></label>
-  <label>&beta; (spectral saturation): <input type="number" name="beta" value="{}" step="any" min="0.001"></label>
-  <label>relation scaling:
-    <select name="rel">
-      <option value="fixed" {}>fixed (spec default)</option>
-      <option value="powq" {}>powq (w^(1/q), dampens diluted relations at low q)</option>
-    </select>
-  </label>
-  <input type="hidden" name="sort" value="{}">
-  <input type="hidden" name="dir" value="{}">
-  <button type="submit">rerun</button>
-</form>
-<div id="grid"></div>
-<script src="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.js"></script>
-<script>
-  fetch('/scores.json' + location.search)
-    .then(function (r) {{ return r.json(); }})
-    .then(function (data) {{
-      new Handsontable(document.getElementById('grid'), {{
-        data: data,
-        colHeaders: ['id', 'title', 'store', 'V (raw)'],
-        columns: [
-          {{ data: 'id' }},
-          {{ data: 'title' }},
-          {{ data: 'store' }},
-          {{ data: 'value', type: 'numeric', numericFormat: {{ pattern: '0.0000' }} }},
-        ],
-        columnSorting: true,
-        filters: true,
-        dropdownMenu: true,
-        stretchH: 'all',
-        height: 600,
-        rowHeaders: true,
-        licenseKey: 'non-commercial-and-evaluation',
-      }});
-    }});
-</script>
-</body></html>
-"#,
-        rows.len(),
-        state.warnings.len(),
-        view.q,
-        view.rel.name(),
-        view.mode.name(),
-        view.beta,
-        if view.mode == Mode::Degreeq { "selected" } else { "" },
-        if view.mode == Mode::Spectral { "selected" } else { "" },
-        view.q,
-        view.beta,
-        if view.rel == RelScaling::Fixed { "selected" } else { "" },
-        if view.rel == RelScaling::Powq { "selected" } else { "" },
-        sort_by_name(view.sort),
-        sort_dir_name(view.dir),
-    )
-    .unwrap();
-
-    Html(body)
-}
-
-fn sort_by_name(s: SortBy) -> &'static str {
-    match s {
-        SortBy::Value => "value",
-        SortBy::Title => "title",
-        SortBy::Id => "id",
-    }
-}
-fn sort_dir_name(d: SortDir) -> &'static str {
-    match d {
-        SortDir::Desc => "desc",
-        SortDir::Asc => "asc",
-    }
-}
-
 fn csv_field(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-async fn scores_csv(
-    State(state): State<Arc<AppState>>,
-    Query(view): Query<ViewParams>,
-) -> impl IntoResponse {
-    let k_feat = live_k_feat(&state);
-    let rows = rows(
-        &state.snapshot,
-        view.q,
-        view.sort,
-        view.dir,
-        view.rel,
-        view.mode,
-        view.beta,
-        k_feat,
-    );
-
-    let mut csv = String::from("id,title,store,value\n");
-    for row in &rows {
-        writeln!(
-            csv,
-            "{},{},{},{:.6}",
-            csv_field(&row.id.0),
-            csv_field(row.title),
-            csv_field(row.store),
-            row.value
-        )
-        .unwrap();
-    }
-
-    (
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"scores.csv\"",
-            ),
-        ],
-        csv,
-    )
-}
-
-#[derive(Serialize)]
-struct RowJson {
-    id: String,
-    title: String,
-    store: String,
-    value: f32,
-}
-
-async fn scores_json(
-    State(state): State<Arc<AppState>>,
-    Query(view): Query<ViewParams>,
-) -> impl IntoResponse {
-    let k_feat = live_k_feat(&state);
-    let rows = rows(
-        &state.snapshot,
-        view.q,
-        view.sort,
-        view.dir,
-        view.rel,
-        view.mode,
-        view.beta,
-        k_feat,
-    );
-
-    Json(
-        rows.iter()
-            .map(|row| RowJson {
-                id: row.id.0.clone(),
-                title: row.title.to_string(),
-                store: row.store.to_string(),
-                value: row.value,
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn no_store_message() -> String {
-    "<!doctype html><p>calibration needs write access -- launch <code>nrs-app</code> against a \
-     <code>.db</code> path instead of XML.</p>"
-        .to_string()
-}
-
-fn page_shell(title: &str, body: &str) -> String {
-    format!(
-        r#"<!doctype html><html><head><meta charset="utf-8">
-<title>{title}</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; }}
-  nav a {{ margin-right: 1rem; }}
-  .pair {{ display: flex; gap: 1rem; margin: 1.5rem 0; }}
-  .pair form {{ flex: 1; border: 1px solid #8884; border-radius: 6px; padding: 1rem; text-align: center; }}
-  .pair button {{ width: 100%; padding: 0.75rem; font-size: 1rem; }}
-  .value {{ color: #888; font-size: 0.85rem; }}
-  dl {{ display: grid; grid-template-columns: max-content auto; gap: 0.25rem 1rem; }}
-  .kfeat-grid {{ display: flex; flex-direction: column; gap: 0.3rem; }}
-  .kfeat-row {{ display: flex; align-items: center; gap: 0.5rem; }}
-  .kfeat-row input[type="number"] {{ width: 5rem; }}
-  .impact {{ border: 1px solid #8884; border-radius: 6px; padding: 1rem; margin: 1rem 0; }}
-  .impact .flagged {{ color: #e08; font-weight: bold; }}
-  .impact .hint {{ color: #888; font-size: 0.85rem; margin: 0.25rem 0; }}
-  .impact textarea {{ width: 100%; box-sizing: border-box; font-family: inherit; }}
-  .chip-row {{ display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.5rem 0; }}
-  .chip-row form {{ display: inline; }}
-  .chip {{ border: 1px solid #8884; border-radius: 999px; padding: 0.2rem 0.6rem; font-size: 0.85rem; cursor: pointer; background: none; }}
-  .chip.remove {{ background: #e0808020; }}
-  .chip.add {{ background: #80e08020; }}
-  .raw-atom {{ font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; }}
-</style></head><body>
-<nav><a href="/">scores</a><a href="/calibrate">calibrate</a><a href="/calibrate/fit">run fit</a><a href="/calibrate/kfeat">k_feat</a><a href="/review">review</a></nav>
-{body}
-</body></html>
-"#
-    )
-}
-
-/// A random pair for the calibrate page's "which is better" vote
-/// (INFRA.md §8's "corrections" -- v1 doesn't try to pick an
-/// informative pair, just two distinct entries).
-async fn calibrate(State(state): State<Arc<AppState>>) -> Html<String> {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message());
-    };
-    if state.snapshot.entries.len() < 2 {
-        return Html(page_shell(
-            "nrs calibrate",
-            "<p>need at least two entries to compare.</p>",
-        ));
-    }
-
-    let live_params = {
-        let store = store_lock.lock().unwrap();
-        match store.load_snapshot() {
-            Ok((_, params)) => params,
-            Err(e) => {
-                return Html(page_shell(
-                    "nrs calibrate",
-                    &format!("<p>failed to load params: {e}</p>"),
-                ))
-            }
-        }
-    };
-    let scores = nrs_core::score(&state.snapshot, &live_params);
-
-    let n = state.snapshot.entries.len();
-    let mut rng = rand::rng();
-    let idx_a = rand::Rng::random_range(&mut rng, 0..n);
-    let mut idx_b = rand::Rng::random_range(&mut rng, 0..n);
-    while idx_b == idx_a {
-        idx_b = rand::Rng::random_range(&mut rng, 0..n);
-    }
-    let a = &state.snapshot.entries[idx_a];
-    let b = &state.snapshot.entries[idx_b];
-    let value_a = scores.values.get(&a.id).copied().unwrap_or(0.0);
-    let value_b = scores.values.get(&b.id).copied().unwrap_or(0.0);
-
-    let body = format!(
-        r#"<h1>calibrate</h1>
-<p>Which of these do you actually think is better?</p>
-<div class="pair">
-  <form method="post" action="/calibrate/vote">
-    <input type="hidden" name="winner" value="{a_id}">
-    <input type="hidden" name="loser" value="{b_id}">
-    <button type="submit">{a_title}</button>
-    <div class="value">current V: {value_a:.3}</div>
-  </form>
-  <form method="post" action="/calibrate/vote">
-    <input type="hidden" name="winner" value="{b_id}">
-    <input type="hidden" name="loser" value="{a_id}">
-    <button type="submit">{b_title}</button>
-    <div class="value">current V: {value_b:.3}</div>
-  </form>
-</div>
-"#,
-        a_id = html_escape(&a.id.0),
-        b_id = html_escape(&b.id.0),
-        a_title = html_escape(a.title_cache.as_deref().unwrap_or(&a.id.0)),
-        b_title = html_escape(b.title_cache.as_deref().unwrap_or(&b.id.0)),
-    );
-    Html(page_shell("nrs calibrate", &body))
-}
-
-#[derive(Deserialize)]
-struct VoteForm {
-    winner: String,
-    loser: String,
-}
-
-async fn calibrate_vote(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<VoteForm>,
-) -> impl IntoResponse {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message()).into_response();
-    };
-    let winner = EntryId(form.winner);
-    let loser = EntryId(form.loser);
-    let mut store = store_lock.lock().unwrap();
-    if let Err(e) = store.record_preference(&winner, &loser, None) {
-        return Html(page_shell(
-            "nrs calibrate",
-            &format!("<p>failed to record: {e}</p>"),
-        ))
-        .into_response();
-    }
-    drop(store);
-    Redirect::to("/calibrate").into_response()
-}
-
-async fn calibrate_fit(State(state): State<Arc<AppState>>) -> Html<String> {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message());
-    };
-    let store = store_lock.lock().unwrap();
-    let (_, prior) = match store.load_snapshot() {
-        Ok(pair) => pair,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs fit",
-                &format!("<p>failed to load: {e}</p>"),
-            ))
-        }
-    };
-    let preferences = match store.load_preferences() {
-        Ok(p) => p,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs fit",
-                &format!("<p>failed to load preferences: {e}</p>"),
-            ))
-        }
-    };
-    drop(store);
-
-    let result = nrs_fit::fit(&state.snapshot, &prior, &preferences);
-    let prior_beta = match prior.homogeneity {
-        Homogeneity::Spectral { beta } => format!("{beta:.4}"),
-        _ => "n/a (prior isn't spectral)".to_string(),
-    };
-
-    let body = format!(
-        r#"<h1>fit</h1>
-<dl>
-  <dt>preferences recorded</dt><dd>{n_preferences}</dd>
-  <dt>prior beta</dt><dd>{prior_beta}</dd>
-  <dt>fitted beta</dt><dd>{fitted_beta:.4}</dd>
-  <dt>loss</dt><dd>{loss:.6}</dd>
-  <dt>violations</dt><dd>{violations} / {n_preferences}</dd>
-</dl>
-<form method="post" action="/calibrate/fit/save">
-  <button type="submit">save fitted beta</button>
-</form>
-"#,
-        n_preferences = preferences.len(),
-        fitted_beta = result.beta,
-        loss = result.loss,
-        violations = result.violations,
-    );
-    Html(page_shell("nrs fit", &body))
-}
-
-async fn calibrate_fit_save(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message()).into_response();
-    };
-    let mut store = store_lock.lock().unwrap();
-    let (_, prior) = match store.load_snapshot() {
-        Ok(pair) => pair,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs fit",
-                &format!("<p>failed to load: {e}</p>"),
-            ))
-            .into_response()
-        }
-    };
-    let preferences = match store.load_preferences() {
-        Ok(p) => p,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs fit",
-                &format!("<p>failed to load preferences: {e}</p>"),
-            ))
-            .into_response()
-        }
-    };
-
-    let result = nrs_fit::fit(&state.snapshot, &prior, &preferences);
-    let params = &result.params;
-    if let Err(e) = store.set_params(
-        params.q,
-        params.k_src_levels,
-        params.homogeneity,
-        params.relation_scaling,
-    ) {
-        return Html(page_shell(
-            "nrs fit",
-            &format!("<p>failed to save: {e}</p>"),
-        ))
-        .into_response();
-    }
-    drop(store);
-    Redirect::to("/calibrate/fit").into_response()
-}
+// ---------------------------------------------------------------
+// Palette and calibration.
+// ---------------------------------------------------------------
 
 /// Every distinct anchor actually used by some atom's blend in
 /// `snapshot` -- `Palette.anchors` isn't populated by `nrs-import` yet,
@@ -741,456 +348,749 @@ fn used_anchors(snapshot: &Snapshot) -> Vec<AnchorId> {
     set.into_iter().collect()
 }
 
-/// `k_feat` is directly interpretable (unlike `beta`), so this skips
-/// `nrs-fit` entirely: pick two anchors, say how redundant they feel,
-/// write straight into `k_feat` via the existing `set_kfeat_pair`.
-async fn calibrate_kfeat(State(state): State<Arc<AppState>>) -> Html<String> {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message());
-    };
-    let k_feat = {
-        let store = store_lock.lock().unwrap();
-        match store.load_snapshot() {
-            Ok((_, params)) => params.k_feat,
-            Err(e) => {
-                return Html(page_shell(
-                    "nrs k_feat",
-                    &format!("<p>failed to load: {e}</p>"),
-                ))
-            }
+// ---------------------------------------------------------------
+// Impact presentation (entry page and review queue).
+// ---------------------------------------------------------------
+
+/// Human-facing identity for an impact kind. The acronym is useful to
+/// long-time NRS users, but it is never left to stand on its own: the
+/// title and one-line explanation make the old vocabulary readable to
+/// somebody who did not memorize DAH_standards.
+fn impact_kind_presentation(kind: Option<&str>) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        Some("cry") => (
+            "response",
+            "Cry response",
+            "A moment strong enough to provoke tears.",
+        ),
+        Some("nei") => (
+            "response",
+            "Noticeable emotional impact",
+            "A feeling that registered clearly in the moment.",
+        ),
+        Some("aei") => (
+            "response",
+            "Appreciable emotional impact",
+            "A substantial emotional response with real weight.",
+        ),
+        Some("ehi") => (
+            "highlight",
+            "Exceptional humor impact",
+            "A standout comic moment rather than general amusement.",
+        ),
+        Some("epi") => (
+            "highlight",
+            "Exceptional plot impact",
+            "A standout story or revelation moment.",
+        ),
+        Some("pads") => (
+            "response",
+            "Persistent aftereffect",
+            "An emotional aftereffect that continued beyond the work.",
+        ),
+        Some("jumpscare") => ("response", "Jumpscare", "A sharp startle response."),
+        Some("sleepless_night") => (
+            "response",
+            "Sleepless night",
+            "Impact strong enough to disrupt sleep.",
+        ),
+        Some("politics") => ("personal", "Politics", "A political or worldview impact."),
+        Some("interest_field") => (
+            "personal",
+            "Interest gateway",
+            "Opened or deepened a real-world field of interest.",
+        ),
+        Some("additional") => (
+            "adjustment",
+            "Manual adjustment",
+            "An explicit score buff or nerf.",
+        ),
+        Some("music") => (
+            "craft",
+            "Music craft",
+            "Direct judgment of the work's music.",
+        ),
+        Some("visual") => (
+            "craft",
+            "Visual craft",
+            "Direct judgment of visual execution.",
+        ),
+        Some("writing") => (
+            "craft",
+            "Writing craft",
+            "Character, story, pacing, and originality.",
+        ),
+        Some("osu_song") => (
+            "personal",
+            "osu! song",
+            "Personal and community rhythm-game impact.",
+        ),
+        Some("waifu") => (
+            "personal",
+            "Character attachment",
+            "Sustained attachment to a character.",
+        ),
+        Some("meme") => (
+            "personal",
+            "Meme impact",
+            "A joke or reference that persisted socially.",
+        ),
+        Some("consumed") => ("progress", "Consumed", "Time spent, adjusted for boredom."),
+        Some("anime_consumed") => (
+            "progress",
+            "Anime consumed",
+            "Episode watch time, adjusted for boredom.",
+        ),
+        Some("dropped") => ("progress", "Dropped", "The work was abandoned."),
+        Some("music_consumed_progress") => (
+            "progress",
+            "Music consumed",
+            "Time spent listening to the music.",
+        ),
+        Some(_) => ("other", "Other impact", "A standards-based impact."),
+        None => (
+            "custom",
+            "Custom anchor impact",
+            "A directly authored anchor composition.",
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImpactSection {
+    Profile,
+    Responses,
+    Resonance,
+    Adjustments,
+    Other,
+}
+
+fn impact_section(kind: Option<&str>) -> ImpactSection {
+    match kind {
+        Some(
+            "music"
+            | "visual"
+            | "writing"
+            | "consumed"
+            | "anime_consumed"
+            | "music_consumed_progress"
+            | "dropped",
+        ) => ImpactSection::Profile,
+        Some("cry" | "nei" | "aei" | "ehi" | "epi" | "pads" | "jumpscare" | "sleepless_night") => {
+            ImpactSection::Responses
         }
-    };
-
-    let anchors = used_anchors(&state.snapshot);
-    if anchors.len() < 2 {
-        return Html(page_shell(
-            "nrs k_feat",
-            "<p>need at least two anchors in use to compare.</p>",
-        ));
-    }
-
-    let mut rows = String::new();
-    for i in 0..anchors.len() {
-        for j in (i + 1)..anchors.len() {
-            let a = &anchors[i];
-            let b = &anchors[j];
-            let current = k_feat.get(a, b);
-            write!(
-                rows,
-                r#"<form method="post" action="/calibrate/kfeat/set" class="kfeat-row">
-  <span>{a_label}</span> &harr; <span>{b_label}</span>
-  <input type="hidden" name="a" value="{a_val}">
-  <input type="hidden" name="b" value="{b_val}">
-  <input type="number" name="k" value="{current}" step="0.05" min="0" max="1">
-  <button type="submit">save</button>
-</form>
-"#,
-                a_label = html_escape(&a.0),
-                b_label = html_escape(&b.0),
-                a_val = html_escape(&a.0),
-                b_val = html_escape(&b.0),
-            )
-            .unwrap();
+        Some("politics" | "interest_field" | "osu_song" | "waifu" | "meme") => {
+            ImpactSection::Resonance
         }
+        Some("additional") => ImpactSection::Adjustments,
+        _ => ImpactSection::Other,
     }
-
-    let body = format!(
-        r#"<h1>k_feat</h1>
-<p>How redundant does each anchor pair feel? 0 = unrelated, 1 = fully redundant
-(the same signal counted twice).</p>
-<div class="kfeat-grid">
-{rows}</div>
-"#
-    );
-    Html(page_shell("nrs k_feat", &body))
 }
 
-#[derive(Deserialize)]
-struct KfeatForm {
-    a: String,
-    b: String,
-    k: f32,
-}
-
-async fn calibrate_kfeat_set(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<KfeatForm>,
-) -> impl IntoResponse {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message()).into_response();
+fn format_duration_minutes(value: &str) -> String {
+    let Some(minutes) = value
+        .parse::<f64>()
+        .ok()
+        .filter(|minutes| minutes.is_finite() && *minutes >= 0.0)
+    else {
+        return value.to_string();
     };
-    let mut store = store_lock.lock().unwrap();
-    if let Err(e) =
-        store.set_kfeat_pair(&AnchorId(form.a), &AnchorId(form.b), form.k.clamp(0.0, 1.0))
-    {
-        return Html(page_shell(
-            "nrs k_feat",
-            &format!("<p>failed to save: {e}</p>"),
-        ))
-        .into_response();
-    }
-    drop(store);
-    Redirect::to("/calibrate/kfeat").into_response()
-}
-
-/// The full 18-anchor palette (`nrs-import`'s `anchors` module is the
-/// source of truth) -- the "+anchor" quick-add buttons on the review
-/// page offer all of them rather than trying to guess plausible
-/// alternatives from which raw legacy box an impact came from, since
-/// that provenance isn't threaded past `nrs-import` today.
-fn all_anchors() -> Vec<AnchorId> {
-    vec![
-        nrs_import::anchors::comedy(),
-        nrs_import::anchors::hype(),
-        nrs_import::anchors::tragedy(),
-        nrs_import::anchors::wistful(),
-        nrs_import::anchors::cozy(),
-        nrs_import::anchors::heartwarming(),
-        nrs_import::anchors::hate(),
-        nrs_import::anchors::discomfort(),
-        nrs_import::anchors::waifu(),
-        nrs_import::anchors::meme(),
-        nrs_import::anchors::hooked(),
-        nrs_import::anchors::worldview(),
-        nrs_import::anchors::gateway(),
-        nrs_import::anchors::writing(),
-        nrs_import::anchors::visual(),
-        nrs_import::anchors::music(),
-        nrs_import::anchors::boredom(),
-        nrs_import::anchors::additional(),
-    ]
-}
-
-async fn review_index(State(state): State<Arc<AppState>>) -> Html<String> {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message());
-    };
-    let store = store_lock.lock().unwrap();
-    let flagged = match store.entries_needing_review() {
-        Ok(f) => f,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs review",
-                &format!("<p>failed to load review queue: {e}</p>"),
-            ))
-        }
-    };
-    drop(store);
-
-    if flagged.is_empty() {
-        return Html(page_shell(
-            "nrs review",
-            "<h1>review queue</h1><p>nothing left to review.</p>",
-        ));
-    }
-
-    let mut items = String::new();
-    for id in &flagged {
-        let title = state
-            .snapshot
-            .entries
-            .iter()
-            .find(|e| &e.id == id)
-            .and_then(|e| e.title_cache.as_deref())
-            .unwrap_or(&id.0);
-        write!(
-            items,
-            r#"<li><a href="/review/{href}">{title}</a></li>"#,
-            href = html_escape(&id.0),
-            title = html_escape(title),
-        )
-        .unwrap();
-    }
-
-    let body = format!(
-        "<h1>review queue</h1>\n<p>{} entries with something left to confirm.</p>\n<ul>{items}</ul>",
-        flagged.len()
-    );
-    Html(page_shell("nrs review", &body))
-}
-
-/// One `+`/`-` control: a tiny standalone form pre-loaded with the atom
-/// as it would look after this one click, so the click needs no
-/// JavaScript -- it's a plain form submit to `/review/{entry}/save`.
-#[allow(clippy::too_many_arguments)]
-fn blend_edit_form(
-    entry_id: &str,
-    impact_id: &str,
-    note: &str,
-    atom: &Atom,
-    new_blend: &[(AnchorId, f32)],
-    class: &str,
-    label: &str,
-) -> String {
-    let blend_json = serde_json::to_string(new_blend).unwrap();
-    let time_json = serde_json::to_string(&atom.time).unwrap();
-    format!(
-        r#"<form method="post" action="/review/{entry_id}/save">
-  <input type="hidden" name="impact" value="{impact_id}">
-  <input type="hidden" name="note" value="{note}">
-  <input type="hidden" name="source" value="{source}">
-  <input type="hidden" name="magnitude" value="{magnitude}">
-  <input type="hidden" name="time_json" value="{time_json}">
-  <input type="hidden" name="blend_json" value="{blend_json}">
-  <button type="submit" class="chip {class}">{label}</button>
-</form>"#,
-        entry_id = html_escape(entry_id),
-        impact_id = html_escape(impact_id),
-        note = html_escape(note),
-        source = html_escape(&atom.source.0),
-        magnitude = atom.magnitude,
-        time_json = html_escape(&time_json),
-        blend_json = html_escape(&blend_json),
-        class = class,
-        label = html_escape(label),
-    )
-}
-
-fn impact_block(entry_id: &str, ri: &nrs_store::ReviewImpact, all_anchors: &[AnchorId]) -> String {
-    let note_value = ri
-        .note
-        .as_deref()
-        .or(ri.source_comment.as_deref())
-        .unwrap_or("");
-    let flagged = if ri.needs_review {
-        r#"<span class="flagged">needs review</span>"#
+    let total_seconds = (minutes * 60.0).round() as u64;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
-        ""
-    };
-    let hint = match &ri.source_comment {
-        Some(c) => format!(r#"<div class="hint">raw comment: {}</div>"#, html_escape(c)),
-        None => String::new(),
-    };
+        format!("{minutes}:{seconds:02}")
+    }
+}
 
-    let editor = match ri.atoms.as_slice() {
-        [atom] => {
-            let mut chips = String::new();
-            for (anchor, weight) in &atom.blend {
-                let mut new_blend = atom.blend.clone();
-                new_blend.retain(|(a, _)| a != anchor);
-                write!(
-                    chips,
-                    "{}",
-                    blend_edit_form(
-                        entry_id,
-                        &ri.id.0,
-                        note_value,
-                        atom,
-                        &new_blend,
-                        "remove",
-                        &format!("- {} ({weight:.2})", anchor.0),
-                    )
-                )
-                .unwrap();
-            }
-            for anchor in all_anchors {
-                if atom.blend.iter().any(|(a, _)| a == anchor) {
-                    continue;
-                }
-                let mut new_blend = atom.blend.clone();
-                new_blend.push((anchor.clone(), 1.0));
-                write!(
-                    chips,
-                    "{}",
-                    blend_edit_form(
-                        entry_id,
-                        &ri.id.0,
-                        note_value,
-                        atom,
-                        &new_blend,
-                        "add",
-                        &format!("+ {}", anchor.0),
-                    )
-                )
-                .unwrap();
-            }
-            format!(r#"<div class="chip-row">{chips}</div>"#)
-        }
-        atoms => {
-            let mut raw = String::new();
-            for atom in atoms {
-                writeln!(
-                    raw,
-                    "{} blend={:?} magnitude={}",
-                    html_escape(&atom.source.0),
-                    atom.blend,
-                    atom.magnitude
-                )
-                .unwrap();
-            }
-            format!(
-                r#"<div class="hint">{} atoms -- multi-atom blend editing isn't supported yet, view only:</div><div class="raw-atom">{}</div>"#,
-                atoms.len(),
-                html_escape(&raw)
+fn impact_primary_metric(
+    kind: Option<&str>,
+    fields: &HashMap<String, String>,
+    impact: &nrs_store::ReviewImpact,
+) -> (String, String, Option<f32>) {
+    let bounded = |key: &str| {
+        fields
+            .get(key)
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|value| value.clamp(0.0, 1.0))
+    };
+    let plain = |key: &str| fields.get(key).filter(|value| !value.is_empty()).cloned();
+    match kind {
+        Some("nei" | "aei" | "epi") => {
+            let value = bounded("factor");
+            (
+                "strength".into(),
+                value
+                    .map(|v| format!("{:.0}%", v * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                value,
             )
         }
-    };
-
-    format!(
-        r#"<div class="impact">
-  <div>impact <code>{impact_id}</code> {flagged}</div>
-  {hint}
-  {editor}
-  <form method="post" action="/review/{entry_id}/save">
-    <input type="hidden" name="impact" value="{impact_id}">
-    <textarea name="note" rows="2">{note_value}</textarea>
-    <button type="submit">save note</button>
-  </form>
-  <form method="post" action="/review/{entry_id}/confirm">
-    <input type="hidden" name="impact" value="{impact_id}">
-    <button type="submit">confirm as shown</button>
-  </form>
-</div>"#,
-        impact_id = html_escape(&ri.id.0),
-        entry_id = html_escape(entry_id),
-        note_value = html_escape(note_value),
-    )
-}
-
-async fn review_entry(
-    State(state): State<Arc<AppState>>,
-    Path(entry_id): Path<String>,
-) -> Html<String> {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message());
-    };
-    let store = store_lock.lock().unwrap();
-    let impacts = match store.impacts_for_entry(&EntryId(entry_id.clone())) {
-        Ok(i) => i,
-        Err(e) => {
-            return Html(page_shell(
-                "nrs review",
-                &format!("<p>failed to load impacts: {e}</p>"),
-            ))
+        Some("pads") => (
+            "duration".into(),
+            plain("days")
+                .map(|v| format!("{v}d"))
+                .unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        Some("music") => {
+            let value = bounded("music_base");
+            (
+                "quality".into(),
+                value
+                    .map(|v| format!("{:.0}%", v * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                value,
+            )
         }
-    };
-    drop(store);
-
-    let anchors = all_anchors();
-    let mut blocks = String::new();
-    for impact in &impacts {
-        blocks.push_str(&impact_block(&entry_id, impact, &anchors));
+        Some("visual") => {
+            let value = bounded("base");
+            (
+                "quality".into(),
+                value
+                    .map(|v| format!("{:.0}%", v * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                value,
+            )
+        }
+        Some("waifu") => (
+            "duration".into(),
+            plain("days")
+                .map(|v| format!("{v}d"))
+                .unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        Some("meme") => (
+            "duration".into(),
+            plain("days")
+                .map(|v| format!("{v}d"))
+                .unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        Some("consumed" | "music_consumed_progress") => (
+            "duration".into(),
+            plain("duration_minutes")
+                .map(|value| format_duration_minutes(&value))
+                .unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        Some("anime_consumed") => (
+            "episodes".into(),
+            plain("episodes").unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        Some("additional") => (
+            "adjustment".into(),
+            plain("value").unwrap_or_else(|| "—".into()),
+            None,
+        ),
+        _ => {
+            let magnitude: f32 = impact.atoms.iter().map(|atom| atom.magnitude).sum();
+            ("magnitude".into(), format!("{magnitude:.2}"), None)
+        }
     }
-
-    let title = state
-        .snapshot
-        .entries
-        .iter()
-        .find(|e| e.id.0 == entry_id)
-        .and_then(|e| e.title_cache.as_deref())
-        .unwrap_or(&entry_id);
-
-    let body = format!(
-        "<h1>{}</h1>\n<p><a href=\"/review\">&larr; back to queue</a></p>\n{blocks}",
-        html_escape(title)
-    );
-    Html(page_shell("nrs review", &body))
 }
 
-/// Every "+"/"-" chip's tiny form also carries the note through as a
-/// hidden field so a reclassification click doesn't clobber an
-/// in-progress edit to the note -- both land in the same handler.
-#[derive(Deserialize)]
-struct ImpactSaveForm {
-    impact: String,
-    note: String,
-    blend_json: Option<String>,
-    source: Option<String>,
-    magnitude: Option<f32>,
-    time_json: Option<String>,
+struct PeriodSummary {
+    from: String,
+    to: String,
+    caption: String,
 }
 
-async fn review_save(
-    State(state): State<Arc<AppState>>,
-    Path(entry_id): Path<String>,
-    Form(form): Form<ImpactSaveForm>,
-) -> impl IntoResponse {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message()).into_response();
-    };
-    let note = if form.note.trim().is_empty() {
-        None
-    } else {
-        Some(form.note.as_str())
-    };
+fn compact_days(value: &str) -> String {
+    value
+        .parse::<f32>()
+        .map(|days| {
+            if days.fract().abs() < 0.005 {
+                format!("{days:.0}")
+            } else {
+                format!("{days:.1}")
+            }
+        })
+        .unwrap_or_else(|_| value.to_string())
+}
 
-    let mut store = store_lock.lock().unwrap();
-    let atoms = match (form.blend_json, form.source, form.magnitude, form.time_json) {
-        (Some(blend_json), Some(source), Some(magnitude), Some(time_json)) => {
-            let blend: Vec<(AnchorId, f32)> = match serde_json::from_str(&blend_json) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Html(page_shell(
-                        "nrs review",
-                        &format!("<p>bad blend: {e}</p>"),
-                    ))
-                    .into_response()
-                }
-            };
-            let time: TimeSupport = match serde_json::from_str(&time_json) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Html(page_shell("nrs review", &format!("<p>bad time: {e}</p>")))
-                        .into_response()
-                }
-            };
-            Some(vec![Atom {
-                source: SourceId(source),
-                blend,
-                magnitude,
-                time,
-            }])
+fn impact_period_summary(
+    kind: Option<&str>,
+    fields: &HashMap<String, String>,
+) -> Option<PeriodSummary> {
+    if !matches!(kind, Some("pads" | "waifu" | "meme")) {
+        return None;
+    }
+    let from = fields.get("period_from").filter(|value| !value.is_empty());
+    let to = fields.get("period_to").filter(|value| !value.is_empty());
+    let from_expression = fields
+        .get("period_from_expression")
+        .filter(|value| !value.is_empty());
+    let to_expression = fields
+        .get("period_to_expression")
+        .filter(|value| !value.is_empty());
+    let days = fields
+        .get("days")
+        .map(|value| compact_days(value))
+        .unwrap_or_else(|| "?".into());
+    match (from, to) {
+        (Some(from), Some(to)) => {
+            let dynamic = from_expression.is_some() || to_expression.is_some();
+            Some(PeriodSummary {
+                from: from_expression.unwrap_or(from).clone(),
+                to: to_expression.unwrap_or(to).clone(),
+                caption: if dynamic {
+                    format!("{days} days · resolved as {from} → {to} on import")
+                } else {
+                    format!("{days} days")
+                },
+            })
         }
-        // The note-only save form (multi-atom fallback, or the plain
-        // "save note" button) submits no blend fields at all -- reread
-        // the existing atoms rather than guessing at a replacement.
-        _ => None,
-    };
+        _ => Some(PeriodSummary {
+            from: "start".into(),
+            to: format!("day {days}"),
+            caption: "relative duration · calendar dates not recorded".into(),
+        }),
+    }
+}
 
-    let result = match atoms {
-        Some(atoms) => store.edit_impact(&ImpactId(form.impact.clone()), &atoms, note),
-        None => match store.impacts_for_entry(&EntryId(entry_id.clone())) {
-            Ok(impacts) => match impacts.into_iter().find(|i| i.id.0 == form.impact) {
-                Some(impact) => store.edit_impact(&ImpactId(form.impact.clone()), &impact.atoms, note),
-                None => Ok(()),
-            },
-            Err(e) => Err(e),
+/// A display-only composition of the impact's stored atoms. Absolute
+/// contribution is used for the percentages so a negative impact still
+/// communicates *what it is made of*; polarity remains visible in the
+/// signed magnitude metric and the standards parameters.
+fn impact_anchor_mix(impact: &nrs_store::ReviewImpact) -> Vec<(String, f32)> {
+    let mut mix: Vec<(String, f32)> = Vec::new();
+    for atom in &impact.atoms {
+        for (anchor, weight) in &atom.blend {
+            let contribution = atom.magnitude.abs() * weight.abs();
+            match mix.iter_mut().find(|(name, _)| name == &anchor.0) {
+                Some((_, total)) => *total += contribution,
+                None => mix.push((anchor.0.clone(), contribution)),
+            }
+        }
+    }
+    let total: f32 = mix.iter().map(|(_, contribution)| contribution).sum();
+    if total > f32::EPSILON {
+        for (_, contribution) in &mut mix {
+            *contribution /= total;
+        }
+    }
+    mix.sort_by(|a, b| b.1.total_cmp(&a.1));
+    mix
+}
+
+/// Reads back a form-submission-shaped JSON blob (`{"factor":"0.5",...}`)
+/// stored by `set_impact_dah`/`set_relation_dah` -- the same shape
+/// `impact_form`/`relation_form` need as prefill, and what's shown as
+/// the DAH_standards params readout on the entry page.
+fn parsed_dah_params(json: &str) -> HashMap<String, String> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------
+// Entries.
+// ---------------------------------------------------------------
+
+fn entry_display_name(e: &Entry) -> &str {
+    e.title_cache.as_deref().unwrap_or(&e.id.0)
+}
+
+/// Every entry kind, as the slugs `entry_kind` returns. The scores
+/// filter accepts these (and `kind_alias`'s spellings) after `type:`.
+const ENTRY_KINDS: &[&str] = &[
+    "anime",
+    "album",
+    "track",
+    "artist",
+    "franchise",
+    "game",
+    "vn",
+    "literature",
+    "other",
+];
+
+/// The kinds `type:music` stands for.
+const MUSIC_KINDS: &[&str] = &["album", "track", "artist"];
+
+/// Whether a `type:` selection (a kind, or the `music` group) covers
+/// `kind`.
+fn kind_covers(selected: &str, kind: &str) -> bool {
+    selected == kind || (selected == "music" && MUSIC_KINDS.contains(&kind))
+}
+
+/// The relation facts `entry_kind` uses to tell music apart. Legacy
+/// data marked ambiguous music ids with an explicit `entrytype` that
+/// the importer doesn't keep, so artists and albums are recognized by
+/// what they do instead.
+#[derive(Default)]
+struct KindHints {
+    /// Entries credited on other work.
+    credited: std::collections::HashSet<String>,
+    /// Entries containing other music.
+    contains_music: std::collections::HashSet<String>,
+}
+
+impl KindHints {
+    fn new(snapshot: &Snapshot) -> Self {
+        let mut hints = Self::default();
+        for relation in &snapshot.relations {
+            match relation.kind {
+                RelKind::Credit => {
+                    hints.credited.insert(relation.from.0.clone());
+                }
+                RelKind::Contains if relation.to.0.starts_with("M-") => {
+                    hints.contains_music.insert(relation.from.0.clone());
+                }
+                _ => {}
+            }
+        }
+        hints
+    }
+}
+
+/// What kind of work an entry is. Legacy ids carry it in their shape,
+/// read the way nrsml's `guessEntryTypeFromId` does (`A-MAL-5114` is
+/// anime, `M-VGMDB-AL-85759` an album and `M-VGMDB-AL-85759-1` one of
+/// its tracks, ...). Music ids that shape doesn't settle are told apart
+/// by `hints`; against the legacy XML's explicit types this gets 1208
+/// of 1216 music entries right. Entries added through the store since
+/// get opaque ULIDs, so those fall back to what their store implies.
+fn entry_kind(id: &str, store: &str, hints: &KindHints) -> &'static str {
+    match id.split('-').next().unwrap_or("") {
+        "A" => "anime",
+        "M" if id.starts_with("M-VGMDB-AR-") => "artist",
+        "M" if id.starts_with("M-VGMDB-AL-") => match id.split('-').count() {
+            4 => "album",
+            _ => "track",
         },
-    };
-    if let Err(e) = result {
-        return Html(page_shell(
-            "nrs review",
-            &format!("<p>failed to save: {e}</p>"),
-        ))
-        .into_response();
+        "M" if hints.credited.contains(id) => "artist",
+        "M" if hints.contains_music.contains(id) => "album",
+        "M" => "track",
+        "F" => "franchise",
+        // nrsml reads only the first letter, so `GF-` is a game too.
+        "G" | "GF" => "game",
+        "V" => "vn",
+        "L" => "literature",
+        "O" => "other",
+        _ => match store {
+            "mal" | "anilist" | "anime" => "anime",
+            "mal-manga" => "literature",
+            "vndb" => "vn",
+            "vgmdb-album" => "album",
+            "vgmdb-artist" => "artist",
+            s if s.starts_with("vgmdb") => "track",
+            _ => "other",
+        },
     }
-    drop(store);
-    Redirect::to(&format!("/review/{entry_id}")).into_response()
 }
 
-#[derive(Deserialize)]
-struct ImpactConfirmForm {
-    impact: String,
+/// `type:` spellings beyond the slugs themselves; `music` is the group
+/// in `MUSIC_KINDS`.
+fn kind_alias(value: &str) -> Option<&'static str> {
+    let value = value.to_lowercase();
+    if let Some(kind) = ENTRY_KINDS.iter().find(|kind| **kind == value) {
+        return Some(kind);
+    }
+    Some(match value.as_str() {
+        "music" | "m" => "music",
+        "a" => "anime",
+        "al" | "albums" => "album",
+        "song" | "songs" | "tracks" => "track",
+        "ar" | "artists" => "artist",
+        "f" | "series" => "franchise",
+        "g" => "game",
+        "v" | "visual-novel" | "visualnovel" => "vn",
+        "l" | "lit" | "manga" | "novel" | "ln" | "book" => "literature",
+        "o" => "other",
+        _ => return None,
+    })
 }
 
-async fn review_confirm(
-    State(state): State<Arc<AppState>>,
-    Path(entry_id): Path<String>,
-    Form(form): Form<ImpactConfirmForm>,
-) -> impl IntoResponse {
-    let Some(store_lock) = &state.store else {
-        return Html(no_store_message()).into_response();
-    };
-    let mut store = store_lock.lock().unwrap();
-    if let Err(e) = store.confirm_impact(&ImpactId(form.impact)) {
-        return Html(page_shell(
-            "nrs review",
-            &format!("<p>failed to confirm: {e}</p>"),
-        ))
-        .into_response();
+// ---------------------------------------------------------------
+// DAH_standards: impact/relation kinds are named formulas (a "cry"
+// gives 4.0 split across its blend, a "waifu" is 1.2*(days/90)^0.35
+// on the waifu anchor, ...), not hand-picked anchor/weight/magnitude
+// triples. `nrs_import::legacy` already implements every formula
+// verbatim (ported from `nrs-lib-ts`, tested against real legacy
+// data) -- these helpers are a thin layer over exactly that, so
+// creating an impact means picking the kind DAH_standards would call
+// it and filling in *its* natural parameters, and the score vector is
+// computed from the spec rather than picked by hand. Free-form
+// per-anchor editing is still available afterwards via the raw
+// impact editor.
+// ---------------------------------------------------------------
+
+fn f32_field(fields: &HashMap<String, String>, key: &str) -> f32 {
+    f32_field_or(fields, key, 0.0)
+}
+
+fn f32_field_or(fields: &HashMap<String, String>, key: &str, default: f32) -> f32 {
+    fields
+        .get(key)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn resolve_period_expression(expression: &str, today: time::Date) -> Result<time::Date, String> {
+    if expression == "today" {
+        return Ok(today);
     }
-    drop(store);
-    Redirect::to(&format!("/review/{entry_id}")).into_response()
+    if let Some(offset) = expression.strip_prefix("today+") {
+        let days = offset
+            .parse::<i64>()
+            .map_err(|_| format!("invalid dynamic period endpoint: {expression}"))?;
+        return Ok(today + time::Duration::days(days));
+    }
+    Err(format!("unsupported dynamic period endpoint: {expression}"))
+}
+
+fn normalize_period_fields_at(
+    kind: &str,
+    fields: &mut HashMap<String, String>,
+    today: time::Date,
+) -> Result<(), String> {
+    if !matches!(kind, "pads" | "waifu" | "meme") {
+        return Ok(());
+    }
+    for (date_key, expression_key) in [
+        ("period_from", "period_from_expression"),
+        ("period_to", "period_to_expression"),
+    ] {
+        if let Some(expression) = fields
+            .get(expression_key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            let resolved = resolve_period_expression(&expression, today)?;
+            fields.insert(date_key.into(), resolved.to_string());
+            fields.insert(expression_key.into(), expression);
+        }
+    }
+    let from = fields
+        .get("period_from")
+        .map(|value| value.trim())
+        .unwrap_or("");
+    let to = fields
+        .get("period_to")
+        .map(|value| value.trim())
+        .unwrap_or("");
+    if from.is_empty() && to.is_empty() {
+        return Ok(());
+    }
+    if from.is_empty() || to.is_empty() {
+        return Err("period needs both a start and end date".into());
+    }
+    let format = &time::format_description::well_known::Iso8601::DATE;
+    let from_date = time::Date::parse(from, format).map_err(|_| "invalid period start date")?;
+    let to_date = time::Date::parse(to, format).map_err(|_| "invalid period end date")?;
+    let days = (to_date - from_date).whole_days();
+    if days < 0 {
+        return Err("period end date must not be before its start date".into());
+    }
+    fields.insert("days".into(), days.to_string());
+    Ok(())
+}
+
+fn normalize_period_fields(kind: &str, fields: &mut HashMap<String, String>) -> Result<(), String> {
+    normalize_period_fields_at(kind, fields, time::OffsetDateTime::now_utc().date())
+}
+
+fn parse_duration_minutes_input(value: &str) -> Result<f32, String> {
+    let value = value.trim();
+    if !value.contains(':') {
+        return value
+            .parse::<f32>()
+            .ok()
+            .filter(|minutes| minutes.is_finite() && *minutes >= 0.0)
+            .ok_or_else(|| "duration must be non-negative minutes, M:SS, or H:MM:SS".into());
+    }
+
+    let parts: Vec<&str> = value.split(':').collect();
+    let invalid = || "duration must be M:SS or H:MM:SS".to_string();
+    let number = |part: &str| part.parse::<f64>().map_err(|_| invalid());
+    let total_seconds = match parts.as_slice() {
+        [minutes, seconds] => {
+            let minutes = number(minutes)?;
+            let seconds = number(seconds)?;
+            if minutes < 0.0 || !(0.0..60.0).contains(&seconds) {
+                return Err(invalid());
+            }
+            minutes * 60.0 + seconds
+        }
+        [hours, minutes, seconds] => {
+            let hours = number(hours)?;
+            let minutes = number(minutes)?;
+            let seconds = number(seconds)?;
+            if hours < 0.0 || !(0.0..60.0).contains(&minutes) || !(0.0..60.0).contains(&seconds) {
+                return Err(invalid());
+            }
+            hours * 3_600.0 + minutes * 60.0 + seconds
+        }
+        _ => return Err(invalid()),
+    };
+    Ok((total_seconds / 60.0) as f32)
+}
+
+fn normalize_duration_fields(
+    kind: &str,
+    fields: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let key = match kind {
+        "consumed" | "music_consumed_progress" => "duration_minutes",
+        "anime_consumed" => "episode_duration_minutes",
+        _ => return Ok(()),
+    };
+    let value = fields.get(key).map(String::as_str).unwrap_or("");
+    let minutes = parse_duration_minutes_input(value)?;
+    fields.insert(key.into(), minutes.to_string());
+    Ok(())
+}
+
+fn blend_field(fields: &HashMap<String, String>) -> Vec<(AnchorId, f32)> {
+    (1..=4u8)
+        .filter_map(|n| {
+            let anchor = fields.get(&format!("anchor{n}"))?.trim();
+            if anchor.is_empty() {
+                return None;
+            }
+            let weight: f32 = fields.get(&format!("weight{n}"))?.trim().parse().ok()?;
+            Some((AnchorId(anchor.to_string()), weight))
+        })
+        .collect()
+}
+
+/// Dispatches to the matching `nrs_import::legacy` formula. Every
+/// "0-1" parameter is clamped before the call: several formulas
+/// (`nei`/`aei`/`epi` via `remap`, `osu_song`) assert their input is
+/// in range and panic otherwise -- appropriate for import-time bad
+/// data, not for a live form a fat-fingered percentage shouldn't be
+/// able to crash a request over.
+fn build_impact_atoms(
+    kind: &str,
+    source: SourceId,
+    fields: &HashMap<String, String>,
+) -> Result<Vec<Atom>, String> {
+    let f = |k: &str| f32_field(fields, k);
+    match kind {
+        "cry" => Ok(nrs_import::cry(source, &blend_field(fields))),
+        "ehi" => Ok(nrs_import::ehi_with_blend(source, &blend_field(fields))),
+        "nei" => Ok(nrs_import::nei(
+            source,
+            f("factor").clamp(0.0, 1.0),
+            f("sign"),
+            &blend_field(fields),
+        )),
+        "aei" => Ok(nrs_import::aei(
+            source,
+            f("factor").clamp(0.0, 1.0),
+            f("sign"),
+            &blend_field(fields),
+        )),
+        "epi" => Ok(nrs_import::epi_with_blend(
+            source,
+            f("factor").clamp(0.0, 1.0),
+            &blend_field(fields),
+        )),
+        "pads" => Ok(nrs_import::pads(
+            source,
+            f("days").max(0.0),
+            &blend_field(fields),
+        )),
+        "jumpscare" => Ok(nrs_import::jumpscare(source)),
+        "sleepless_night" => Ok(nrs_import::sleepless_night(source)),
+        "politics" => Ok(nrs_import::politics(source)),
+        "dropped" => Ok(nrs_import::dropped(source)),
+        "interest_field" => Ok(nrs_import::interest_field(
+            source,
+            fields
+                .get("new_field")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+        )),
+        "additional" => Ok(nrs_import::additional(source, f("value"))),
+        "music" => Ok(nrs_import::music(source, f("music_base").clamp(0.0, 1.0))),
+        "waifu" => Ok(nrs_import::waifu(source, f("days").max(0.0))),
+        "music_consumed_progress" => Ok(nrs_import::music_consumed_progress(
+            source,
+            f("duration_minutes").max(0.0),
+        )),
+        "meme" => Ok(nrs_import::meme(
+            source,
+            f("strength").clamp(0.0, 1.999),
+            f("days").max(0.0),
+        )),
+        "osu_song" => Ok(nrs_import::osu_song(
+            source,
+            f("personal").clamp(0.0, 1.0),
+            f("community").clamp(0.0, 1.0),
+        )),
+        "consumed" => Ok(nrs_import::consumed(
+            source,
+            f("boredom").clamp(0.0, 1.0),
+            f("duration_minutes").max(0.0),
+        )),
+        "anime_consumed" => Ok(nrs_import::anime_consumed(
+            source,
+            f("boredom").clamp(0.0, 1.0),
+            f("episodes").max(0.0),
+            f("episode_duration_minutes").max(0.0),
+        )),
+        "visual" => Ok(nrs_import::visual(
+            source,
+            f("visual_kind").clamp(0.0, 1.0),
+            f("base").clamp(0.0, 1.0),
+            f("unique").clamp(0.0, 1.0),
+        )),
+        "writing" => Ok(nrs_import::writing(
+            source,
+            f("character_complexity").clamp(0.0, 1.0),
+            f("story_quality").clamp(0.0, 1.0),
+            f("pacing").clamp(0.0, 1.0),
+            f("originality").clamp(0.0, 1.0),
+        )),
+        other => Err(format!("unknown impact kind: {other}")),
+    }
+}
+
+/// The whole submitted form, stored verbatim -- `impact_form`/
+/// `relation_form` read the same shape back as edit-mode prefill, and
+/// `dah_params_summary` filters the bookkeeping keys out at display
+/// time rather than here.
+fn dah_params_json(fields: &HashMap<String, String>) -> String {
+    serde_json::to_string(fields).unwrap_or_default()
+}
+
+/// A `<contributor factor="..">` share (INFRA.md's fan-out: one
+/// `<impact>` tag with several contributors becomes one row per
+/// contributor, each carrying the same kind/params but a different
+/// slice of the formula's full-magnitude result) -- 1.0 for a plain
+/// impact, clamped to `[0, 1]` since that's the only range a share
+/// makes sense in.
+fn dah_factor_field(fields: &HashMap<String, String>) -> f32 {
+    f32_field_or(fields, "dah_factor", 1.0).clamp(0.0, 1.0)
+}
+
+fn build_relation(
+    kind: &str,
+    from: EntryId,
+    to: EntryId,
+    fields: &HashMap<String, String>,
+) -> Result<nrs_core::Relation, String> {
+    match kind {
+        "contains" => Ok(nrs_import::contains_weighted(
+            from,
+            to,
+            f32_field_or(fields, "factor", 1.0).clamp(0.0, 1.0),
+        )),
+        "remix" => Ok(nrs_import::remix(from, to)),
+        "feature_music" => Ok(nrs_import::feature_music(from, to)),
+        "killed_by" => Ok(nrs_import::killed_by(
+            from,
+            to,
+            f32_field_or(fields, "potential", 0.5).clamp(0.0, 1.0),
+            f32_field_or(fields, "effect", 0.5).clamp(0.0, 1.0),
+        )),
+        other => Err(format!("unknown relation kind: {other}")),
+    }
 }
 
 #[cfg(test)]
@@ -1245,7 +1145,7 @@ mod tests {
             ],
             relations: vec![],
             palette: Palette {
-                anchors: Vec::new(),
+                anchors: vec![],
                 k_feat: KFeatMatrix::default(),
             },
             taxonomy: Taxonomy::default(),
@@ -1257,15 +1157,14 @@ mod tests {
         let snap = tiny_snapshot();
         let r = rows(
             &snap,
-            0.6,
             SortBy::Value,
             SortDir::Desc,
             RelScaling::Fixed,
-            Mode::Degreeq,
-            2.0,
+            Mode::Credit,
+            0.5,
             KFeatMatrix::default(),
         );
-        assert_eq!(r[0].id.0, "a"); // higher magnitude -> higher value
+        assert_eq!(r[0].id.0, "a");
         assert_eq!(r[1].id.0, "b");
     }
 
@@ -1274,12 +1173,11 @@ mod tests {
         let snap = tiny_snapshot();
         let r = rows(
             &snap,
-            0.6,
             SortBy::Title,
             SortDir::Asc,
             RelScaling::Fixed,
-            Mode::Degreeq,
-            2.0,
+            Mode::Credit,
+            0.5,
             KFeatMatrix::default(),
         );
         assert_eq!(r[0].title, "Apple");
@@ -1287,21 +1185,111 @@ mod tests {
     }
 
     #[test]
-    fn spectral_mode_produces_finite_ordered_values() {
+    fn credit_is_the_default_mode_and_produces_finite_values() {
         let snap = tiny_snapshot();
         let r = rows(
             &snap,
-            0.6,
             SortBy::Value,
             SortDir::Desc,
             RelScaling::Fixed,
-            Mode::Spectral,
-            2.0,
+            Mode::Credit,
+            0.5,
             KFeatMatrix::default(),
         );
-        assert!(r.iter().all(|row| row.value.is_finite()));
-        // Entry "a" (mass 5) still outranks "b" (mass 1) under spectral.
-        assert_eq!(r[0].id.0, "a");
-        assert!(r[0].value > r[1].value);
+        for row in &r {
+            assert!(row.value.is_finite());
+        }
+    }
+
+    #[test]
+    fn calendar_period_recomputes_legacy_day_count() {
+        let mut fields = HashMap::from([
+            ("period_from".into(), "2025-01-01".into()),
+            ("period_to".into(), "2025-02-01".into()),
+            ("days".into(), "999".into()),
+        ]);
+        normalize_period_fields("meme", &mut fields).unwrap();
+        assert_eq!(fields.get("days").map(String::as_str), Some("31"));
+    }
+
+    #[test]
+    fn dynamic_today_period_keeps_expression_and_refreshes_resolution() {
+        let mut fields = HashMap::from([
+            ("period_from".into(), "2025-01-01".into()),
+            ("period_to".into(), "2025-01-31".into()),
+            ("period_to_expression".into(), "today".into()),
+            ("days".into(), "30".into()),
+        ]);
+        normalize_period_fields_at("meme", &mut fields, time::macros::date!(2025 - 02 - 01))
+            .unwrap();
+        assert_eq!(
+            fields.get("period_to").map(String::as_str),
+            Some("2025-02-01")
+        );
+        assert_eq!(
+            fields.get("period_to_expression").map(String::as_str),
+            Some("today")
+        );
+        assert_eq!(fields.get("days").map(String::as_str), Some("31"));
+    }
+
+    #[test]
+    fn dynamic_period_summary_shows_expression_and_resolved_date() {
+        let fields = HashMap::from([
+            ("period_from".into(), "2025-01-01".into()),
+            ("period_to".into(), "2025-02-01".into()),
+            ("period_to_expression".into(), "today".into()),
+            ("days".into(), "31".into()),
+        ]);
+        let period = impact_period_summary(Some("meme"), &fields).unwrap();
+        assert_eq!(period.from, "2025-01-01");
+        assert_eq!(period.to, "today");
+        assert!(period
+            .caption
+            .contains("resolved as 2025-01-01 → 2025-02-01"));
+    }
+
+    #[test]
+    fn legacy_day_only_period_is_presented_as_relative() {
+        let fields = HashMap::from([("days".into(), "528".into())]);
+        let period = impact_period_summary(Some("waifu"), &fields).unwrap();
+        assert_eq!(period.from, "start");
+        assert_eq!(period.to, "day 528");
+        assert!(period.caption.contains("dates not recorded"));
+    }
+
+    #[test]
+    fn music_kinds_follow_legacy_ids_then_relations() {
+        let mut hints = KindHints::default();
+        hints.credited.insert("M-20221224T220452".into());
+        hints.contains_music.insert("M-20220818T163913".into());
+        let kind = |id| entry_kind(id, "none", &hints);
+        assert_eq!(kind("M-VGMDB-AR-14655"), "artist");
+        assert_eq!(kind("M-VGMDB-AL-85759"), "album");
+        assert_eq!(kind("M-VGMDB-AL-85759-1"), "track");
+        assert_eq!(kind("M-20221224T220452"), "artist");
+        assert_eq!(kind("M-20220818T163913"), "album");
+        assert_eq!(kind("M-20241202T141801"), "track");
+        assert_eq!(kind("A-MAL-5114"), "anime");
+        assert_eq!(kind("GF-VGMDB-7059"), "game");
+        let ulid = "01M2600Y960YYWR278THQT8546";
+        assert_eq!(entry_kind(ulid, "vgmdb-album", &hints), "album");
+        assert_eq!(entry_kind(ulid, "anime", &hints), "anime");
+    }
+
+    #[test]
+    fn duration_minutes_are_displayed_as_media_time() {
+        assert_eq!(format_duration_minutes("3.6833334"), "3:41");
+        assert_eq!(format_duration_minutes("65.7"), "1:05:42");
+        assert_eq!(format_duration_minutes("180"), "3:00:00");
+    }
+
+    #[test]
+    fn duration_input_accepts_media_time() {
+        let mut submitted = HashMap::from([("duration_minutes".into(), "3:41".into())]);
+        normalize_duration_fields("music_consumed_progress", &mut submitted).unwrap();
+        let minutes = submitted["duration_minutes"].parse::<f32>().unwrap();
+        assert!((minutes - (3.0 + 41.0 / 60.0)).abs() < 1e-5);
+        assert!((parse_duration_minutes_input("1:05:42").unwrap() - 65.7).abs() < 1e-5);
     }
 }
