@@ -24,6 +24,7 @@ fn k_feat() -> KFeatMatrix {
 fn params() -> Params {
     Params {
         k_feat: k_feat(),
+        time: Default::default(),
         calibration: Isotonic::default(), // identity, so S_e == V_e
     }
 }
@@ -282,4 +283,98 @@ fn empty_entry_scores_zero() {
     let snap = snapshot(&["e"], vec![], vec![]);
     assert_eq!(value_of(&snap, "e"), 0.0);
     assert!(explain(&snap, &params(), EntryId("e".into())).contributions.is_empty());
+}
+
+fn dated(anchor: &str, magnitude: f32, from: i32, to: i32) -> Atom {
+    Atom {
+        time: TimeSupport::Interval { from, to },
+        ..moment(anchor, magnitude)
+    }
+}
+
+fn value_with(snap: &Snapshot, id: &str, time: TimeParams) -> f32 {
+    let p = Params { time, ..params() };
+    score(snap, &p).values[&EntryId(id.into())]
+}
+
+/// A dated period split into two adjacent periods, its embedded mass
+/// split by length, scores the same at any time setting.
+#[test]
+fn splitting_a_period_in_embedded_units_is_invariant() {
+    let m = 3.0f32;
+    let whole = snapshot(&["e"], vec![impact("i", "e", vec![dated("hype", m, 0, 100)])], vec![]);
+    let split = snapshot(
+        &["e"],
+        vec![
+            impact("i1", "e", vec![dated("hype", 0.3f32.powf(W_HYPE) * m, 0, 30)]),
+            impact("i2", "e", vec![dated("hype", 0.7f32.powf(W_HYPE) * m, 30, 100)]),
+        ],
+        vec![],
+    );
+    for time in [TimeParams::default(), TimeParams { shared: 0.0, length_days: 20.0 }] {
+        let (a, b) = (value_with(&whole, "e", time), value_with(&split, "e", time));
+        assert!(close(a, b), "{a} vs {b}");
+    }
+}
+
+/// With `shared = 1` time is ignored: dated mass scores as if undated.
+#[test]
+fn fully_shared_time_matches_undated_scoring() {
+    let atoms = |d: bool| {
+        vec![
+            impact("a", "e", vec![if d { dated("hype", 1.0, 0, 30) } else { moment("hype", 1.0) }]),
+            impact("b", "e", vec![if d { dated("hype", 2.0, 900, 990) } else { moment("hype", 2.0) }]),
+        ]
+    };
+    let time = TimeParams { shared: 1.0, length_days: 30.0 };
+    let (with_dates, without) = (
+        value_with(&snapshot(&["e"], atoms(true), vec![]), "e", time),
+        value_with(&snapshot(&["e"], atoms(false), vec![]), "e", time),
+    );
+    assert!(close(with_dates, without), "{with_dates} vs {without}");
+}
+
+/// Repeats far apart in time score higher than repeats at one moment,
+/// and less than independent mass.
+#[test]
+fn distant_repeats_count_partly_new() {
+    let snap = |gap: i32| {
+        snapshot(
+            &["e"],
+            vec![
+                impact("a", "e", vec![dated("hype", 1.0, 0, 1)]),
+                impact("b", "e", vec![dated("hype", 1.0, gap, gap + 1)]),
+            ],
+            vec![],
+        )
+    };
+    let time = TimeParams { shared: 0.7, length_days: 30.0 };
+    let (near, far) = (value_with(&snap(0), "e", time), value_with(&snap(2000), "e", time));
+    // Two hits on one day are one hit with their embedded masses added.
+    let one = snapshot(
+        &["e"],
+        vec![impact("a", "e", vec![dated("hype", 2f32.powf(W_HYPE), 0, 1)])],
+        vec![],
+    );
+    assert!(close(near, value_with(&one, "e", time)), "{near}");
+    assert!(far > near && far < 2.0, "{far}");
+}
+
+/// Splitting invariance through relations holds for dated mass too.
+#[test]
+fn dated_halves_reaching_by_two_paths_recombine() {
+    let impacts = vec![impact("i", "x", vec![dated("hype", 2.0, 0, 200)])];
+    let split = snapshot(
+        &["x", "b", "a"],
+        impacts.clone(),
+        vec![
+            rel(RelKind::Contains, "b", "x", 0.5),
+            rel(RelKind::Contains, "a", "b", 1.0),
+            rel(RelKind::Contains, "a", "x", 0.5),
+        ],
+    );
+    let whole = snapshot(&["x", "a"], impacts, vec![rel(RelKind::Contains, "a", "x", 1.0)]);
+    let time = TimeParams { shared: 0.5, length_days: 30.0 };
+    let (s, w) = (value_with(&split, "a", time), value_with(&whole, "a", time));
+    assert!(close(s, w), "{s} vs {w}");
 }

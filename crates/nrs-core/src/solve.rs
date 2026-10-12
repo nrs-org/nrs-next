@@ -20,12 +20,13 @@
 //! contraction (spectral radius < 1, as the old linear solve required)
 //! the fixed point is unique. Strongly connected components are resolved
 //! dependencies-first; acyclic nodes take one exact step, and a cycle is
-//! iterated to convergence. Relation weights act on embedded mass.
+//! iterated to convergence. Relation weights act on embedded mass, and a
+//! borrowed fraction of a dated span keeps its days.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 
-use crate::measure::Measure;
+use crate::measure::{Measure, Span};
 use crate::types::{AnchorId, EntryId, Relation, Transform};
 
 /// A node in the borrow graph: `(entry, anchor)` interned to small
@@ -193,7 +194,7 @@ pub(crate) fn solve_relations(
 
     let active_anchors: BTreeSet<u32> = measures
         .values()
-        .flat_map(|m| m.keys())
+        .flat_map(|m| m.undated.keys().chain(m.dated.keys()))
         .map(|a| anchors.intern(a))
         .collect();
 
@@ -202,14 +203,22 @@ pub(crate) fn solve_relations(
     // adjacency[u] = { v: accumulated weight of edges u -> v }
     let mut adj: BTreeMap<usize, BTreeMap<usize, f64>> = BTreeMap::new();
 
+    // Own (pre-relation) mass at each node: undated, and dated spans.
     let mut own: Vec<f64> = Vec::new();
+    let mut own_spans: Vec<Vec<Span>> = Vec::new();
     for (entry, measure) in &measures {
         let e = entries.intern(entry);
-        for (anchor, &mass) in measure {
+        for (anchor, &mass) in &measure.undated {
             let a = anchors.intern(anchor);
             let i = intern_node((e, a), &mut node_index, &mut nodes);
             own.resize(nodes.len(), 0.0);
             own[i] += mass;
+        }
+        for (anchor, spans) in &measure.dated {
+            let a = anchors.intern(anchor);
+            let i = intern_node((e, a), &mut node_index, &mut nodes);
+            own_spans.resize(nodes.len(), Vec::new());
+            own_spans[i].extend(spans.iter().copied());
         }
     }
     for relation in relations {
@@ -227,6 +236,8 @@ pub(crate) fn solve_relations(
         }
     }
     own.resize(nodes.len(), 0.0);
+    own_spans.resize(nodes.len(), Vec::new());
+    let has_own = |g: usize| own[g] != 0.0 || !own_spans[g].is_empty();
 
     let mut phi: Vec<Fractions> = vec![Fractions::new(); nodes.len()];
     for scc in tarjan_sccs(&adj, nodes.len()) {
@@ -236,7 +247,7 @@ pub(crate) fn solve_relations(
             .iter()
             .map(|&g| {
                 let mut acc = Fractions::new();
-                if own[g] != 0.0 {
+                if has_own(g) {
                     acc.insert(g, 1.0);
                 }
                 if let Some(targets) = adj.get(&g) {
@@ -292,11 +303,24 @@ pub(crate) fn solve_relations(
         .map(|e| (e.clone(), Measure::new()))
         .collect();
     for (i, &(e, a)) in nodes.iter().enumerate() {
+        let entry = entries.resolve(e);
+        let anchor = anchors.resolve(a);
         let mass: f64 = phi[i].iter().map(|(&o, &f)| f * own[o]).sum();
         if mass != 0.0 {
-            out.entry(entries.resolve(e).clone())
+            out.entry(entry.clone())
                 .or_default()
-                .insert(anchors.resolve(a).clone(), mass);
+                .undated
+                .insert(anchor.clone(), mass);
+        }
+        for (&o, &f) in &phi[i] {
+            for span in &own_spans[o] {
+                let e = f * span.e;
+                if e != 0.0 {
+                    out.entry(entry.clone())
+                        .or_default()
+                        .add_span(anchor, Span { e, ..*span });
+                }
+            }
         }
     }
     out

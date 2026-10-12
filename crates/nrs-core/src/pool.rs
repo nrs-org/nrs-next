@@ -17,11 +17,19 @@
 //! Merging along a tree is the most associativity a per-pair exponent
 //! allows: with three anchors at pairwise exponents `p, q, q`, merge
 //! order is irrelevant only when `p = q`.
+//!
+//! The tree's leaves are boxes of twin anchors (`K(a, b) = w_a = w_b`),
+//! which pool as one anchor. Within a box, dated mass first goes through
+//! the time stage (`TimeParams`): a mix of pooling everything as one and
+//! the concave coverage integral of its dated density. A tree can't take
+//! its time structure from a time-difference kernel (on a continuous time
+//! line its closure collapses to one level), which is why time is
+//! integrated inside the leaves rather than through `K`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::measure::{sgnpow, Measure};
-use crate::types::{AnchorId, Contribution, KFeatMatrix};
+use crate::measure::{sgnpow, Measure, Span};
+use crate::types::{AnchorId, Contribution, KFeatMatrix, TimeParams};
 
 /// Smallest exponent honoured; `w -> 0` would pool as an exact max and
 /// overflow the embedding.
@@ -91,6 +99,77 @@ impl Kernel {
             _ => 1.0,
         }
     }
+
+    /// Whether `a` and `b` are one box: same exponent, pooling at it.
+    fn twins(&self, a: &AnchorId, b: &AnchorId) -> bool {
+        match (self.index.get(a), self.index.get(b)) {
+            (Some(&i), Some(&j)) => {
+                self.exponent[i] == self.exponent[j] && self.level[i][j] <= self.exponent[i]
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `∫ sgnpow(u(t), w) dt` for `u = c (box_L ⋆ density)`, `c = L^(-1/w)`,
+/// where each span spreads its embedded mass evenly over its days. `u`
+/// is piecewise linear with breaks at span ends `± L/2`, and
+/// `F(u) = |u|^(w+1) / (w+1)` is an antiderivative of `sgnpow(u, w)` on
+/// both signs, so each linear piece integrates exactly.
+fn coverage(spans: &[Span], w: f64, length: f64) -> f64 {
+    let half = length / 2.0;
+    let c = length.powf(-1.0 / w);
+    let u = |t: f64| -> f64 {
+        c * spans
+            .iter()
+            .map(|s| {
+                let overlap = (s.to.min(t + half) - s.from.max(t - half)).max(0.0);
+                s.e / (s.to - s.from) * overlap
+            })
+            .sum::<f64>()
+    };
+    let mut breaks: Vec<f64> = spans
+        .iter()
+        .flat_map(|s| [s.from - half, s.from + half, s.to - half, s.to + half])
+        .collect();
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup();
+    let antiderivative = |u: f64| u.abs().powf(w + 1.0) / (w + 1.0);
+    let mut total = 0.0;
+    let mut prev = (breaks[0], u(breaks[0]));
+    for &t in &breaks[1..] {
+        let (t0, u0) = prev;
+        let u1 = u(t);
+        let h = t - t0;
+        let mid = 0.5 * (u0 + u1);
+        let r = (u1 - u0) / mid;
+        total += if mid != 0.0 && r.abs() < 1e-3 {
+            // Mean of sgnpow over a nearly flat piece, by Taylor expansion
+            // about the midpoint (error O(r^4)); the difference quotient
+            // would lose digits to cancellation here.
+            h * sgnpow(mid, w) * (1.0 + w * (w - 1.0) * r * r / 24.0)
+        } else if u0 == u1 {
+            h * sgnpow(u0, w)
+        } else {
+            h * (antiderivative(u1) - antiderivative(u0)) / (u1 - u0)
+        };
+        prev = (t, u1);
+    }
+    total
+}
+
+/// One box's value: its undated embedded mass `undated` plus its dated
+/// spans, through the time stage.
+fn box_value(undated: f64, spans: &[Span], w: f64, time: &TimeParams) -> f64 {
+    let dated: f64 = spans.iter().map(|s| s.e).sum();
+    let full = sgnpow(undated + dated, w);
+    let shared = f64::from(time.shared).clamp(0.0, 1.0);
+    let length = f64::from(time.length_days);
+    if spans.is_empty() || shared >= 1.0 || !(length > 0.0 && length.is_finite()) {
+        return full;
+    }
+    let local = sgnpow(undated + sgnpow(coverage(spans, w, length), 1.0 / w), w);
+    shared * full + (1.0 - shared) * local
 }
 
 /// One merge in the single-linkage tree.
@@ -99,19 +178,64 @@ struct Merge {
     children: [usize; 2],
 }
 
-/// The pooled value of one entry, with each anchor's Euler share.
-pub(crate) fn value(measure: &Measure, kernel: &Kernel) -> (f32, Vec<Contribution>) {
-    let leaves: Vec<(&AnchorId, f64, f64)> = measure
-        .iter()
-        .filter(|(_, &e)| e != 0.0)
-        .map(|(a, &e)| (a, e, sgnpow(e, kernel.exponent_of(a))))
-        .collect();
+/// One leaf of the tree: a box of twin anchors present in the entry.
+struct Leaf<'a> {
+    anchors: Vec<(&'a AnchorId, f64)>,
+    representative: &'a AnchorId,
+    value: f64,
+}
+
+/// The pooled value of one entry, with each anchor's share (Euler shares
+/// of the boxes, split within a box by embedded mass).
+pub(crate) fn value(
+    measure: &Measure,
+    kernel: &Kernel,
+    time: &TimeParams,
+) -> (f32, Vec<Contribution>) {
+    let mut present: BTreeMap<&AnchorId, (f64, Vec<Span>)> = BTreeMap::new();
+    for (a, &e) in &measure.undated {
+        if e != 0.0 {
+            present.entry(a).or_default().0 += e;
+        }
+    }
+    for (a, spans) in &measure.dated {
+        let spans: Vec<Span> = spans.iter().filter(|s| s.e != 0.0).copied().collect();
+        if !spans.is_empty() {
+            present.entry(a).or_default().1.extend(spans);
+        }
+    }
+    let mut leaves: Vec<Leaf> = Vec::new();
+    let mut boxes: Vec<(Vec<&AnchorId>, f64, Vec<Span>)> = Vec::new();
+    for (a, (undated, spans)) in present.iter() {
+        match boxes.iter_mut().find(|b| kernel.twins(b.0[0], a)) {
+            Some(b) => {
+                b.0.push(a);
+                b.1 += undated;
+                b.2.extend(spans.iter().copied());
+            }
+            None => boxes.push((vec![*a], *undated, spans.clone())),
+        }
+    }
+    for (anchors, undated, spans) in boxes {
+        let w = kernel.exponent_of(anchors[0]);
+        leaves.push(Leaf {
+            anchors: anchors
+                .iter()
+                .map(|a| {
+                    let (u, s) = &present[a];
+                    (*a, u + s.iter().map(|s| s.e).sum::<f64>())
+                })
+                .collect(),
+            representative: anchors[0],
+            value: box_value(undated, &spans, w, time),
+        });
+    }
     let n = leaves.len();
 
     let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
-            let l = kernel.level_of(leaves[i].0, leaves[j].0);
+            let l = kernel.level_of(leaves[i].representative, leaves[j].representative);
             if l < 1.0 {
                 pairs.push((l, i, j));
             }
@@ -121,7 +245,7 @@ pub(crate) fn value(measure: &Measure, kernel: &Kernel) -> (f32, Vec<Contributio
 
     // Tree nodes: leaves 0..n, then one node per merge. `root[i]` is the
     // current tree node holding union-find set `i`.
-    let mut val: Vec<f64> = leaves.iter().map(|l| l.2).collect();
+    let mut val: Vec<f64> = leaves.iter().map(|l| l.value).collect();
     let mut merges: Vec<Merge> = Vec::new();
     let mut parent: Vec<usize> = (0..n).collect();
     let mut root: Vec<usize> = (0..n).collect();
@@ -169,16 +293,24 @@ pub(crate) fn value(measure: &Measure, kernel: &Kernel) -> (f32, Vec<Contributio
         }
     }
 
-    let contributions = leaves
-        .iter()
-        .enumerate()
-        .map(|(i, &(anchor, e, m))| Contribution {
-            anchor: anchor.clone(),
-            embedded: e as f32,
-            mass: m as f32,
-            contribution: (m * grad[i]) as f32,
-        })
-        .collect();
+    let mut contributions = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        let share = leaf.value * grad[i];
+        let embedded: f64 = leaf.anchors.iter().map(|(_, e)| e).sum();
+        for &(anchor, e) in &leaf.anchors {
+            contributions.push(Contribution {
+                anchor: anchor.clone(),
+                embedded: e as f32,
+                mass: sgnpow(e, kernel.exponent_of(anchor)) as f32,
+                contribution: if embedded != 0.0 {
+                    (share * e / embedded) as f32
+                } else {
+                    0.0
+                },
+            });
+        }
+    }
+    contributions.sort_by(|a, b| a.anchor.cmp(&b.anchor));
     (total as f32, contributions)
 }
 
@@ -270,7 +402,14 @@ mod tests {
     }
 
     fn measure(entries: &[(&str, f64)]) -> Measure {
-        entries.iter().map(|&(a, e)| (id(a), e)).collect()
+        Measure {
+            undated: entries.iter().map(|&(a, e)| (id(a), e)).collect(),
+            ..Measure::default()
+        }
+    }
+
+    fn value(m: &Measure, k: &Kernel) -> (f32, Vec<Contribution>) {
+        super::value(m, k, &TimeParams::default())
     }
 
     #[test]
@@ -311,6 +450,48 @@ mod tests {
         assert!((f64::from(v) - expect).abs() < 1e-5);
         let sum: f32 = c.iter().map(|c| c.contribution).sum();
         assert!((sum - v).abs() < 1e-4);
+    }
+
+    fn span(from: f64, to: f64, e: f64) -> Span {
+        Span { from, to, e }
+    }
+
+    #[test]
+    fn coverage_depends_only_on_the_density() {
+        let w = 0.4;
+        let whole = coverage(&[span(0.0, 100.0, 5.0)], w, 30.0);
+        let split = coverage(&[span(0.0, 40.0, 2.0), span(40.0, 100.0, 3.0)], w, 30.0);
+        assert!((whole - split).abs() < 1e-9 * whole, "{whole} vs {split}");
+    }
+
+    #[test]
+    fn a_short_span_scores_about_its_own_mass() {
+        let (w, e, d, l) = (0.35, 8.0f64, 1.0, 365.0);
+        let exact = e.powf(w) * (1.0 - d / l + 2.0 * d / ((w + 1.0) * l));
+        assert!((coverage(&[span(0.0, d, e)], w, l) - exact).abs() < 1e-9);
+    }
+
+    #[test]
+    fn distant_repeats_count_partly_new() {
+        let (w, e) = (0.4, 2.0f64);
+        let spans = [span(0.0, 1.0, e), span(10_000.0, 10_001.0, e)];
+        let lone = coverage(&spans[..1], w, 30.0);
+        let time = |shared| TimeParams {
+            shared,
+            length_days: 30.0,
+        };
+        let full = (2.0 * e).powf(w);
+        assert!((box_value(0.0, &spans, w, &time(1.0)) - full).abs() < 1e-12);
+        let mixed = box_value(0.0, &spans, w, &time(0.7));
+        let shared = f64::from(0.7f32);
+        let expect = shared * full + (1.0 - shared) * 2.0 * lone;
+        assert!((mixed - expect).abs() < 1e-9, "{mixed} vs {expect}");
+    }
+
+    #[test]
+    fn undated_mass_alone_ignores_time() {
+        let time = TimeParams::default();
+        assert_eq!(box_value(3.0, &[], 0.4, &time), 3f64.powf(0.4));
     }
 
     #[test]

@@ -50,8 +50,8 @@ pub struct Impact {
     pub atoms: Vec<Atom>,
 }
 
-/// One embedded mass: a source, a blend over 1-3 palette anchors, a
-/// signed magnitude, and how it's spread over time.
+/// One value mass: a source, a blend over 1-3 palette anchors, a signed
+/// magnitude, and when it happened.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Atom {
@@ -64,8 +64,16 @@ pub struct Atom {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TimeSupport {
+    /// Undated: the magnitude is the whole mass.
     Moment,
+    /// Undated, with a relative decay profile whose area scales the
+    /// magnitude.
     Tail { peak: f32, lambda: f32, cutoff: f32 },
+    /// Dated: the magnitude is the value of the whole period pooled as
+    /// one (the legacy duration formulas), and its embedded mass is
+    /// spread evenly over days `[from, to)`, counted from 1970-01-01. A
+    /// period shorter than a day counts as one day.
+    Interval { from: i32, to: i32 },
 }
 
 /// Relation kinds (INFRA.md §5.1 `relation.kind`). Not read by the
@@ -230,11 +238,40 @@ impl Isotonic {
     }
 }
 
+/// How dated mass on one box of twin anchors decorrelates over time.
+///
+/// The box's value is `shared * full + (1 - shared) * local`, where
+/// `full` pools all of its mass as one regardless of timing (the legacy
+/// behaviour) and `local` is the concave coverage integral
+/// `∫ sgnpow((phi ⋆ e)(t), w) dt` of its dated embedded density, with
+/// `phi` a box of width `length_days` normalised so a lone instant
+/// scores its own mass. Within `length_days` repeats pool as one; across
+/// longer gaps a share `1 - shared` of each counts as new. Undated mass
+/// pools with the local part as if it happened at the same moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TimeParams {
+    /// `λ` in `[0, 1]`; 1 ignores time entirely.
+    pub shared: f32,
+    /// `L` in days, `> 0`.
+    pub length_days: f32,
+}
+
+impl Default for TimeParams {
+    fn default() -> Self {
+        TimeParams {
+            shared: 0.7,
+            length_days: 365.0,
+        }
+    }
+}
+
 /// `Theta` - the fitted knobs (INFRA.md §4.2): the pooling-exponent
-/// matrix and the public-scale calibration.
-#[derive(Debug, Clone, PartialEq)]
+/// matrix, the time decorrelation, and the public-scale calibration.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Params {
     pub k_feat: KFeatMatrix,
+    pub time: TimeParams,
     pub calibration: Isotonic,
 }
 

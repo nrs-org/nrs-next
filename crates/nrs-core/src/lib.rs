@@ -31,7 +31,7 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
     let values: std::collections::BTreeMap<EntryId, f32> = entries
         .par_iter()
         .map(|&(entry, f)| {
-            let (v, _) = pool::value(f, &kernel);
+            let (v, _) = pool::value(f, &kernel, &params.time);
             (entry.clone(), params.calibration.apply(v))
         })
         .collect();
@@ -47,7 +47,7 @@ pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation 
 
     let empty = measure::Measure::new();
     let f = resolved.get(&entry).unwrap_or(&empty);
-    let (value, contributions) = pool::value(f, &kernel);
+    let (value, contributions) = pool::value(f, &kernel, &params.time);
     let score = params.calibration.apply(value);
     Explanation {
         entry,

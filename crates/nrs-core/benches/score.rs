@@ -129,6 +129,7 @@ fn k_feat() -> KFeatMatrix {
 fn params(k_feat: KFeatMatrix) -> Params {
     Params {
         k_feat,
+        time: Default::default(),
         calibration: Isotonic::default(),
     }
 }
