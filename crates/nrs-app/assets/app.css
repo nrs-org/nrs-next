@@ -468,6 +468,23 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 .track-row.unlinked .relation-title { color: var(--bone-700); font-size: .74rem; }
 .track-row.unlinked .relation-kind { color: var(--bone-700); font-size: .62rem; }
 .relation-group > .inline-editor-panel { margin: 0; border-width: 1px 0; }
+
+.related-slot:empty { display: none; }
+.related-slot { margin-top: 1rem; }
+.related-row { grid-template-columns: auto minmax(0, 1fr) auto; cursor: pointer; }
+.related-row input { grid-row: span 2; align-self: center; accent-color: var(--brass); }
+.related-what { min-width: 0; display: flex; align-items: baseline; gap: .4rem; }
+.related-phrase { color: var(--bone-500); font-size: .7rem; white-space: nowrap; }
+.related-details { grid-column: 2 / -1; color: var(--bone-700); font-size: .66rem; overflow-wrap: anywhere; }
+.related-actions { display: flex; justify-content: flex-end; align-items: center; gap: 1rem; padding: .6rem .85rem; }
+
+.store-hits { margin-top: 2rem; }
+.store-hits .entry-subtitle { margin-bottom: .75rem; }
+.hit-subtitle { color: var(--bone-500); font-size: .75rem; margin-left: .5rem; }
+.hit-actions { display: flex; align-items: center; gap: .8rem; }
+.hit-actions .button { padding: .25rem .6rem; }
+.store-hit.adopted .entry-title { color: var(--bone-500); }
+.store-hit-errors { font-size: .7rem; margin-top: .5rem; }
 .inline-disclosure > summary { cursor: pointer; color: var(--bone-700); list-style-position: inside; }
 .inline-disclosure > summary:hover { color: var(--brass); }
 .inline-disclosure[open] > summary { color: var(--bone-500); }

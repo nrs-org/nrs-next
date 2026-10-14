@@ -86,6 +86,26 @@ const entryKinds = {
   other: "other",
 };
 
+// A type store's own `kind` (`resolve`'s) as an entry kind, like the
+// server's `kind_from_store`.
+const storeKinds = {
+  anime: "anime",
+  anime_movie: "anime",
+  manga: "literature",
+  novel: "literature",
+  light_novel: "literature",
+  one_shot: "literature",
+  visual_novel: "vn",
+  release: "album",
+  release_group: "album",
+  track: "track",
+  artist: "artist",
+};
+
+function storeKindTag(kind) {
+  return storeKinds[kind] ? kindTag(storeKinds[kind]) : `<span class="kind-tag">${escapeHtml(kind)}</span>`;
+}
+
 function kindTag(kind) {
   return `<span class="kind-tag" data-kind="${escapeHtml(kind)}">${escapeHtml(entryKinds[kind] || kind)}</span>`;
 }
@@ -571,7 +591,7 @@ async function renderEntries() {
   document.title = "Entries — NRS";
   app.innerHTML = `
     <h1>entries</h1>
-    <p class="muted entry-subtitle">Paste an entry URL to ingest it through the anime or music store, or pick an existing entry.</p>
+    <p class="muted entry-subtitle">Paste an entry URL to ingest it through the anime or music store, or filter to search NRS and both stores.</p>
     <form class="ingest-form">
       ${textField({}, "query", "anime, manga, novel, visual novel, or music URL", "", "url", 'placeholder="https://myanimelist.net/anime/5114 or https://vgmdb.net/album/104418" required')}
       <button class="button primary" type="submit">ingest</button>
@@ -582,6 +602,12 @@ async function renderEntries() {
     </div>
     <p class="entry-count">…</p>
     <div class="entry-list"><p class="loading">Loading entries…</p></div>
+    <section class="store-hits" hidden>
+      <h2>From the stores <span class="count"></span></h2>
+      <p class="muted entry-subtitle">What the anime and music stores already hold. Add one to make it an NRS entry.</p>
+      <div class="entry-list store-hit-list"></div>
+      <p class="dim store-hit-errors" hidden></p>
+    </section>
   `;
   const ingest = app.querySelector(".ingest-form");
   const input = app.querySelector(".search");
@@ -624,9 +650,82 @@ async function renderEntries() {
   }
   input.addEventListener("input", () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(load, 250);
+    searchTimer = setTimeout(() => {
+      load();
+      loadStoreHits();
+    }, 250);
   });
+
+  const hits = app.querySelector(".store-hits");
+  const hitList = app.querySelector(".store-hit-list");
+  const hitErrors = app.querySelector(".store-hit-errors");
+  if (!(hits instanceof HTMLElement) || !(hitList instanceof HTMLElement) || !(hitErrors instanceof HTMLElement)) return;
+  let storeSearch = null;
+  let hitData = [];
+  pageTeardown = () => storeSearch?.abort();
+  // Separate from getJson, which would abort the entry list's request.
+  async function loadStoreHits() {
+    const q = input.value.trim();
+    storeSearch?.abort();
+    if (q.length < 2) {
+      hits.hidden = true;
+      return;
+    }
+    const controller = (storeSearch = new AbortController());
+    try {
+      const response = await fetch(`/api/v1/stores/search?${new URLSearchParams({ q })}`, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `${response.status} ${response.statusText}`);
+      hitData = body.results;
+      const fresh = hitData.filter((hit) => !hit.entry_id).length;
+      hits.querySelector("h2 .count").textContent = `${fresh} not in NRS`;
+      hitList.innerHTML = hitData.length ? hitData.map(storeHitRow).join("") : `<p class="empty">Neither store has a match.</p>`;
+      hitErrors.hidden = !body.errors.length;
+      hitErrors.textContent = body.errors.join("; ");
+      hits.hidden = false;
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      hitList.innerHTML = `<p class="empty">${escapeHtml(error?.message || String(error))}</p>`;
+      hits.hidden = false;
+    }
+  }
+  hitList.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("[data-adopt]") : null;
+    if (!(button instanceof HTMLButtonElement)) return;
+    const hit = hitData[Number(button.dataset.adopt)];
+    button.disabled = true;
+    try {
+      const result = await sendJson("/api/v1/entries/adopt", "POST", { store: hit.store, store_id: hit.store_id });
+      navigate(pathForEntry(result.id));
+    } catch (reason) {
+      showToast(reason?.message || String(reason), "error");
+      button.disabled = false;
+    }
+  });
+
   await load();
+}
+
+/** A store search result: "in NRS" when bound, else an add button. */
+function storeHitRow(hit, index) {
+  const subtitle = hit.subtitle ? `<span class="hit-subtitle">${escapeHtml(hit.subtitle)}</span>` : "";
+  let host = hit.store;
+  try {
+    if (hit.canonical_url) host = new URL(hit.canonical_url).hostname.replace(/^www\./, "");
+  } catch {}
+  const source = hit.canonical_url
+    ? `<a class="entry-ref" href="${escapeHtml(hit.canonical_url)}" target="_blank" rel="noopener">${escapeHtml(host)} ↗</a>`
+    : `<span class="entry-ref">${escapeHtml(host)}</span>`;
+  const action = hit.entry_id
+    ? `<a class="link-button" href="${pathForEntry(hit.entry_id)}" data-link>in NRS</a>`
+    : `<button class="button" type="button" data-adopt="${index}">add</button>`;
+  return `<div class="entry-row store-hit${hit.entry_id ? " adopted" : ""}">
+    <span class="entry-title">${storeKindTag(hit.kind)}${escapeHtml(hit.title)}${subtitle}</span>
+    <span class="hit-actions">${source}${action}</span>
+  </div>`;
 }
 
 function entryRow(entry) {
@@ -832,6 +931,85 @@ async function bindTracklist(data) {
   group.querySelectorAll(":scope > .relation-row").forEach((row) => row.remove());
   group.insertAdjacentHTML("beforeend", rows.join(""));
   group.classList.add("tracklist");
+}
+
+/**
+ * What the entry's store suggests around it that NRS doesn't record yet
+ * (a track's album, an album's tracks), as a checklist: picked rows add
+ * the other entry when NRS lacks it, then the relation. The albums a
+ * track is on start checked; an album's tracks don't.
+ */
+async function bindRelated(data) {
+  const slot = app.querySelector(".related-slot");
+  if (data.entry.store !== "url" || !(slot instanceof HTMLElement)) return;
+  let suggestions;
+  try {
+    const response = await fetch(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/related`);
+    if (!response.ok) return;
+    ({ suggestions } = await response.json());
+  } catch {
+    return;
+  }
+  if (currentEntryData !== data || !slot.isConnected) return;
+  const open = suggestions.filter((suggestion) => !suggestion.relation_exists);
+  if (!open.length) return;
+  slot.innerHTML = `
+    <details class="relation-group related-group" open>
+      <summary>Suggested by the ${escapeHtml(open[0].store)} store <span class="count">${open.length}</span></summary>
+      <form class="related-form">
+        ${open.map(relatedRow).join("")}
+        <div class="related-actions">
+          ${open.length > 3 ? `<button class="link-button" type="button" data-related-all>select all</button>` : ""}
+          <button class="button primary" type="submit">add selected</button>
+        </div>
+      </form>
+    </details>`;
+  const form = slot.querySelector(".related-form");
+  if (!(form instanceof HTMLFormElement)) return;
+  const boxes = () => [...form.querySelectorAll('input[name="pick"]')];
+  form.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element) || !event.target.closest("[data-related-all]")) return;
+    const all = boxes().every((box) => box.checked);
+    boxes().forEach((box) => (box.checked = !all));
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const items = boxes()
+      .filter((box) => box.checked)
+      .map((box) => open[Number(box.value)])
+      .map((suggestion) => ({ store_id: suggestion.target.store_id, kind: suggestion.kind, direction: suggestion.direction }));
+    if (!items.length) return;
+    const button = form.querySelector('button[type="submit"]');
+    if (button instanceof HTMLButtonElement) button.disabled = true;
+    try {
+      const result = await sendJson(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/related`, "POST", { items });
+      const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+      showToast(`Added ${plural(result.relations_added, "relation", "relations")}, ${plural(result.entries_added, "new entry", "new entries")}`);
+      await refreshEntry(data.entry.id);
+    } catch (reason) {
+      showToast(reason?.message || String(reason), "error");
+      if (button instanceof HTMLButtonElement) button.disabled = false;
+    }
+  });
+}
+
+function relatedPhrase(suggestion) {
+  if (suggestion.kind === "contains") return suggestion.direction === "incoming" ? "on" : "contains";
+  return suggestion.direction === "incoming" ? `${suggestion.kind} of` : suggestion.kind;
+}
+
+function relatedRow(suggestion, index) {
+  const target = suggestion.target;
+  const title = suggestion.target_entry_id
+    ? `<a class="relation-title" href="${pathForEntry(suggestion.target_entry_id)}" data-link>${escapeHtml(target.title)}</a>`
+    : `<span class="relation-title">${escapeHtml(target.title)}</span>`;
+  const details = [suggestion.evidence, target.subtitle, target.release_date?.slice(0, 10)].filter(Boolean);
+  return `<label class="relation-row related-row">
+    <input type="checkbox" name="pick" value="${index}" ${suggestion.direction === "incoming" ? "checked" : ""}>
+    <span class="related-what"><span class="related-phrase">${escapeHtml(relatedPhrase(suggestion))}</span>${title}</span>
+    <span class="relation-kind">${storeKindTag(target.kind)} ${suggestion.target_entry_id ? "in NRS" : "new entry"}</span>
+    <span class="related-details">${escapeHtml(details.join(" · "))}</span>
+  </label>`;
 }
 
 function relationSectionsMarkup(relations) {
@@ -2022,11 +2200,13 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <h2>Relations <span class="count">${data.relations.length}</span></h2>
         <p class="section-lead">Structure, lineage, credits, and influence. Open only the branch you need.</p>
         ${data.relations.length ? `<div class="relation-sections">${relationSectionsMarkup(data.relations)}</div>` : `<p class="empty">No relations yet.</p>`}
+        <div class="related-slot"></div>
         <div class="section-actions"><button class="button primary" type="button" data-action="add-relation">add relation</button></div>
       </section>`;
     bindKindSelect(data);
     bindInlineSplits(data);
     bindTracklist(data);
+    bindRelated(data);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {
       if (!(element instanceof HTMLDetailsElement)) return;
       const key = element.getAttribute("data-disclosure");

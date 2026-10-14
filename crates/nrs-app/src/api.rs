@@ -1,5 +1,9 @@
 //! Versioned JSON API for the dependency-free browser client.
 
+mod adopt;
+
+pub(crate) use adopt::{entry_adopt, entry_related, entry_related_add, stores_search};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,12 +19,12 @@ use super::score_filter::{Candidate, ScoreFilter};
 use super::{
     build_impact_atoms, build_relation, dah_factor_field, dah_params_json, entry_display_name,
     entry_kind, entry_kind_slug, impact_anchor_mix, impact_kind_presentation,
-    impact_period_summary, impact_primary_metric, impact_section, inferred_kind, kind_from_store,
+    impact_period_summary, impact_primary_metric, impact_section, inferred_kind,
     normalize_duration_fields, normalize_period_fields, parsed_dah_params, rows, used_anchors,
     AppState, ImpactSection, KindHints, SortBy, SortDir, TrackedStore, ENTRY_KINDS,
 };
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(super) struct ApiError {
     error: String,
 }
@@ -145,23 +149,14 @@ pub(super) async fn entry_ingest(
     let mut store = store
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-    let id = match store
-        .find_entry("url", &bind_url)
-        .map_err(|error| store_error("look up ingested entry", error))?
-    {
-        Some(id) => id,
-        None => {
-            let id = store
-                .add_entry("url", &bind_url, Some(&metadata.title))
-                .map_err(|error| store_error("add ingested entry", error))?;
-            if let Some(kind) = kind_from_store(&metadata.kind) {
-                store
-                    .set_entry_kind(&id, Some(kind))
-                    .map_err(|error| store_error("set ingested entry kind", error))?;
-            }
-            id
-        }
-    };
+    // An entry already bound under another of the store's URLs is this one.
+    let (id, _) = adopt::bind_entry(
+        &mut store,
+        &bind_url,
+        &metadata.urls,
+        &metadata.title,
+        &metadata.kind,
+    )?;
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(id.0),

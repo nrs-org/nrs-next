@@ -211,6 +211,8 @@ async fn main() {
         .route("/review", get(api::review_queue))
         .route("/entries", get(api::entries_index))
         .route("/entries/ingest", post(api::entry_ingest))
+        .route("/entries/adopt", post(api::entry_adopt))
+        .route("/stores/search", get(api::stores_search))
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
         .route("/entries/{entry_id}/impacts", post(api::impact_add))
@@ -219,6 +221,10 @@ async fn main() {
             get(api::progress_basis),
         )
         .route("/entries/{entry_id}/tracklist", get(api::entry_tracklist))
+        .route(
+            "/entries/{entry_id}/related",
+            get(api::entry_related).post(api::entry_related_add),
+        )
         .route(
             "/entries/{entry_id}/impacts/{impact_id}",
             put(api::impact_edit).delete(api::impact_delete),
