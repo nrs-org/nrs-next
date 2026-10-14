@@ -19,6 +19,7 @@ palette, pairwise calibration, K (pooling exponents), and the review queue.
 | `/api/v1/entries` | GET | Search and pagination; `q`, `offset`, `limit` |
 | `/api/v1/entries/ingest` | POST | Ingest through the configured anime store |
 | `/api/v1/entries/{entry}` | GET | Entry, impacts, and relations |
+| `/api/v1/entries/{entry}/score` | GET | Score breakdown at the stored time settings: V, overall and per-type rank, each anchor's share of V (own vs borrowed), and each anchor's share split across the own impacts and lender entries' impacts whose mass reaches it |
 | `/api/v1/entries/{entry}/impacts` | POST | Add a standards impact |
 | `/api/v1/entries/{entry}/impacts/{impact}` | PUT, DELETE | Edit or remove a standards impact |
 | `/api/v1/entries/{entry}/impacts/{impact}/raw` | PUT | Review source atoms and note while preserving imported time supports |

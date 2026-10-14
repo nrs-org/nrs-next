@@ -184,11 +184,29 @@ fn cap(mut phi: Fractions) -> Fractions {
 const MAX_CYCLE_ITERATIONS: usize = 10_000;
 const CYCLE_TOLERANCE: f64 = 1e-12;
 
+/// The solved borrow graph: every `(entry, anchor)` node, its own mass,
+/// and its origin fractions `phi`.
+pub(crate) struct Borrow {
+    entries: Interner<EntryId>,
+    anchors: Interner<AnchorId>,
+    nodes: Vec<Node>,
+    own: Vec<f64>,
+    own_spans: Vec<Vec<Span>>,
+    phi: Vec<Fractions>,
+    /// Every entry, including ones without nodes.
+    keys: Vec<EntryId>,
+}
+
 /// Phase 2: return every entry's fully-borrowed embedded measure.
 pub(crate) fn solve_relations(
     measures: BTreeMap<EntryId, Measure>,
     relations: &[Relation],
 ) -> BTreeMap<EntryId, Measure> {
+    borrow(measures, relations).resolved()
+}
+
+/// Phase 2's solve: every node's origin fractions `phi`.
+pub(crate) fn borrow(measures: BTreeMap<EntryId, Measure>, relations: &[Relation]) -> Borrow {
     let mut entries: Interner<EntryId> = Interner::new();
     let mut anchors: Interner<AnchorId> = Interner::new();
 
@@ -298,30 +316,71 @@ pub(crate) fn solve_relations(
         }
     }
 
-    let mut out: BTreeMap<EntryId, Measure> = measures
-        .keys()
-        .map(|e| (e.clone(), Measure::new()))
-        .collect();
-    for (i, &(e, a)) in nodes.iter().enumerate() {
-        let entry = entries.resolve(e);
-        let anchor = anchors.resolve(a);
-        let mass: f64 = phi[i].iter().map(|(&o, &f)| f * own[o]).sum();
-        if mass != 0.0 {
-            out.entry(entry.clone())
-                .or_default()
-                .undated
-                .insert(anchor.clone(), mass);
-        }
-        for (&o, &f) in &phi[i] {
-            for span in &own_spans[o] {
-                let e = f * span.e;
-                if e != 0.0 {
-                    out.entry(entry.clone())
-                        .or_default()
-                        .add_span(anchor, Span { e, ..*span });
+    Borrow {
+        entries,
+        anchors,
+        nodes,
+        own,
+        own_spans,
+        phi,
+        keys: measures.into_keys().collect(),
+    }
+}
+
+impl Borrow {
+    /// Every entry's fully-borrowed embedded measure.
+    pub(crate) fn resolved(&self) -> BTreeMap<EntryId, Measure> {
+        let mut out: BTreeMap<EntryId, Measure> = self
+            .keys
+            .iter()
+            .map(|e| (e.clone(), Measure::new()))
+            .collect();
+        for (i, &(e, a)) in self.nodes.iter().enumerate() {
+            let entry = self.entries.resolve(e);
+            let anchor = self.anchors.resolve(a);
+            let mass: f64 = self.phi[i].iter().map(|(&o, &f)| f * self.own[o]).sum();
+            if mass != 0.0 {
+                out.entry(entry.clone())
+                    .or_default()
+                    .undated
+                    .insert(anchor.clone(), mass);
+            }
+            for (&o, &f) in &self.phi[i] {
+                for span in &self.own_spans[o] {
+                    let e = f * span.e;
+                    if e != 0.0 {
+                        out.entry(entry.clone())
+                            .or_default()
+                            .add_span(anchor, Span { e, ..*span });
+                    }
                 }
             }
         }
+        out
     }
-    out
+
+    /// Where `entry`'s mass comes from: `(anchor, origin entry, origin
+    /// anchor, phi)` for every own-mass node reaching one of its anchors.
+    /// The origin is `entry` itself for its own impacts.
+    pub(crate) fn origins(&self, entry: &EntryId) -> Vec<(&AnchorId, &EntryId, &AnchorId, f64)> {
+        let Some(&e) = self.entries.id_of.get(entry) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, &(node_entry, a)) in self.nodes.iter().enumerate() {
+            if node_entry != e {
+                continue;
+            }
+            for (&o, &f) in &self.phi[i] {
+                let (origin_entry, origin_anchor) = self.nodes[o];
+                out.push((
+                    self.anchors.resolve(a),
+                    self.entries.resolve(origin_entry),
+                    self.anchors.resolve(origin_anchor),
+                    f,
+                ));
+            }
+        }
+        out
+    }
 }

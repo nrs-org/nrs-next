@@ -1092,6 +1092,122 @@ function relatedRow(suggestion, index) {
   </label>`;
 }
 
+function formatContribution(value) {
+  const rounded = Math.abs(value) < .005 ? 0 : value;
+  return rounded.toFixed(2);
+}
+
+// A bar of |value| against the largest |value| shown beside it;
+// negatives read in oxblood.
+function contributionBar(value, scale, parts = null) {
+  const width = scale > 0 ? Math.min(1, Math.abs(value) / scale) * 100 : 0;
+  if (value < 0) return `<span class="score-bar"><span class="negative" style="width:${width}%"></span></span>`;
+  const segments = parts
+    ? parts.filter(([, part]) => part > 0).map(([kind, part]) => `<span class="${kind}" style="width:${(part / value) * width}%"></span>`).join("")
+    : `<span class="own" style="width:${width}%"></span>`;
+  return `<span class="score-bar">${segments}</span>`;
+}
+
+function anchorStrip(anchors) {
+  const positive = anchors.filter((anchor) => anchor.contribution > 0);
+  const total = positive.reduce((sum, anchor) => sum + anchor.contribution, 0);
+  if (!(total > 0)) return "";
+  return `<div class="score-strip" aria-hidden="true">${positive.map((anchor, index) => {
+    const share = anchor.contribution / total;
+    return `<span style="width:${share * 100}%;background:${splitColors[index % splitColors.length]}" title="${escapeHtml(anchor.anchor)} ${formatContribution(anchor.contribution)}">${share >= .08 ? escapeHtml(anchor.anchor) : ""}</span>`;
+  }).join("")}</div>`;
+}
+
+function scoreAnchorRows(anchors, scale) {
+  return anchors.map((anchor) => {
+    const parts = [["own", anchor.own], ["borrowed", anchor.borrowed]];
+    const title = `mass ${anchor.mass.toFixed(3)} · embedded ${anchor.embedded.toFixed(3)} · own ${formatContribution(anchor.own)} · borrowed ${formatContribution(anchor.borrowed)}`;
+    return `<div class="score-row" title="${escapeHtml(title)}">
+      <span class="score-label mono">${escapeHtml(anchor.anchor)}</span>
+      ${contributionBar(anchor.contribution, scale, parts)}
+      <span class="score-amount">${formatContribution(anchor.contribution)}</span>
+    </div>`;
+  }).join("");
+}
+
+function scoreImpactRow(impact, scale, kind = "own") {
+  const anchors = impact.anchors.map(({ anchor, contribution }) => `<span class="chip">${escapeHtml(anchor)}<small>${formatContribution(contribution)}</small></span>`).join("");
+  return `<div class="score-row" title="${escapeHtml(impact.id)}">
+    <span class="score-label"><span>${escapeHtml(impact.title)}</span>${impact.anchors.length > 1 ? `<span class="score-chips">${anchors}</span>` : `<span class="dim mono">${escapeHtml(impact.anchors[0]?.anchor || "")}</span>`}</span>
+    ${contributionBar(impact.contribution, scale, kind === "own" ? null : [[kind, impact.contribution]])}
+    <span class="score-amount">${formatContribution(impact.contribution)}</span>
+  </div>`;
+}
+
+function scoreLender(lender, scale, openDisclosures) {
+  const key = `score-lender-${lender.entry.id}`;
+  const innerScale = Math.max(...lender.impacts.map((impact) => Math.abs(impact.contribution)), 0);
+  return `<details class="score-lender" data-disclosure="${escapeHtml(key)}"${openDisclosures.has(key) ? " open" : ""}>
+    <summary class="score-row">
+      <span class="score-label"><span><span class="disclosure">▶</span> <a href="${pathForEntry(lender.entry.id)}" data-link>${escapeHtml(lender.entry.title)}</a></span> ${kindTag(lender.entry.kind)}</span>
+      ${contributionBar(lender.contribution, scale, [["borrowed", lender.contribution]])}
+      <span class="score-amount">${formatContribution(lender.contribution)}</span>
+    </summary>
+    <div class="score-lender-body">${lender.impacts.map((impact) => scoreImpactRow(impact, innerScale, "borrowed")).join("")}</div>
+  </details>`;
+}
+
+// Past this many lenders the rest fold behind one disclosure.
+const SCORE_LENDER_LIMIT = 8;
+
+function scorePanelMarkup(score, openDisclosures) {
+  const ownTotal = score.own.reduce((sum, impact) => sum + impact.contribution, 0);
+  const borrowedTotal = score.borrowed.reduce((sum, lender) => sum + lender.contribution, 0);
+  const anchorScale = Math.max(...score.anchors.map((anchor) => Math.abs(anchor.contribution)), 0);
+  const sourceScale = Math.max(...score.own.map((impact) => Math.abs(impact.contribution)), ...score.borrowed.map((lender) => Math.abs(lender.contribution)), 0);
+  const rank = (rank, total, label) => `<div><dt>${escapeHtml(label)}</dt><dd>${rank == null ? "—" : `#${rank}`}<small> / ${total}</small></dd></div>`;
+  const lenders = score.borrowed.map((lender) => scoreLender(lender, sourceScale, openDisclosures));
+  const moreKey = "score-lenders-more";
+  const lenderMarkup = lenders.length > SCORE_LENDER_LIMIT
+    ? `${lenders.slice(0, SCORE_LENDER_LIMIT).join("")}<details class="score-more" data-disclosure="${moreKey}"${openDisclosures.has(moreKey) ? " open" : ""}><summary>${lenders.length - SCORE_LENDER_LIMIT} more entries</summary>${lenders.slice(SCORE_LENDER_LIMIT).join("")}</details>`
+    : lenders.join("");
+  return `
+    <h2>Score</h2>
+    <div class="score-head">
+      <div class="score-value"><span class="mono">${score.value.toFixed(2)}</span><small>V</small></div>
+      <dl class="score-ranks">
+        ${rank(score.rank, score.total, "overall")}
+        ${rank(score.kind_rank, score.kind_total, score.kind)}
+        <div><dt>time</dt><dd>λ ${score.time.shared.toFixed(2)}<small> · L ${Math.round(score.time.length_days)}d</small></dd></div>
+      </dl>
+    </div>
+    ${score.anchors.length ? anchorStrip(score.anchors) : `<p class="empty">No scored mass yet.</p>`}
+    ${score.anchors.length ? `<div class="score-columns">
+      <section>
+        <h3 class="subsection-title">By anchor<span class="count">${score.anchors.length}</span></h3>
+        <p class="section-intro">Each anchor's share of V after pooling. <span class="legend own"></span>own <span class="legend borrowed"></span>borrowed</p>
+        <div class="score-rows">${scoreAnchorRows(score.anchors, anchorScale)}</div>
+      </section>
+      <section>
+        <h3 class="subsection-title">By source</h3>
+        <p class="section-intro">Each anchor's share split across the impacts whose mass reaches it. Borrowed mass is listed under the entry that holds the impact, however many relations it passed through.</p>
+        ${score.own.length ? `<h4 class="score-group">Own impacts <span class="score-amount">${formatContribution(ownTotal)}</span></h4><div class="score-rows">${score.own.map((impact) => scoreImpactRow(impact, sourceScale)).join("")}</div>` : ""}
+        ${score.borrowed.length ? `<h4 class="score-group">Borrowed from ${score.borrowed.length} ${score.borrowed.length === 1 ? "entry" : "entries"} <span class="score-amount">${formatContribution(borrowedTotal)}</span></h4><div class="score-rows">${lenderMarkup}</div>` : ""}
+      </section>
+    </div>` : ""}`;
+}
+
+async function bindScore(data, openDisclosures) {
+  const panel = app.querySelector("[data-score]");
+  if (!(panel instanceof HTMLElement)) return;
+  let score;
+  try {
+    const response = await fetch(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/score`);
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HTTP ${response.status}`);
+    score = await response.json();
+  } catch (error) {
+    if (currentEntryData === data && panel.isConnected) panel.innerHTML = `<h2>Score</h2><p class="error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`;
+    return;
+  }
+  if (currentEntryData !== data || !panel.isConnected) return;
+  panel.innerHTML = scorePanelMarkup(score, openDisclosures);
+}
+
 function relationSectionsMarkup(relations) {
   return Object.entries(relationSections)
     .map(([section, [title, description, order]]) => {
@@ -2270,6 +2386,10 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <h1>${escapeHtml(data.entry.title)}</h1>
         <p class="muted mono">${kindSelect(data)} ${escapeHtml(data.entry.store)}:${escapeHtml(data.entry.store_id)}</p>
       </header>
+      <section class="page-section score-panel" data-score>
+        <h2>Score</h2>
+        <p class="loading">Scoring…</p>
+      </section>
       <section class="page-section">
         <h2>Impacts <span class="count">${data.impacts.length}</span></h2>
         <p class="section-lead">What this entry did, why it mattered, and which feeling or craft anchor carried it.</p>
@@ -2287,6 +2407,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
     bindInlineSplits(data);
     bindTracklist(data);
     bindRelated(data);
+    bindScore(data, openDisclosures);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {
       if (!(element instanceof HTMLDetailsElement)) return;
       const key = element.getAttribute("data-disclosure");

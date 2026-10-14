@@ -39,20 +39,67 @@ pub fn score(snap: &Snapshot, params: &Params) -> Scores {
 }
 
 /// Same contract as `score`, but returns one entry's per-anchor
-/// breakdown (INFRA.md §4.3 phase 3).
+/// breakdown (INFRA.md §4.3 phase 3), and each anchor's share split
+/// across the impacts whose mass reaches it (phase 2 in reverse).
 pub fn explain(snap: &Snapshot, params: &Params, entry: EntryId) -> Explanation {
     let kernel = pool::Kernel::new(&params.k_feat);
     let built = measure::build_measures(snap, &kernel);
-    let resolved = solve::solve_relations(built, &snap.relations);
+    let borrow = solve::borrow(built, &snap.relations);
+    let resolved = borrow.resolved();
 
     let empty = measure::Measure::new();
     let f = resolved.get(&entry).unwrap_or(&empty);
     let (value, contributions) = pool::value(f, &kernel, &params.time);
     let score = params.calibration.apply(value);
+    let sources = sources(snap, &kernel, &borrow, &entry, &contributions);
     Explanation {
         entry,
         value,
         score,
         contributions,
+        sources,
     }
+}
+
+/// Embedded mass is linear in `phi` and in impacts, so each anchor's
+/// mass splits exactly into impact pieces; its contribution is split in
+/// the same proportions, as `pool::value` already splits a box.
+fn sources(
+    snap: &Snapshot,
+    kernel: &pool::Kernel,
+    borrow: &solve::Borrow,
+    entry: &EntryId,
+    contributions: &[Contribution],
+) -> Vec<Source> {
+    use std::collections::BTreeMap;
+
+    let per_impact = measure::impact_embeds(snap, kernel);
+    let mut embedded: BTreeMap<(&AnchorId, &EntryId, &AnchorId, &ImpactId), f64> = BTreeMap::new();
+    for (anchor, origin, origin_anchor, phi) in borrow.origins(entry) {
+        let Some(impacts) = per_impact.get(&(origin.clone(), origin_anchor.clone())) else {
+            continue;
+        };
+        for (impact, e) in impacts {
+            *embedded
+                .entry((anchor, origin, origin_anchor, impact))
+                .or_insert(0.0) += phi * e;
+        }
+    }
+    let anchor_share: BTreeMap<&AnchorId, f64> = contributions
+        .iter()
+        .filter(|c| c.embedded != 0.0)
+        .map(|c| (&c.anchor, f64::from(c.contribution) / f64::from(c.embedded)))
+        .collect();
+    embedded
+        .into_iter()
+        .filter(|(_, e)| *e != 0.0)
+        .map(|((anchor, origin, origin_anchor, impact), e)| Source {
+            anchor: anchor.clone(),
+            entry: origin.clone(),
+            origin_anchor: origin_anchor.clone(),
+            impact: impact.clone(),
+            embedded: e as f32,
+            contribution: (e * anchor_share.get(anchor).copied().unwrap_or(0.0)) as f32,
+        })
+        .collect()
 }

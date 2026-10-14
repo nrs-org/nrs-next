@@ -222,6 +222,7 @@ async fn main() {
             get(api::progress_basis),
         )
         .route("/entries/{entry_id}/tracklist", get(api::entry_tracklist))
+        .route("/entries/{entry_id}/score", get(api::entry_score))
         .route(
             "/entries/{entry_id}/related",
             get(api::entry_related).post(api::entry_related_add),

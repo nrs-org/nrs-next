@@ -1638,6 +1638,249 @@ pub(super) async fn entry_detail(
     }))
 }
 
+/// One anchor's share of an entry's value, and how much of it came
+/// from the entry's own impacts versus entries it borrows from.
+#[derive(Serialize)]
+pub(super) struct AnchorPart {
+    anchor: String,
+    /// Resolved embedded mass `e` and its value-unit form `mass`.
+    embedded: f32,
+    mass: f32,
+    /// Euler share of V; the anchors sum to V.
+    contribution: f32,
+    own: f32,
+    borrowed: f32,
+}
+
+#[derive(Serialize)]
+pub(super) struct AnchorAmount {
+    anchor: String,
+    contribution: f32,
+}
+
+/// One impact's share of V: its anchors' contributions split by the
+/// embedded mass it puts there.
+#[derive(Serialize)]
+pub(super) struct ImpactPart {
+    /// The stored impact (a shared impact's id, not its member copy's).
+    id: String,
+    kind: Option<String>,
+    title: String,
+    contribution: f32,
+    anchors: Vec<AnchorAmount>,
+}
+
+/// Everything borrowed from one entry.
+#[derive(Serialize)]
+pub(super) struct LenderPart {
+    entry: EntrySummary,
+    contribution: f32,
+    impacts: Vec<ImpactPart>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ScoreBreakdown {
+    /// V, as on the scores page.
+    value: f32,
+    /// Overall rank by V, out of `total`, and among entries of `kind`.
+    rank: Option<usize>,
+    total: usize,
+    kind: &'static str,
+    kind_rank: Option<usize>,
+    kind_total: usize,
+    time: TimeParams,
+    /// Largest contribution first; they sum to `value`.
+    anchors: Vec<AnchorPart>,
+    own: Vec<ImpactPart>,
+    borrowed: Vec<LenderPart>,
+}
+
+/// Groups `sources` by stored impact, largest contribution first.
+fn impact_parts(
+    sources: &[&nrs_core::Source],
+    kinds: &HashMap<String, Option<String>>,
+) -> Vec<ImpactPart> {
+    let mut by_impact: HashMap<&str, HashMap<&str, f32>> = HashMap::new();
+    for source in sources {
+        let id = nrs_store::split_member_impact_id(&source.impact.0)
+            .map_or(source.impact.0.as_str(), |(base, _)| base);
+        *by_impact
+            .entry(id)
+            .or_default()
+            .entry(source.anchor.0.as_str())
+            .or_default() += source.contribution;
+    }
+    let mut parts: Vec<ImpactPart> = by_impact
+        .into_iter()
+        .map(|(id, anchors)| {
+            let kind = kinds.get(id).cloned().flatten();
+            let (_, title, _) = impact_kind_presentation(kind.as_deref());
+            let mut anchors: Vec<AnchorAmount> = anchors
+                .into_iter()
+                .map(|(anchor, contribution)| AnchorAmount {
+                    anchor: anchor.to_string(),
+                    contribution,
+                })
+                .collect();
+            anchors.sort_by(|a, b| b.contribution.total_cmp(&a.contribution));
+            ImpactPart {
+                id: id.to_string(),
+                kind,
+                title: title.to_string(),
+                contribution: anchors.iter().map(|a| a.contribution).sum(),
+                anchors,
+            }
+        })
+        .collect();
+    parts.sort_by(|a, b| {
+        b.contribution
+            .total_cmp(&a.contribution)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    parts
+}
+
+/// Stored impact id -> DAH kind, for `entries`' impacts.
+fn impact_kinds<'a>(
+    store: &TrackedStore,
+    entries: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, Option<String>>, (StatusCode, Json<ApiError>)> {
+    let mut kinds = HashMap::new();
+    for entry in entries {
+        let impacts = store
+            .impacts_for_entry(&EntryId(entry.into()))
+            .map_err(|error| store_error("load impacts", error))?;
+        kinds.extend(
+            impacts
+                .into_iter()
+                .map(|impact| (impact.id.0, impact.dah_kind)),
+        );
+    }
+    Ok(kinds)
+}
+
+/// Where an entry's V comes from: `explain` at the stored time settings,
+/// grouped by anchor, by own impact, and by the entries it borrows from.
+pub(super) async fn entry_score(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> ApiResult<ScoreBreakdown> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entry API requires database mode",
+        )
+    })?;
+    let (generation, time) = current(&state)?;
+    let key = ScoresKey {
+        generation,
+        shared_bits: time.shared.to_bits(),
+        length_bits: time.length_days.to_bits(),
+    };
+    let ranking = scored(&state, key)?;
+
+    let (snapshot, k_feat) = {
+        let store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        let (snapshot, params) = store
+            .load_snapshot()
+            .map_err(|error| store_error("load scores", error))?;
+        (snapshot, params.k_feat)
+    };
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.id.0 == entry_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "entry not found"))?;
+    let explanation = nrs_core::explain(
+        &snapshot,
+        &super::params(k_feat, time),
+        EntryId(entry_id.clone()),
+    );
+
+    let (own_sources, borrowed_sources): (Vec<_>, Vec<_>) = explanation
+        .sources
+        .iter()
+        .partition(|source| source.entry.0 == entry_id);
+    let mut by_lender: HashMap<&str, Vec<&nrs_core::Source>> = HashMap::new();
+    for source in &borrowed_sources {
+        by_lender.entry(&source.entry.0).or_default().push(source);
+    }
+    let (kinds, hints) = {
+        let store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        let lenders = by_lender.keys().copied();
+        let kinds = impact_kinds(&store, std::iter::once(entry_id.as_str()).chain(lenders))?;
+        (kinds, kind_hints(&state, &store)?)
+    };
+
+    let own_by_anchor = |sources: &[&nrs_core::Source], anchor: &str| -> f32 {
+        sources
+            .iter()
+            .filter(|source| source.anchor.0 == anchor)
+            .map(|source| source.contribution)
+            .sum()
+    };
+    let mut anchors: Vec<AnchorPart> = explanation
+        .contributions
+        .iter()
+        .map(|c| AnchorPart {
+            anchor: c.anchor.0.clone(),
+            embedded: c.embedded,
+            mass: c.mass,
+            contribution: c.contribution,
+            own: own_by_anchor(&own_sources, &c.anchor.0),
+            borrowed: own_by_anchor(&borrowed_sources, &c.anchor.0),
+        })
+        .collect();
+    anchors.sort_by(|a, b| b.contribution.total_cmp(&a.contribution));
+
+    let entries: HashMap<&str, &Entry> = snapshot
+        .entries
+        .iter()
+        .map(|entry| (entry.id.0.as_str(), entry))
+        .collect();
+    let mut borrowed: Vec<LenderPart> = by_lender
+        .into_iter()
+        .filter_map(|(lender, sources)| {
+            let impacts = impact_parts(&sources, &kinds);
+            Some(LenderPart {
+                entry: EntrySummary::new(entries.get(lender)?, &hints),
+                contribution: impacts.iter().map(|impact| impact.contribution).sum(),
+                impacts,
+            })
+        })
+        .collect();
+    borrowed.sort_by(|a, b| {
+        b.contribution
+            .total_cmp(&a.contribution)
+            .then_with(|| a.entry.id.cmp(&b.entry.id))
+    });
+
+    let kind = entry_kind(&entry_id, &entry.store, &hints);
+    let ranking = ranking.as_deref().map(Vec::as_slice).unwrap_or_default();
+    let of_kind = || ranking.iter().filter(|row| row.kind == kind);
+    Ok(Json(ScoreBreakdown {
+        value: explanation.value,
+        rank: ranking
+            .iter()
+            .find(|row| row.id == entry_id)
+            .map(|row| row.rank),
+        total: ranking.len(),
+        kind,
+        kind_rank: of_kind()
+            .position(|row| row.id == entry_id)
+            .map(|index| index + 1),
+        kind_total: of_kind().count(),
+        time,
+        anchors,
+        own: impact_parts(&own_sources, &kinds),
+        borrowed,
+    }))
+}
+
 #[derive(Deserialize)]
 pub(super) struct KindUpdate {
     /// One of `ENTRY_KINDS`; `None` goes back to the inferred kind.

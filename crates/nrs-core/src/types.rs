@@ -293,6 +293,23 @@ pub struct Contribution {
     pub contribution: f32,
 }
 
+/// One impact's part in an anchor's contribution. `entry` holds the
+/// impact: the explained entry itself, or one it borrows from (through
+/// `origin_anchor`, which differs from `anchor` only under `Transport`).
+/// `embedded` is the impact's embedded mass that reaches `anchor`; the
+/// sources of one anchor sum to its `embedded`. `contribution` is the
+/// anchor's contribution split by that embedded mass, so the sources of
+/// one anchor sum to its contribution as well.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    pub anchor: AnchorId,
+    pub entry: EntryId,
+    pub origin_anchor: AnchorId,
+    pub impact: ImpactId,
+    pub embedded: f32,
+    pub contribution: f32,
+}
+
 /// `explain`'s output: the per-cell breakdown behind one entry's score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explanation {
@@ -300,6 +317,7 @@ pub struct Explanation {
     pub value: f32,
     pub score: f32,
     pub contributions: Vec<Contribution>,
+    pub sources: Vec<Source>,
 }
 
 #[cfg(test)]

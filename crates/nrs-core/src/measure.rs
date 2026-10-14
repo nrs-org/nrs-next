@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use crate::pool::Kernel;
-use crate::types::{AnchorId, Atom, EntryId, Snapshot, TimeSupport};
+use crate::types::{AnchorId, Atom, EntryId, ImpactId, Snapshot, TimeSupport};
 
 /// Embedded mass `e` spread evenly over days `[from, to)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +73,30 @@ fn atom_mass(atom: &Atom) -> f32 {
     atom.magnitude * life(&atom.time)
 }
 
+/// One atom's embedded pieces: per blend anchor, its share's embedded
+/// mass `e` and, for a dated atom, the days `[from, to)` it spreads over.
+fn atom_embeds<'a>(
+    atom: &'a Atom,
+    kernel: &'a Kernel,
+) -> impl Iterator<Item = (&'a AnchorId, f64, Option<(f64, f64)>)> + 'a {
+    let mass = f64::from(atom_mass(atom));
+    atom.blend.iter().filter_map(move |(anchor, frac)| {
+        let share = mass * f64::from(*frac);
+        if share == 0.0 {
+            return None;
+        }
+        let e = sgnpow(share, 1.0 / kernel.exponent_of(anchor));
+        let days = match atom.time {
+            TimeSupport::Interval { from, to } => {
+                let from = f64::from(from);
+                Some((from, f64::from(to).max(from + 1.0)))
+            }
+            _ => None,
+        };
+        Some((anchor, e, days))
+    })
+}
+
 /// Build every entry's own embedded measure from its impacts' atoms,
 /// before any relation is applied. An atom's mass splits across its
 /// blend anchors in proportion to the blend weights, and each share
@@ -85,25 +109,35 @@ pub(crate) fn build_measures(snap: &Snapshot, kernel: &Kernel) -> BTreeMap<Entry
     for impact in &snap.impacts {
         let measure = measures.entry(impact.target.clone()).or_default();
         for atom in &impact.atoms {
-            let mass = f64::from(atom_mass(atom));
-            for (anchor, frac) in &atom.blend {
-                let share = mass * f64::from(*frac);
-                if share == 0.0 {
-                    continue;
-                }
-                let e = sgnpow(share, 1.0 / kernel.exponent_of(anchor));
-                match atom.time {
-                    TimeSupport::Interval { from, to } => {
-                        let from = f64::from(from);
-                        let to = f64::from(to).max(from + 1.0);
-                        measure.add_span(anchor, Span { from, to, e });
-                    }
-                    _ => *measure.undated.entry(anchor.clone()).or_insert(0.0) += e,
+            for (anchor, e, days) in atom_embeds(atom, kernel) {
+                match days {
+                    Some((from, to)) => measure.add_span(anchor, Span { from, to, e }),
+                    None => *measure.undated.entry(anchor.clone()).or_insert(0.0) += e,
                 }
             }
         }
     }
     measures
+}
+
+/// Each impact's own embedded mass per `(target, anchor)`, undated and
+/// dated together: the pieces `build_measures` sums, kept apart.
+pub(crate) fn impact_embeds(
+    snap: &Snapshot,
+    kernel: &Kernel,
+) -> BTreeMap<(EntryId, AnchorId), BTreeMap<ImpactId, f64>> {
+    let mut out: BTreeMap<(EntryId, AnchorId), BTreeMap<ImpactId, f64>> = BTreeMap::new();
+    for impact in &snap.impacts {
+        for atom in &impact.atoms {
+            for (anchor, e, _) in atom_embeds(atom, kernel) {
+                *out.entry((impact.target.clone(), anchor.clone()))
+                    .or_default()
+                    .entry(impact.id.clone())
+                    .or_insert(0.0) += e;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

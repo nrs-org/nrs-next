@@ -277,6 +277,42 @@ fn explain_agrees_with_score() {
     assert!(close(sum, ex.value), "{sum} vs {}", ex.value);
 }
 
+/// Sources split each anchor's mass and contribution across the impacts
+/// reaching it, own and borrowed, and sum back to both.
+#[test]
+fn explain_sources_sum_to_each_anchor() {
+    let snap = snapshot(
+        &["a", "b", "c"],
+        vec![
+            impact("ia1", "a", vec![moment("hype", 1.0), moment("cozy", 2.0)]),
+            impact("ia2", "a", vec![moment("hype", 3.0)]),
+            impact("ib", "b", vec![moment("cozy", 1.0), moment("music", 2.0)]),
+            impact("ic", "c", vec![moment("music", 5.0)]),
+        ],
+        vec![
+            rel(RelKind::Contains, "a", "b", 0.5),
+            rel(RelKind::Remix, "b", "a", 0.2),
+        ],
+    );
+    let ex = explain(&snap, &params(), EntryId("a".into()));
+    for c in &ex.contributions {
+        let of_anchor: Vec<_> = ex.sources.iter().filter(|s| s.anchor == c.anchor).collect();
+        let embedded: f32 = of_anchor.iter().map(|s| s.embedded).sum();
+        let contribution: f32 = of_anchor.iter().map(|s| s.contribution).sum();
+        assert!(close(embedded, c.embedded), "{:?}: {embedded} vs {}", c.anchor, c.embedded);
+        assert!(close(contribution, c.contribution), "{:?}", c.anchor);
+    }
+    let from = |impact: &str| -> Vec<&Source> {
+        ex.sources.iter().filter(|s| s.impact.0 == impact).collect()
+    };
+    assert_eq!(from("ia2").len(), 1);
+    assert!(from("ib").iter().all(|s| s.entry.0 == "b"));
+    assert_eq!(from("ib").len(), 2, "b lends cozy and music");
+    assert!(from("ic").is_empty(), "c is unrelated");
+    let total: f32 = ex.sources.iter().map(|s| s.contribution).sum();
+    assert!(close(total, ex.value));
+}
+
 /// An entry with no mass scores zero and has no contributions.
 #[test]
 fn empty_entry_scores_zero() {
