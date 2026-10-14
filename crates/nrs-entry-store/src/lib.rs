@@ -1,4 +1,4 @@
-//! Blocking client for the NRS Store Protocol v0.4.
+//! Blocking client for the NRS Store Protocol v0.5.
 //!
 //! NRS persists only the opaque `(store, store_id)` returned by a type
 //! store. Provider identifiers, aliases, metadata aggregation, and
@@ -56,6 +56,9 @@ pub struct EntryMeta {
     pub canonical_url: Option<String>,
     #[serde(default)]
     pub urls: Vec<String>,
+    /// Added in 0.5 (see `EntrySummary`).
+    #[serde(default)]
+    pub edition_group: Option<String>,
     #[serde(default)]
     pub extra: Value,
 }
@@ -79,6 +82,9 @@ pub struct EntrySummary {
     /// Every URL the store knows the entry by, `canonical_url` included.
     #[serde(default)]
     pub urls: Vec<String>,
+    /// Shared by editions of one work, e.g. an album's releases (0.5).
+    #[serde(default)]
+    pub edition_group: Option<String>,
 }
 
 /// A `lookup` match: the store ID a query already belongs to, plus
