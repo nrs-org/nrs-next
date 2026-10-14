@@ -14,10 +14,10 @@ use serde_json::{json, Value};
 use super::score_filter::{Candidate, ScoreFilter};
 use super::{
     build_impact_atoms, build_relation, dah_factor_field, dah_params_json, entry_display_name,
-    entry_kind, impact_anchor_mix, impact_kind_presentation, impact_period_summary,
-    impact_primary_metric, impact_section, normalize_duration_fields, normalize_period_fields,
-    parsed_dah_params, rows, used_anchors, AppState, ImpactSection, KindHints, SortBy, SortDir,
-    TrackedStore, ENTRY_KINDS,
+    entry_kind, entry_kind_slug, impact_anchor_mix, impact_kind_presentation,
+    impact_period_summary, impact_primary_metric, impact_section, inferred_kind, kind_from_store,
+    normalize_duration_fields, normalize_period_fields, parsed_dah_params, rows, used_anchors,
+    AppState, ImpactSection, KindHints, SortBy, SortDir, TrackedStore, ENTRY_KINDS,
 };
 
 #[derive(Serialize)]
@@ -150,9 +150,17 @@ pub(super) async fn entry_ingest(
         .map_err(|error| store_error("look up ingested entry", error))?
     {
         Some(id) => id,
-        None => store
-            .add_entry("url", &bind_url, Some(&metadata.title))
-            .map_err(|error| store_error("add ingested entry", error))?,
+        None => {
+            let id = store
+                .add_entry("url", &bind_url, Some(&metadata.title))
+                .map_err(|error| store_error("add ingested entry", error))?;
+            if let Some(kind) = kind_from_store(&metadata.kind) {
+                store
+                    .set_entry_kind(&id, Some(kind))
+                    .map_err(|error| store_error("set ingested entry kind", error))?;
+            }
+            id
+        }
     };
     Ok(Json(MutationResponse {
         ok: true,
@@ -254,8 +262,7 @@ fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode,
     if let Some(hit) = cached_ranking(state, key) {
         return Ok(Some(hit));
     }
-    let rank = |snapshot: &nrs_core::Snapshot, k_feat| -> Vec<Scored> {
-        let hints = KindHints::new(snapshot);
+    let rank = |snapshot: &nrs_core::Snapshot, k_feat, hints: KindHints| -> Vec<Scored> {
         rows(snapshot, SortBy::Value, SortDir::Desc, k_feat, key.time())
             .into_iter()
             .enumerate()
@@ -280,10 +287,19 @@ fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode,
         let (snapshot, params) = store
             .load_snapshot()
             .map_err(|error| store_error("load scores", error))?;
+        let stored = store
+            .entry_kinds()
+            .map_err(|error| store_error("load entry kinds", error))?;
         drop(store);
-        rank(&snapshot, params.k_feat)
+        let hints = KindHints::new(&snapshot).with_stored(stored);
+        rank(&snapshot, params.k_feat, hints)
     } else {
-        rank(&state.snapshot, state.snapshot.palette.k_feat.clone())
+        let hints = KindHints::new(&state.snapshot);
+        rank(
+            &state.snapshot,
+            state.snapshot.palette.k_feat.clone(),
+            hints,
+        )
     };
 
     let ranking = Arc::new(ranking);
@@ -938,7 +954,10 @@ fn kind_hints(
     let (snapshot, _) = store
         .load_snapshot()
         .map_err(|error| store_error("load relations", error))?;
-    let hints = Arc::new(KindHints::new(&snapshot));
+    let stored = store
+        .entry_kinds()
+        .map_err(|error| store_error("load entry kinds", error))?;
+    let hints = Arc::new(KindHints::new(&snapshot).with_stored(stored));
     *cache = Some((store.generation, hints.clone()));
     Ok(hints)
 }
@@ -1527,6 +1546,9 @@ fn tracklist(
 #[derive(Serialize)]
 pub(super) struct EntryResponse {
     entry: EntrySummary,
+    /// The kind with no stored one, and whether one is stored.
+    inferred_kind: &'static str,
+    kind_stored: bool,
     impacts: Vec<Impact>,
     relations: Vec<Relation>,
 }
@@ -1609,11 +1631,51 @@ pub(super) async fn entry_detail(
         .collect();
     Ok(Json(EntryResponse {
         entry: EntrySummary::new(entry, &hints),
+        inferred_kind: inferred_kind(&entry.id.0, &entry.store, &hints),
+        kind_stored: hints.stored.contains_key(&entry.id.0),
         impacts: impacts
             .iter()
             .map(|impact| impact_response(impact, &lookup, &hints))
             .collect(),
         relations: relation_responses,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct KindUpdate {
+    /// One of `ENTRY_KINDS`; `None` goes back to the inferred kind.
+    kind: Option<String>,
+}
+
+pub(super) async fn entry_kind_set(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Json(update): Json<KindUpdate>,
+) -> ApiResult<MutationResponse> {
+    let kind = match update.kind.as_deref() {
+        None => None,
+        Some(kind) => Some(entry_kind_slug(kind).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown entry kind {kind:?}"),
+            )
+        })?),
+    };
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entry writes require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    store
+        .set_entry_kind(&EntryId(entry_id.clone()), kind)
+        .map_err(|error| store_error("set entry kind", error))?;
+    Ok(Json(MutationResponse {
+        ok: true,
+        id: Some(entry_id),
     }))
 }
 

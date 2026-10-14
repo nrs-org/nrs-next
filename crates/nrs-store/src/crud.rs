@@ -172,6 +172,49 @@ impl Store {
         Ok(EntryId(id))
     }
 
+    /// Entries with a stored kind (see `set_entry_kind`), by entry id.
+    pub fn entry_kinds(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind FROM entry WHERE kind IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Stores what kind of work `id` is; `None` clears it back to
+    /// inference.
+    pub fn set_entry_kind(&mut self, id: &EntryId, kind: Option<&str>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let before: Option<Option<String>> = tx
+            .query_row(
+                "SELECT kind FROM entry WHERE id = ?1",
+                params![id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(before) = before else {
+            return Err(StoreError::Invalid(format!("no entry {}", id.0)));
+        };
+        if before.as_deref() == kind {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE entry SET kind = ?2 WHERE id = ?1",
+            params![id.0, kind],
+        )?;
+        append_event(
+            &tx,
+            EventKind::EntryEdit,
+            Some(&id.0),
+            Some(&serde_json::json!({ "kind": before }).to_string()),
+            Some(&serde_json::json!({ "kind": kind }).to_string()),
+            None,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn add_impact(
         &mut self,
         target: &EntryId,
@@ -602,6 +645,34 @@ mod tests {
             magnitude,
             time: TimeSupport::Moment,
         }
+    }
+
+    #[test]
+    fn set_entry_kind_stores_logs_and_clears() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.add_entry("url", "https://youtu.be/x", None).unwrap();
+        assert!(store.entry_kinds().unwrap().is_empty());
+
+        store.set_entry_kind(&id, Some("track")).unwrap();
+        assert_eq!(store.entry_kinds().unwrap()[&id.0], "track");
+        let (before, after): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT before, after FROM event WHERE kind = 'entry.edit' AND target = ?1",
+                params![id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (before.as_str(), after.as_str()),
+            (r#"{"kind":null}"#, r#"{"kind":"track"}"#)
+        );
+
+        store.set_entry_kind(&id, None).unwrap();
+        assert!(store.entry_kinds().unwrap().is_empty());
+        assert!(store
+            .set_entry_kind(&EntryId("missing".into()), Some("track"))
+            .is_err());
     }
 
     fn read_note(store: &Store, id: &ImpactId) -> Option<String> {

@@ -90,6 +90,31 @@ function kindTag(kind) {
   return `<span class="kind-tag" data-kind="${escapeHtml(kind)}">${escapeHtml(entryKinds[kind] || kind)}</span>`;
 }
 
+// The entry page's kind tag, as a picker: "auto" keeps the inferred kind.
+function kindSelect(data) {
+  const current = data.kind_stored ? data.entry.kind : "";
+  const option = (value, label) => `<option value="${escapeHtml(value)}" ${value === current ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  return `<select class="kind-tag kind-select" data-kind="${escapeHtml(data.entry.kind)}" aria-label="entry type" title="entry type">
+    ${option("", `auto: ${entryKinds[data.inferred_kind] || data.inferred_kind}`)}
+    ${Object.entries(entryKinds).map(([kind, label]) => option(kind, label)).join("")}
+  </select>`;
+}
+
+function bindKindSelect(data) {
+  const select = app.querySelector(".kind-select");
+  if (!(select instanceof HTMLSelectElement)) return;
+  select.addEventListener("change", async () => {
+    select.disabled = true;
+    try {
+      await sendJson(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/kind`, "PUT", { kind: select.value || null });
+      await renderEntry(data.entry.id, { quiet: true });
+    } catch (reason) {
+      showToast(reason?.message || String(reason), "error");
+      select.disabled = false;
+    }
+  });
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -1985,7 +2010,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
       <a class="back-link" href="/entries" data-link>← all entries</a>
       <header class="entry-header">
         <h1>${escapeHtml(data.entry.title)}</h1>
-        <p class="muted mono">${kindTag(data.entry.kind)} ${escapeHtml(data.entry.store)}:${escapeHtml(data.entry.store_id)}</p>
+        <p class="muted mono">${kindSelect(data)} ${escapeHtml(data.entry.store)}:${escapeHtml(data.entry.store_id)}</p>
       </header>
       <section class="page-section">
         <h2>Impacts <span class="count">${data.impacts.length}</span></h2>
@@ -1999,6 +2024,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         ${data.relations.length ? `<div class="relation-sections">${relationSectionsMarkup(data.relations)}</div>` : `<p class="empty">No relations yet.</p>`}
         <div class="section-actions"><button class="button primary" type="button" data-action="add-relation">add relation</button></div>
       </section>`;
+    bindKindSelect(data);
     bindInlineSplits(data);
     bindTracklist(data);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {

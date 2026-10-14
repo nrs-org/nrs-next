@@ -212,6 +212,7 @@ async fn main() {
         .route("/entries", get(api::entries_index))
         .route("/entries/ingest", post(api::entry_ingest))
         .route("/entries/{entry_id}", get(api::entry_detail))
+        .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
         .route("/entries/{entry_id}/impacts", post(api::impact_add))
         .route(
             "/entries/{entry_id}/progress-basis",
@@ -740,6 +741,9 @@ struct KindHints {
     credited: std::collections::HashSet<String>,
     /// Entries containing other music.
     contains_music: std::collections::HashSet<String>,
+    /// Kinds the store records (`Store::entry_kinds`), which win over
+    /// any inference.
+    stored: HashMap<String, &'static str>,
 }
 
 impl KindHints {
@@ -758,6 +762,34 @@ impl KindHints {
         }
         hints
     }
+
+    /// Adds the store's recorded kinds; unknown slugs are ignored.
+    fn with_stored(mut self, kinds: HashMap<String, String>) -> Self {
+        self.stored = kinds
+            .into_iter()
+            .filter_map(|(id, kind)| Some((id, entry_kind_slug(&kind)?)))
+            .collect();
+        self
+    }
+}
+
+/// `kind` as one of `ENTRY_KINDS`.
+fn entry_kind_slug(kind: &str) -> Option<&'static str> {
+    ENTRY_KINDS.iter().find(|slug| **slug == kind).copied()
+}
+
+/// The entry kind for a type store's own `kind` (`resolve`'s), when one
+/// fits.
+fn kind_from_store(store_kind: &str) -> Option<&'static str> {
+    Some(match store_kind {
+        "anime" | "anime_movie" => "anime",
+        "manga" | "novel" | "light_novel" | "one_shot" => "literature",
+        "visual_novel" => "vn",
+        "release" | "release_group" => "album",
+        "track" => "track",
+        "artist" => "artist",
+        _ => return None,
+    })
 }
 
 /// What kind of work an entry is. Legacy ids carry it in their shape,
@@ -766,8 +798,17 @@ impl KindHints {
 /// its tracks, ...). Music ids that shape doesn't settle are told apart
 /// by `hints`; against the legacy XML's explicit types this gets 1208
 /// of 1216 music entries right. Entries added through the store since
-/// get opaque ULIDs, so those fall back to what their store implies.
+/// get opaque ULIDs: they carry a stored kind, or fall back to what
+/// their store implies.
 fn entry_kind(id: &str, store: &str, hints: &KindHints) -> &'static str {
+    match hints.stored.get(id) {
+        Some(kind) => kind,
+        None => inferred_kind(id, store, hints),
+    }
+}
+
+/// `entry_kind` without the stored kind: what clearing it falls back to.
+fn inferred_kind(id: &str, store: &str, hints: &KindHints) -> &'static str {
     match id.split('-').next().unwrap_or("") {
         "A" => "anime",
         "M" if id.starts_with("M-VGMDB-AR-") => "artist",
@@ -1281,6 +1322,26 @@ mod tests {
         let ulid = "01M2600Y960YYWR278THQT8546";
         assert_eq!(entry_kind(ulid, "vgmdb-album", &hints), "album");
         assert_eq!(entry_kind(ulid, "anime", &hints), "anime");
+        assert_eq!(entry_kind(ulid, "url", &hints), "other");
+
+        let hints = hints.with_stored(HashMap::from([
+            (ulid.to_string(), "track".to_string()),
+            ("A-MAL-5114".to_string(), "literature".to_string()),
+            ("M-VGMDB-AL-85759".to_string(), "bogus".to_string()),
+        ]));
+        assert_eq!(entry_kind(ulid, "url", &hints), "track");
+        assert_eq!(entry_kind("A-MAL-5114", "none", &hints), "literature");
+        assert_eq!(entry_kind("M-VGMDB-AL-85759", "none", &hints), "album");
+    }
+
+    #[test]
+    fn store_kinds_map_onto_entry_kinds() {
+        assert_eq!(kind_from_store("anime_movie"), Some("anime"));
+        assert_eq!(kind_from_store("manga"), Some("literature"));
+        assert_eq!(kind_from_store("visual_novel"), Some("vn"));
+        assert_eq!(kind_from_store("release"), Some("album"));
+        assert_eq!(kind_from_store("track"), Some("track"));
+        assert_eq!(kind_from_store("person"), None);
     }
 
     #[test]

@@ -258,9 +258,16 @@ CREATE TABLE IF NOT EXISTS impact_split (
 );
 "#;
 
+const SCHEMA_V10: &str = r#"
+-- What kind of work an entry is (`anime`, `track`, ...), as the store
+-- that ingested it reported or as set in the app. NULL leaves it to the
+-- app's inference from legacy id shapes and relations.
+ALTER TABLE entry ADD COLUMN kind TEXT;
+"#;
+
 const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V9, SCHEMA_V10,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -280,7 +287,9 @@ mod tests {
     #[test]
     fn migration_removes_the_retired_central_alias_table() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        for migration in &MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
         conn.execute_batch(
             "CREATE TABLE entry_alias (entry TEXT, store TEXT, store_id TEXT);\
              PRAGMA user_version = 4;",

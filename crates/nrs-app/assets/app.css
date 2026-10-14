@@ -201,6 +201,12 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
   vertical-align: .1em;
 }
 .entry-title .kind-tag { margin-right: .55rem; }
+.kind-select {
+  appearance: none;
+  cursor: pointer;
+  padding-right: .45rem;
+}
+.kind-select option { background: var(--ink-900); color: var(--bone-300); }
 
 .kind-chips { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; margin-bottom: 1rem; }
 .kind-chip, .status-chip {
