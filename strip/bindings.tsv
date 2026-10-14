@@ -233,6 +233,7 @@ F-20221122T195753		local
 F-20221122T215201		local	
 F-20221128T123502		local	
 F-20230618T115627		local	
+F-20250417T125254		local	
 F-MAL-52962		local	
 F-VGMDB-10006	https://vgmdb.net/product/10006	legacy id	
 F-VGMDB-10135	https://vgmdb.net/product/10135	legacy id	
@@ -333,6 +334,7 @@ L-20241109T062928		local
 L-MAL-110953	https://myanimelist.net/manga/110953	legacy id	anime
 L-MAL-121484	https://myanimelist.net/manga/121484	legacy id	anime
 L-MAL-128337	https://myanimelist.net/manga/128337	legacy id	anime
+L-MAL-130414	https://myanimelist.net/manga/130414	legacy id	anime
 L-MAL-139873	https://myanimelist.net/manga/139873	legacy id	anime
 L-MAL-90810	https://myanimelist.net/manga/90810	legacy id	anime
 M-20220113T154228	https://musicbrainz.org/artist/75ca5f4e-e125-4642-b0fc-fa8832464f8d	timestamp-artist-decisions	musiclib
@@ -663,6 +665,10 @@ M-20250221T163932-7		local
 M-20250221T165439	https://musicbrainz.org/recording/bea3f246-2d88-4c92-adcd-0a16fd87beeb	timestamp-track-decisions	musiclib
 M-20250221T171218	https://musicbrainz.org/recording/0c43f1ff-ef99-4f78-bac6-21143b655991	timestamp-track-decisions	musiclib
 M-20250221T171421	https://youtu.be/Tsk7dbhAQIA	timestamp-track-decisions	musiclib
+M-20250417T125416		local	
+M-20250417T130521	https://youtu.be/07Fo-_-IOHE	final-stragglers	musiclib
+M-20250417T130522	https://youtu.be/ZG-Lsp7DvYE	final-stragglers	musiclib
+M-20250504T073237		local	
 M-20251104T141828	https://musicbrainz.org/release/d49ac23d-a226-49ec-8f0a-5945ea998b3d	timestamp-album-decisions	musiclib
 M-20251104T141828-1	https://musicbrainz.org/recording/f469242b-6dbe-4449-86d2-9f9b00348fc8	timestamp-track-decisions	musiclib
 M-20251125T015400	https://musicbrainz.org/artist/201500bb-d0b7-49bf-9869-50e6496350b8	timestamp-artist-decisions	musiclib
