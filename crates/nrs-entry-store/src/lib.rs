@@ -403,7 +403,7 @@ mod tests {
         let (base_url, server) = mock_server(responses);
         let client = HttpEntryStore::new(&base_url).unwrap();
 
-        let store_id = client.ingest("mal:1").unwrap();
+        let store_id = client.ingest("https://myanimelist.net/anime/1").unwrap();
         assert_eq!(store_id, "opaque/id");
         let metadata = client.resolve(&store_id).unwrap();
         assert_eq!(metadata.title, "Fixture Anime");
