@@ -420,6 +420,8 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 
 .relation-sections { display: grid; gap: 1.5rem; }
 .relation-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr)); align-items: start; gap: .7rem; }
+/* A tracklist reads as one list: give it the full width. */
+.relation-groups:has(> .tracklist) { grid-template-columns: 1fr; }
 .relation-group > summary { font-size: .8rem; color: var(--bone-500); padding: .75rem .85rem; margin: 0; border-bottom: 1px solid var(--ink-800); cursor: pointer; }
 .relation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: .3rem .7rem; padding: .6rem .85rem; border-bottom: 1px solid var(--ink-800); }
 .relation-group > .relation-row:last-child { border-bottom: 0; }
@@ -429,6 +431,12 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 .relation-weight { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .7rem; color: var(--bone-500); font: .68rem Plex Mono, monospace; }
 .relation-actions { display: flex; justify-content: flex-end; gap: .75rem; font-size: .7rem; }
 .relation-actions .edit-link { padding: 0; }
+.track-row { grid-template-columns: 1.8rem minmax(0, 1fr) auto; }
+.track-no { grid-row: span 2; justify-self: end; color: var(--bone-700); font: .72rem Plex Mono, monospace; font-variant-numeric: tabular-nums; }
+.track-row.unlinked { padding-block: .25rem; }
+.track-row.unlinked .track-no { grid-row: auto; }
+.track-row.unlinked .relation-title { color: var(--bone-700); font-size: .74rem; }
+.track-row.unlinked .relation-kind { color: var(--bone-700); font-size: .62rem; }
 .relation-group > .inline-editor-panel { margin: 0; border-width: 1px 0; }
 .inline-disclosure > summary { cursor: pointer; color: var(--bone-700); list-style-position: inside; }
 .inline-disclosure > summary:hover { color: var(--brass); }

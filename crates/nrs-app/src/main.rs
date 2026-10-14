@@ -200,6 +200,7 @@ async fn main() {
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/impacts", post(api::impact_add))
         .route("/entries/{entry_id}/progress-basis", get(api::progress_basis))
+        .route("/entries/{entry_id}/tracklist", get(api::entry_tracklist))
         .route(
             "/entries/{entry_id}/impacts/{impact_id}",
             put(api::impact_edit).delete(api::impact_delete),

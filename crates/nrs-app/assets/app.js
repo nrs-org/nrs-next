@@ -743,13 +743,70 @@ function relationWeightMarkup(relation) {
   return transformMarkup(relation.transform);
 }
 
-function relationRow(relation) {
-  return `<div class="relation-row">
+/** `position` (from `bindTracklist`) numbers the row as an album track. */
+function relationRow(relation, position = null) {
+  return `<div class="relation-row${position == null ? "" : " track-row"}">
+    ${position == null ? "" : `<span class="track-no">${escapeHtml(position)}</span>`}
     <a class="relation-title" href="${pathForEntry(relation.other.id)}" data-link>${escapeHtml(relation.other.title)}</a>
     <span class="relation-kind">${kindTag(relation.other.kind)}</span>
     <div class="relation-weight">${relationWeightMarkup(relation)}</div>
     <div class="relation-actions">${relation.editable ? `<button class="edit-link" type="button" data-action="edit-relation" data-id="${escapeHtml(relation.id)}">edit</button>` : ""}<button class="edit-link danger-button" type="button" data-action="delete-relation" data-id="${escapeHtml(relation.id)}">delete</button></div>
   </div>`;
+}
+
+/** A store track no `contains` from this entry binds: one dim line. */
+function unlinkedTrackRow(position, title) {
+  return `<div class="relation-row track-row unlinked">
+    <span class="track-no">${escapeHtml(position)}</span>
+    <span class="relation-title">${escapeHtml(title || "untitled track")}</span>
+    <span class="relation-kind">not linked</span>
+  </div>`;
+}
+
+/**
+ * An album's Contains group in the music store's track order: linked
+ * tracks numbered, the store's other tracks as dim lines in between,
+ * relations the tracklist doesn't have last. The plain list stays when
+ * the store has no tracklist for the entry or can't be reached.
+ */
+async function bindTracklist(data) {
+  const group = app.querySelector('details.relation-group[data-disclosure="relations-Contains"]');
+  if (data.entry.store !== "url" || !(group instanceof HTMLDetailsElement)) return;
+  let tracks;
+  try {
+    const response = await fetch(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/tracklist`);
+    if (!response.ok) return;
+    ({ tracks } = await response.json());
+  } catch {
+    return;
+  }
+  if (!tracks?.length || currentEntryData !== data || !group.isConnected) return;
+
+  const pending = new Map(data.relations.filter((relation) => relation.label === "Contains").map((relation) => [relation.id, relation]));
+  const discs = new Set(tracks.map((track) => track.disc ?? 1));
+  const position = (track) =>
+    track.track == null ? "·" : discs.size > 1 ? `${track.disc ?? 1}-${String(track.track).padStart(2, "0")}` : String(track.track);
+  const rows = [];
+  let linkedTracks = 0;
+  for (const track of tracks) {
+    const linked = track.relation_ids.map((id) => pending.get(id)).filter(Boolean);
+    if (linked.length) linkedTracks++;
+    for (const relation of linked) {
+      pending.delete(relation.id);
+      rows.push(relationRow(relation, position(track)));
+    }
+    if (!linked.length) rows.push(unlinkedTrackRow(position(track), track.title));
+  }
+  for (const relation of pending.values()) rows.push(relationRow(relation, "·"));
+
+  const count = group.querySelector(":scope > summary .count");
+  if (count) {
+    count.textContent = `${linkedTracks}/${tracks.length} tracks`;
+    count.setAttribute("title", "tracks linked by contains / tracks on the store's tracklist");
+  }
+  group.querySelectorAll(":scope > .relation-row").forEach((row) => row.remove());
+  group.insertAdjacentHTML("beforeend", rows.join(""));
+  group.classList.add("tracklist");
 }
 
 function relationSectionsMarkup(relations) {
@@ -768,7 +825,7 @@ function relationSectionsMarkup(relations) {
               const rows = sectionRelations.filter((relation) => relation.label === label);
               return `<details class="relation-group" ${rows.length <= 6 ? "open" : ""} data-disclosure="relations-${escapeHtml(label)}">
                 <summary>${escapeHtml(label)}<span class="count">${rows.length}</span></summary>
-                ${rows.map(relationRow).join("")}
+                ${rows.map((relation) => relationRow(relation)).join("")}
               </details>`;
             }).join("")}
           </div>
@@ -1943,6 +2000,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <div class="section-actions"><button class="button primary" type="button" data-action="add-relation">add relation</button></div>
       </section>`;
     bindInlineSplits(data);
+    bindTracklist(data);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {
       if (!(element instanceof HTMLDetailsElement)) return;
       const key = element.getAttribute("data-disclosure");

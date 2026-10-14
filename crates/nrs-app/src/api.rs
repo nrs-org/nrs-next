@@ -1398,6 +1398,108 @@ pub(super) async fn progress_basis(
     }))
 }
 
+/// The music store's tracklist for an album entry, each track with the
+/// `contains` relations from this entry that bind it.
+#[derive(Serialize, Default)]
+pub(super) struct TracklistResponse {
+    tracks: Vec<TracklistTrack>,
+}
+
+#[derive(Serialize)]
+struct TracklistTrack {
+    disc: Option<i64>,
+    track: Option<i64>,
+    title: Option<String>,
+    /// Empty when no `contains` from this entry binds the track.
+    relation_ids: Vec<String>,
+}
+
+pub(super) async fn entry_tracklist(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> ApiResult<TracklistResponse> {
+    let (album_url, children) = {
+        let store = state.store.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "entry API requires database mode",
+            )
+        })?;
+        let store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        let entries = store
+            .list_entries()
+            .map_err(|error| store_error("load entries", error))?;
+        let bind_url = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.id.0 == id && entry.store == "url")
+                .map(|entry| entry.store_id.clone())
+        };
+        let album_url = bind_url(&entry_id);
+        let children: Vec<(String, String)> = store
+            .relations_for_entry(&EntryId(entry_id.clone()))
+            .map_err(|error| store_error("load relations", error))?
+            .into_iter()
+            .filter(|relation| relation.kind == RelKind::Contains && relation.from.0 == entry_id)
+            .filter_map(|relation| Some((relation.id, bind_url(&relation.to.0)?)))
+            .collect();
+        (album_url, children)
+    };
+    let (Some(album_url), Some(music_store_url)) = (album_url, state.music_store_url.clone())
+    else {
+        return Ok(Json(TracklistResponse::default()));
+    };
+    let tracks =
+        tokio::task::spawn_blocking(move || tracklist(&music_store_url, &album_url, &children))
+            .await
+            .map_err(|error| store_error("run store lookup", error))?
+            .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(TracklistResponse { tracks }))
+}
+
+/// `resolve`'s `extra.tracklist` for `album_url`, with `children`
+/// (`contains` relation id, bind URL) placed on the tracks they bind.
+fn tracklist(
+    music_store_url: &str,
+    album_url: &str,
+    children: &[(String, String)],
+) -> Result<Vec<TracklistTrack>, String> {
+    let err = |e: nrs_entry_store::Error| format!("music store {music_store_url}: {e}");
+    let store = nrs_entry_store::HttpEntryStore::new(music_store_url)
+        .map_err(err)?
+        .expecting_store("musiclib");
+    let Some(album) = store.lookup(album_url).map_err(err)? else {
+        return Ok(Vec::new());
+    };
+    let meta = store.resolve(&album.store_id).map_err(err)?;
+    let Some(listed) = meta.extra["tracklist"].as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut relations_of: HashMap<String, Vec<String>> = HashMap::new();
+    for (relation_id, url) in children {
+        if let Some(track) = store.lookup(url).map_err(err)? {
+            relations_of
+                .entry(track.store_id)
+                .or_default()
+                .push(relation_id.clone());
+        }
+    }
+    Ok(listed
+        .iter()
+        .map(|track| TracklistTrack {
+            disc: track["disc"].as_i64(),
+            track: track["track"].as_i64(),
+            title: track["title"].as_str().map(str::to_string),
+            relation_ids: track["store_id"]
+                .as_str()
+                .and_then(|id| relations_of.remove(id))
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
 #[derive(Serialize)]
 pub(super) struct EntryResponse {
     entry: EntrySummary,
