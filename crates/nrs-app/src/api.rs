@@ -1828,18 +1828,12 @@ pub(super) async fn impact_delete(
     let mut store = store
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-    let existing = scoped_impact(&store, &entry_id, &impact_id)?;
-    if existing.members.is_empty() {
-        store
-            .delete_impact(&ImpactId(impact_id.clone()))
-            .map_err(|error| store_error("delete impact", error))?;
-    } else {
-        // From an entry's page, deleting a shared impact takes out only
-        // this entry's share.
-        store
-            .remove_impact_member(&ImpactId(impact_id.clone()), &EntryId(entry_id))
-            .map_err(|error| store_error("remove share", error))?;
-    }
+    // A shared impact goes as a whole, from any member's page; dropping a
+    // single share is an edit of the share list.
+    scoped_impact(&store, &entry_id, &impact_id)?;
+    store
+        .delete_impact(&ImpactId(impact_id.clone()))
+        .map_err(|error| store_error("delete impact", error))?;
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(impact_id),
@@ -2417,6 +2411,31 @@ mod tests {
     async fn scores_page_sorts_filters_and_compares() {
         let (state, a, b, _) = test_state();
         let page = |query: ScoresQuery| scores(State(state.clone()), Query(query));
+    #[tokio::test]
+    async fn deleting_a_shared_impact_from_a_member_deletes_it_for_all() {
+        let (state, a, b, id) = test_state();
+        {
+            let mut store = state.store.as_ref().unwrap().lock().unwrap();
+            let impact = ImpactId(id.clone());
+            store.make_impact_shared(&impact).unwrap();
+            let atoms = store.impacts_for_entry(&EntryId(a.clone())).unwrap()[0]
+                .atoms
+                .clone();
+            let members = [&a, &b].map(|e| nrs_store::ImpactMember {
+                contributor: EntryId(e.clone()),
+                factor: 0.5,
+            });
+            store
+                .edit_shared_impact(&impact, &atoms, &members, None)
+                .unwrap();
+        }
+        let result = impact_delete(State(state.clone()), Path((b.clone(), id))).await;
+        assert!(result.is_ok());
+        let store = state.store.as_ref().unwrap().lock().unwrap();
+        assert!(store.impacts_for_entry(&EntryId(a)).unwrap().is_empty());
+        assert!(store.impacts_for_entry(&EntryId(b)).unwrap().is_empty());
+    }
+
 
         let all = page(ScoresQuery::default()).await.ok().unwrap().0;
         assert_eq!((all.total, all.database_total), (2, 2));

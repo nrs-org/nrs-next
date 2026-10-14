@@ -1724,7 +1724,7 @@ function openImpactEditor(impact = null, action) {
     },
     impact ? async () => {
       await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts/${encodeURIComponent(impact.id)}`, "DELETE");
-      await refresh(impact.shared ? "Share removed" : "Impact deleted");
+      await refresh("Impact deleted");
     } : null,
   );
   bindEmotionSplits(editor);
