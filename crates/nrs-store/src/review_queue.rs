@@ -36,14 +36,30 @@ pub struct ReviewImpact {
     /// before saving -- `None` alongside `dah_kind: None`; `Some(1.0)`
     /// for an unscaled DAH-built impact.
     pub dah_factor: Option<f32>,
+    /// For a shared impact: every contributor and its share (this entry's
+    /// own share is also `dah_factor`, and `atoms` are already scaled to
+    /// it). Empty for an ordinary impact.
+    pub members: Vec<crate::shared::ImpactMember>,
+    /// For a shared impact: its split tree, stored (edited in the app) or
+    /// inferred from `members`.
+    pub split: Option<crate::split::SplitNode>,
+    pub split_stored: bool,
 }
 
 impl Store {
-    /// Every impact on `entry`, in insertion order.
+    /// Every impact on `entry`, in insertion order: its own impacts, and
+    /// its share of each shared impact it is a member of.
     pub fn impacts_for_entry(&self, entry: &EntryId) -> Result<Vec<ReviewImpact>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, note, dah_kind, dah_params, dah_factor FROM impact \
-             WHERE target = ?1 ORDER BY rowid",
+            "SELECT i.id, i.note, i.dah_kind, i.dah_params, i.dah_factor, NULL, i.rowid \
+               FROM impact i \
+              WHERE i.target = ?1 \
+                AND NOT EXISTS (SELECT 1 FROM impact_member m WHERE m.impact = i.id) \
+             UNION ALL \
+             SELECT i.id, i.note, i.dah_kind, i.dah_params, i.dah_factor, m.factor, i.rowid \
+               FROM impact_member m JOIN impact i ON i.id = m.impact \
+              WHERE m.contributor = ?1 \
+             ORDER BY 7",
         )?;
         let rows = stmt.query_map(params![entry.0], |row| {
             let id: String = row.get(0)?;
@@ -51,13 +67,29 @@ impl Store {
             let dah_kind: Option<String> = row.get(2)?;
             let dah_params: Option<String> = row.get(3)?;
             let dah_factor: Option<f32> = row.get(4)?;
-            Ok((id, note, dah_kind, dah_params, dah_factor))
+            let share: Option<f32> = row.get(5)?;
+            Ok((id, note, dah_kind, dah_params, dah_factor, share))
         })?;
 
         let mut impacts = Vec::new();
         for row in rows {
-            let (id, note, dah_kind, dah_params, dah_factor) = row?;
-            let atoms = self.load_atoms(&id)?;
+            let (id, note, dah_kind, dah_params, dah_factor, share) = row?;
+            let (atoms, dah_factor, members) = match share {
+                Some(share) => (
+                    crate::shared::scale_atoms(&self.load_atoms(&id)?, share),
+                    Some(share),
+                    crate::shared::members_of(&self.conn, &id)?,
+                ),
+                None => (self.load_atoms(&id)?, dah_factor, Vec::new()),
+            };
+            let stored = if members.is_empty() {
+                None
+            } else {
+                crate::shared::stored_split(&self.conn, &id)?
+            };
+            let split_stored = stored.is_some();
+            let split = (!members.is_empty())
+                .then(|| stored.unwrap_or_else(|| crate::split::infer(&members)));
             let review = self.review.get(&id);
             impacts.push(ReviewImpact {
                 id: ImpactId(id),
@@ -69,6 +101,9 @@ impl Store {
                 dah_kind,
                 dah_params,
                 dah_factor,
+                members,
+                split,
+                split_stored,
             });
         }
         Ok(impacts)
@@ -92,18 +127,25 @@ impl Store {
             Ok((id, target, note))
         })?;
 
+        // A shared impact is reviewed from each member's page.
+        let members = crate::shared::load_all_members(&self.conn)?;
         let mut seen = BTreeSet::new();
         let mut flagged = Vec::new();
         for row in rows {
             let (id, target, note) = row?;
-            if seen.contains(&target) {
-                continue;
-            }
             let review = self.review.get(&id);
             let has_unconfirmed_comment = note.is_none() && review.source_comment.is_some();
-            if review.needs_review || has_unconfirmed_comment {
-                seen.insert(target.clone());
-                flagged.push(EntryId(target));
+            if !(review.needs_review || has_unconfirmed_comment) {
+                continue;
+            }
+            let targets: Vec<String> = match members.get(&id) {
+                Some(members) => members.iter().map(|m| m.contributor.0.clone()).collect(),
+                None => vec![target],
+            };
+            for target in targets {
+                if seen.insert(target.clone()) {
+                    flagged.push(EntryId(target));
+                }
             }
         }
         Ok(flagged)

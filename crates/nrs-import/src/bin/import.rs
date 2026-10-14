@@ -4,6 +4,10 @@
 //! against a fresh/empty database.
 //!
 //! Usage: `cargo run -p nrs-import --bin import -- <path to .xml> <path to .db> [today]`
+//!
+//! Stripped XML (`<bind url>` entries) gets its titles and store-asserted
+//! containment from `NRS_MUSICLIB_DB` (musiclib's database, read-only) and
+//! `NRS_ANIME_STORE_URL` (the anime store).
 
 use std::path::PathBuf;
 
@@ -26,13 +30,23 @@ fn main() {
         }
         None => time::OffsetDateTime::now_utc().date(),
     };
-    let doc = match nrs_import::parse_file(&PathBuf::from(&xml_path), today) {
+    let mut doc = match nrs_import::parse_file(&PathBuf::from(&xml_path), today) {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("parse error: {e}");
             std::process::exit(1);
         }
     };
+    let musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(PathBuf::from);
+    let anime_store = std::env::var("NRS_ANIME_STORE_URL").ok();
+    let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store);
+    match nrs_import::resolve_binds(&mut doc, &sources) {
+        Ok(warnings) => doc.warnings.extend(warnings),
+        Err(e) => {
+            eprintln!("store lookup: {e}");
+            std::process::exit(1);
+        }
+    }
     for w in &doc.warnings {
         eprintln!("warning: {w}");
     }

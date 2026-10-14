@@ -40,6 +40,10 @@ struct AppState {
     /// store, which the read-only XML-mode doesn't have.
     store: Option<Mutex<TrackedStore>>,
     anime_store: HttpEntryStore,
+    /// Where progress defaults come from (`NRS_MUSICLIB_DB`,
+    /// `NRS_ANIME_STORE_URL`); see `api::progress_basis`.
+    musiclib_db: Option<std::path::PathBuf>,
+    anime_store_url: Option<String>,
     /// Recently scored rankings, so paging and re-sorting the scores
     /// table don't re-run the whole functional (see `api::scored`).
     scores_cache: api::ScoresCache,
@@ -116,13 +120,27 @@ async fn main() {
     } else {
         eprintln!("parsing {path}...");
         let today = time::OffsetDateTime::now_utc().date();
-        let doc = match nrs_import::parse_file(std::path::Path::new(&path), today) {
+        let mut doc = match nrs_import::parse_file(std::path::Path::new(&path), today) {
             Ok(doc) => doc,
             Err(e) => {
                 eprintln!("parse error: {e}");
                 std::process::exit(1);
             }
         };
+        // Stripped XML: titles and store-asserted containment come from the
+        // stores (`NRS_MUSICLIB_DB`, `NRS_ANIME_STORE_URL`).
+        let musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(std::path::PathBuf::from);
+        let anime_store_url = Some(
+            std::env::var("NRS_ANIME_STORE_URL").unwrap_or_else(|_| "http://127.0.0.1:3738".into()),
+        );
+        let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store_url);
+        match nrs_import::resolve_binds(&mut doc, &sources) {
+            Ok(store_warnings) => doc.warnings.extend(store_warnings),
+            Err(e) => {
+                eprintln!("store lookup: {e}");
+                std::process::exit(1);
+            }
+        }
         // XML-mode is read-only browsing (no Store), so BuildExtras
         // (comments/needs-review, feeding the review UI) has nowhere
         // to go here -- only meaningful in `.db` mode.
@@ -157,6 +175,8 @@ async fn main() {
         snapshot,
         store: store.map(|store| Mutex::new(TrackedStore::new(store))),
         anime_store,
+        musiclib_db: std::env::var_os("NRS_MUSICLIB_DB").map(std::path::PathBuf::from),
+        anime_store_url: Some(anime_store_url),
         scores_cache: Default::default(),
         kind_hints: Default::default(),
     });
@@ -179,6 +199,7 @@ async fn main() {
         .route("/entries/ingest", post(api::entry_ingest))
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/impacts", post(api::impact_add))
+        .route("/entries/{entry_id}/progress-basis", get(api::progress_basis))
         .route(
             "/entries/{entry_id}/impacts/{impact_id}",
             put(api::impact_edit).delete(api::impact_delete),
@@ -190,6 +211,14 @@ async fn main() {
         .route(
             "/entries/{entry_id}/impacts/{impact_id}/raw",
             put(api::impact_raw_edit),
+        )
+        .route(
+            "/entries/{entry_id}/impacts/{impact_id}/shares",
+            put(api::impact_shares_edit),
+        )
+        .route(
+            "/entries/{entry_id}/impacts/{impact_id}/share",
+            post(api::impact_make_shared),
         )
         .route("/entries/{entry_id}/relations", post(api::relation_add))
         .route(

@@ -62,7 +62,10 @@ const relationKinds = [
   ["remix", "Remix"],
   ["feature_music", "Feature music"],
   ["killed_by", "Killed-by"],
+  ["credit", "Credit (contributor → work)"],
 ];
+
+const roleNames = ["compose", "arrange", "lyrics", "vocal", "inst_perform", "image", "image_feat", "mv", "albumart", "prod", "inst", "perform", "inst_writing", "inst_total", "vocal_lyrics", "music_total", "image_total", "total"];
 
 const anchors = [
   "comedy", "hype", "tragedy", "wistful", "cozy", "heartwarming", "hate",
@@ -147,9 +150,13 @@ document.addEventListener("click", (event) => {
     if (name === "add-impact") openImpactEditor(null, action);
     if (name === "edit-impact") {
       const impact = currentEntryData?.impacts.find((item) => item.id === action.dataset.id);
-      if (impact) impact.kind ? openImpactEditor(impact, action) : openRawImpactEditor(impact, action);
+      if (impact) {
+        if (impact.kind) openImpactEditor(impact, action);
+        else if (!impact.shared) openRawImpactEditor(impact, action);
+      }
     }
     if (name === "confirm-impact") confirmImpact(action.dataset.id);
+    if (name === "share-impact") shareImpact(action.dataset.id);
     if (name === "add-relation") openRelationEditor(null, action);
     if (name === "edit-relation") {
       const relation = currentEntryData?.relations.find((item) => item.id === action.dataset.id);
@@ -643,7 +650,7 @@ function impactCard(impact) {
     <article class="impact-card" data-category="${escapeHtml(impact.category)}">
       <div class="card-head"><div class="category-badge">${escapeHtml(impact.category)}</div>
         <div class="card-copy">
-          <h3 class="impact-title">${escapeHtml(impact.title)}${impact.needs_review ? '<span class="review-flag">needs review</span>' : ""}</h3>
+          <h3 class="impact-title">${escapeHtml(impact.title)}${impact.shared ? `<span class="share-pill" title="shared between ${impact.shared.members.length} entries">shared <span class="mono">${Number(impact.contributor_share ?? 0).toFixed(2)}</span></span>` : ""}${impact.needs_review ? '<span class="review-flag">needs review</span>' : ""}</h3>
           <p class="impact-description">${escapeHtml(impact.description)}</p>
           <div class="chips">${anchorChips(impact.anchors)}</div>
           ${sourceMarkup}
@@ -653,10 +660,12 @@ function impactCard(impact) {
         ${impact.period ? "" : `<div class="metric"><div class="metric-value">${escapeHtml(impact.metric.value)}</div><div class="metric-label">${escapeHtml(impact.metric.label)}</div>${impact.metric.progress != null ? `<div class="metric-bar"><span style="width:${Math.max(0, Math.min(1, Number(impact.metric.progress))) * 100}%"></span></div>` : ""}</div>`}
       </div>
       <details class="card-details" data-disclosure="${escapeHtml(impact.id)}"><summary>details &amp; edit</summary><div class="details-body">
-        <p class="raw-id"><span class="mono">${escapeHtml(impact.id)}</span>${impact.contributor_share != null && Math.abs(impact.contributor_share - 1) > .005 ? `<span>contributor share <span class="mono">${Number(impact.contributor_share).toFixed(2)}</span></span>` : ""}</p>
+        <p class="raw-id"><span class="mono">${escapeHtml(impact.id)}</span>${!impact.shared && impact.contributor_share != null && Math.abs(impact.contributor_share - 1) > .005 ? `<span>contributor share <span class="mono">${Number(impact.contributor_share).toFixed(2)}</span></span>` : ""}</p>
+        ${impact.shared ? `<div class="card-split" data-inline-split="${escapeHtml(impact.id)}"></div>` : ""}
         ${impact.kind ? "" : paramsMarkup(impact.params)}
         <div class="detail-actions">
           ${(impact.needs_review || (!impact.note && impact.source_comment)) ? `<button class="button primary" type="button" data-action="confirm-impact" data-id="${escapeHtml(impact.id)}">confirm</button>` : ""}
+          ${impact.shared ? "" : `<button class="link-button" type="button" data-action="share-impact" data-id="${escapeHtml(impact.id)}" title="split this impact between this entry and others">share with other entries</button>`}
           <button hidden type="button" data-action="edit-impact" data-id="${escapeHtml(impact.id)}">edit impact</button>
         </div>
       </div></details>
@@ -798,10 +807,11 @@ function impactKindField(value) {
       .map(([key, text]) => `<option value="${escapeHtml(key)}" ${key === value ? "selected" : ""}>${escapeHtml(text)}</option>`)
       .join("")}</optgroup>`)
     .join("");
-  return field("impact kind", `<select name="kind">${groups}</select>`);
+  return field("kind", `<select name="kind">${groups}</select>`);
 }
 
 function formatDurationInput(value) {
+  if (value == null || value === "") return "";
   const minutes = Number(value);
   if (!Number.isFinite(minutes)) return String(value ?? "");
   const seconds = Math.round(minutes * 60);
@@ -816,15 +826,148 @@ function durationField(fields, name, label, fallback) {
   return field(label, `<input name="${name}" type="text" value="${escapeHtml(value)}" placeholder="3:41">`, "M:SS, H:MM:SS, or numeric minutes");
 }
 
+/**
+ * Emotion blend as a split: each anchor is a segment of one bar summing to
+ * 1 (every stored blend does). Dragging a boundary trades weight between
+ * the two neighbours; the form still submits anchor1..4 / weight1..4.
+ */
 function blendFields(fields) {
-  return Array.from({ length: 4 }, (_, index) => {
-    const number = index + 1;
-    const anchorName = `anchor${number}`;
-    const weightName = `weight${number}`;
-    const selected = fieldValue(fields, anchorName);
-    const weight = fieldValue(fields, weightName, "1");
-    return field(`anchor ${number}`, `<div class="blend-control"><select name="${anchorName}"><option value=""></option>${anchors.map((anchor) => `<option value="${anchor}" ${anchor === selected ? "selected" : ""}>${anchor}</option>`).join("")}</select><input name="${weightName}" type="range" min="0" max="1" step="0.05" value="${escapeHtml(weight)}"><output>${escapeHtml(weight)}</output></div>`);
-  }).join("");
+  const slots = [1, 2, 3, 4]
+    .map((number) => ({ anchor: fieldValue(fields, `anchor${number}`), weight: Number(fieldValue(fields, `weight${number}`, "0")) || 0 }))
+    .filter((slot) => slot.anchor);
+  const hidden = [1, 2, 3, 4].map((number) => `<input type="hidden" name="anchor${number}" value=""><input type="hidden" name="weight${number}" value="">`).join("");
+  return `<div class="form-field full emotion-split" data-emotion-split="${escapeHtml(JSON.stringify(slots))}">
+    <span>emotions</span>
+    <div class="emo-body">
+      <div class="split-bar editable" data-bar></div>
+      <div class="emo-rows"><span data-rows class="emo-chips"></span><select data-add-anchor aria-label="add anchor"><option value="">+ anchor</option>${anchors.map((anchor) => `<option value="${anchor}">${anchor}</option>`).join("")}</select><button class="link-button" type="button" data-even>split evenly</button><span class="dim" data-total></span></div>
+    </div>
+    ${hidden}
+  </div>`;
+}
+
+function bindEmotionSplits(root) {
+  root.querySelectorAll("[data-emotion-split]").forEach((editor) => {
+    if (!(editor instanceof HTMLElement) || editor.dataset.bound) return;
+    editor.dataset.bound = "true";
+    const slots = JSON.parse(editor.dataset.emotionSplit || "[]");
+    const bar = editor.querySelector("[data-bar]");
+    const rows = editor.querySelector("[data-rows]");
+    const add = editor.querySelector("[data-add-anchor]");
+    const round = (value) => Math.round(value * 100) / 100;
+    const total = () => slots.reduce((sum, slot) => sum + slot.weight, 0);
+    const paint = () => {
+      let left = 0;
+      slots.forEach((slot, index) => {
+        const seg = editor.querySelector(`[data-seg="${index}"]`);
+        if (seg instanceof HTMLElement) {
+          seg.style.left = `${left * 100}%`;
+          seg.style.width = `${slot.weight * 100}%`;
+          seg.textContent = slot.weight >= .12 ? slot.anchor : "";
+        }
+        left += slot.weight;
+        const handle = editor.querySelector(`[data-handle="${index}"]`);
+        if (handle instanceof HTMLElement) handle.style.left = `${left * 100}%`;
+        const input = editor.querySelector(`[data-weight="${index}"]`);
+        if (input instanceof HTMLInputElement && document.activeElement !== input) input.value = slot.weight.toFixed(2);
+      });
+      [1, 2, 3, 4].forEach((number) => {
+        const slot = slots[number - 1];
+        const anchorInput = editor.querySelector(`input[name="anchor${number}"]`);
+        const weightInput = editor.querySelector(`input[name="weight${number}"]`);
+        if (anchorInput instanceof HTMLInputElement) anchorInput.value = slot ? slot.anchor : "";
+        if (weightInput instanceof HTMLInputElement) weightInput.value = slot ? String(slot.weight) : "";
+      });
+      const sum = editor.querySelector("[data-total]");
+      if (sum) sum.textContent = slots.length && Math.abs(total() - 1) > .005 ? `total ${total().toFixed(2)} (should be 1)` : "";
+      if (add instanceof HTMLSelectElement) {
+        add.disabled = slots.length >= 4;
+        [...add.options].forEach((option) => option.disabled = !!option.value && slots.some((slot) => slot.anchor === option.value));
+      }
+    };
+    // Takes `amount` from (or gives it to) every slot but `keep`, in
+    // proportion to their weights, so the total stays put.
+    const rebalance = (keep, amount) => {
+      const others = slots.filter((_, index) => index !== keep);
+      const pool = others.reduce((sum, slot) => sum + slot.weight, 0);
+      others.forEach((slot) => {
+        slot.weight = round(pool > 0 ? slot.weight - amount * (slot.weight / pool) : Math.max(0, -amount / others.length));
+      });
+    };
+    const render = () => {
+      if (bar instanceof HTMLElement) {
+        bar.innerHTML = slots.map((slot, index) => `<span class="split-seg" data-seg="${index}" style="background:${splitColors[index % splitColors.length]}"></span>`).join("")
+          + slots.slice(0, -1).map((_, index) => `<span class="split-handle" data-handle="${index}" role="slider" tabindex="0" aria-label="boundary ${index + 1}"></span>`).join("");
+      }
+      if (rows instanceof HTMLElement) {
+        rows.innerHTML = slots.map((slot, index) => `<span class="emo-chip"><span class="split-swatch" style="background:${splitColors[index % splitColors.length]}"></span>${escapeHtml(slot.anchor)}<input type="number" min="0" max="1" step="0.05" data-weight="${index}" aria-label="${escapeHtml(slot.anchor)} weight"><button type="button" class="chip-x" data-remove="${index}" aria-label="remove ${escapeHtml(slot.anchor)}">×</button></span>`).join("")
+          || `<span class="dim">no anchors yet</span>`;
+      }
+      rows?.querySelectorAll("[data-weight]").forEach((input) => input.addEventListener("input", () => {
+        const index = Number(input.dataset.weight);
+        const value = Number(input.value);
+        if (!Number.isFinite(value) || slots.length < 2) return;
+        const next = Math.min(1, Math.max(0, value));
+        rebalance(index, next - slots[index].weight);
+        slots[index].weight = round(next);
+        paint();
+      }));
+      rows?.querySelectorAll("[data-remove]").forEach((button) => button.addEventListener("click", () => {
+        const index = Number(button.dataset.remove);
+        const freed = slots[index].weight;
+        slots.splice(index, 1);
+        const pool = total();
+        slots.forEach((slot) => slot.weight = round(pool > 0 ? slot.weight + freed * (slot.weight / pool) : 1 / slots.length));
+        render();
+      }));
+      bar?.querySelectorAll("[data-handle]").forEach((handle) => {
+        if (!(handle instanceof HTMLElement) || !(bar instanceof HTMLElement)) return;
+        const index = Number(handle.dataset.handle);
+        const move = (at) => {
+          const lower = slots.slice(0, index).reduce((sum, slot) => sum + slot.weight, 0);
+          const upper = lower + slots[index].weight + slots[index + 1].weight;
+          const boundary = Math.min(upper, Math.max(lower, Math.round(at * 100) / 100));
+          slots[index + 1].weight = round(upper - boundary);
+          slots[index].weight = round(boundary - lower);
+          paint();
+        };
+        handle.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          handle.setPointerCapture(event.pointerId);
+          const onMove = (moveEvent) => {
+            const rect = bar.getBoundingClientRect();
+            move((moveEvent.clientX - rect.left) / rect.width);
+          };
+          const onUp = () => {
+            handle.removeEventListener("pointermove", onMove);
+            handle.removeEventListener("pointerup", onUp);
+          };
+          handle.addEventListener("pointermove", onMove);
+          handle.addEventListener("pointerup", onUp);
+        });
+        handle.addEventListener("keydown", (event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const edge = slots.slice(0, index + 1).reduce((sum, slot) => sum + slot.weight, 0);
+          move(edge + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? .1 : .01));
+        });
+      });
+      paint();
+    };
+    add?.addEventListener("change", () => {
+      const anchor = add.value;
+      add.value = "";
+      if (!anchor || slots.length >= 4 || slots.some((slot) => slot.anchor === anchor)) return;
+      // A first anchor takes everything; later ones start at 0 to be dragged in.
+      slots.push({ anchor, weight: slots.length ? 0 : 1 });
+      render();
+    });
+    editor.querySelector("[data-even]")?.addEventListener("click", () => {
+      slots.forEach((slot) => slot.weight = round(1 / slots.length));
+      render();
+    });
+    render();
+  });
 }
 
 function periodFields(fields, fallbackDays) {
@@ -838,7 +981,7 @@ function periodFields(fields, fallbackDays) {
       <label><input name="period_from_expression" type="checkbox" value="${escapeHtml(fromExpression || "today")}" ${fromExpression ? "checked" : ""}> start follows ${escapeHtml(fromExpression || "today")}</label>
       <label><input name="period_to_expression" type="checkbox" value="${escapeHtml(toExpression || "today")}" ${toExpression ? "checked" : ""}> end follows ${escapeHtml(toExpression || "today")}</label>
     </div><small>Optional. Dynamic endpoints are resolved whenever this is saved or reimported.</small></div>
-    ${textField(fields, "days", "fallback duration (days)", fallbackDays, "number", 'min="0" step="1"')}`;
+    ${textField(fields, "days", "fallback days", fallbackDays, "number", 'min="0" step="1"')}`;
 }
 
 function impactKindFields(kind, fields) {
@@ -846,16 +989,16 @@ function impactKindFields(kind, fields) {
   if (["nei", "aei"].includes(kind)) return `${rangeField(fields, "factor", "intensity")}${selectField(fields, "sign", "sign", [["1", "positive"], ["-1", "negative"]], "1")}${blendFields(fields)}`;
   if (kind === "epi") return `${rangeField(fields, "factor", "intensity")}${blendFields(fields)}`;
   if (kind === "pads") return `${periodFields(fields, "3")}${blendFields(fields)}`;
-  if (["jumpscare", "sleepless_night", "politics", "dropped"].includes(kind)) return `<p class="form-note full">No extra parameters — this impact's score is fixed by the standard.</p>`;
+  if (["jumpscare", "sleepless_night", "politics", "dropped"].includes(kind)) return "";
   if (kind === "interest_field") return selectField(fields, "new_field", "new field?", [["true", "yes — genuinely new interest"], ["false", "no — same field as before"]], "false");
   if (kind === "additional") return rangeField(fields, "value", "signed adjustment", "0.5", "-2", "2");
   if (kind === "music") return rangeField(fields, "music_base", "music quality");
   if (kind === "waifu") return periodFields(fields, "90");
-  if (kind === "music_consumed_progress") return durationField(fields, "duration_minutes", "duration", "180");
+  if (kind === "music_consumed_progress") return durationField(fields, "duration_minutes", "duration", "");
   if (kind === "meme") return `${rangeField(fields, "strength", "strength", "1", "0", "2")}${periodFields(fields, "30")}`;
   if (kind === "osu_song") return `${rangeField(fields, "personal", "personal impact")}${rangeField(fields, "community", "community impact", "0.3")}`;
   if (kind === "consumed") return `${rangeField(fields, "boredom", "boredom")}${durationField(fields, "duration_minutes", "duration", "180")}`;
-  if (kind === "anime_consumed") return `${rangeField(fields, "boredom", "boredom")}${textField(fields, "episodes", "episodes", "12", "number", 'min="0" step="0.01"')}${durationField(fields, "episode_duration_minutes", "duration per episode", "20")}`;
+  if (kind === "anime_consumed") return `${rangeField(fields, "boredom", "boredom")}${textField(fields, "episodes", "episodes", "", "number", 'min="0" step="0.01" placeholder="12"')}${durationField(fields, "episode_duration_minutes", "duration per episode", "")}`;
   if (kind === "visual") return `${selectField(fields, "visual_kind", "visual kind", [["1.0", "Anime / RPG 3D game (1.0)"], ["0.8", "Animated short / MV / VN / manga (0.8)"], ["0.7", "Anime PV / animated gacha art (0.7)"], ["0.6", "Gacha card art, static (0.6)"], ["0.5", "Light novel visual / semi-animated MV (0.5)"], ["0.3", "Static music video (0.3)"], ["0.25", "Album art / anime promo art (0.25)"]], "1.0")}${rangeField(fields, "base", "quality")}${rangeField(fields, "unique", "uniqueness")}`;
   if (kind === "writing") return `${rangeField(fields, "character_complexity", "character complexity")}${rangeField(fields, "story_quality", "story quality")}${rangeField(fields, "pacing", "pacing")}${rangeField(fields, "originality", "originality")}`;
   return `<p class="error full">Unknown impact kind.</p>`;
@@ -880,7 +1023,7 @@ function showEditor(host, title, formMarkup, onSubmit, onDelete) {
   document.querySelectorAll(".inline-editor-panel").forEach((panel) => panel.remove());
   const editor = document.createElement("section");
   editor.className = "inline-editor-panel";
-  editor.innerHTML = `<form class="editor-shell"><header><h3>${escapeHtml(title)}</h3><button class="icon-button" type="button" data-action="close-editor" aria-label="Close">×</button></header><div class="editor-form">${formMarkup}<p class="form-error" hidden></p><div class="editor-actions">${onDelete ? '<button class="danger-button" type="button" data-delete>delete</button>' : ""}<span></span><button class="button" type="button" data-action="close-editor">cancel</button><button class="button primary" type="submit">save</button></div></div></form>`;
+  editor.innerHTML = `<form class="editor-shell"><header><h3>${escapeHtml(title)}</h3><button class="icon-button" type="button" data-action="close-editor" aria-label="Close">×</button></header><div class="editor-form">${formMarkup}<p class="form-error" hidden></p><div class="editor-actions">${onDelete ? '<button class="danger-button" type="button" data-delete>delete</button>' : "<span></span>"}<span></span><button class="button" type="button" data-action="close-editor">cancel</button><button class="button primary" type="submit">save</button></div></div></form>`;
   if (host.classList.contains("details-body")) {
     host.append(editor);
   } else {
@@ -942,6 +1085,19 @@ async function confirmImpact(impactId) {
     await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts/${encodeURIComponent(impactId)}/confirm`, "POST");
     await refreshEntry(entryId);
     showToast("Impact confirmed");
+  } catch (error) {
+    showToast(error?.message || String(error), "error");
+  }
+}
+
+/** Converts an ordinary impact into a shared one; its split editor opens. */
+async function shareImpact(impactId) {
+  if (!currentEntryData || !impactId) return;
+  const entryId = currentEntryData.entry.id;
+  try {
+    await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts/${encodeURIComponent(impactId)}/share`, "POST");
+    await refreshEntry(entryId, { keepEditorFor: impactId });
+    showToast("Now shared — add entries to the split");
   } catch (error) {
     showToast(error?.message || String(error), "error");
   }
@@ -1048,6 +1204,430 @@ function openRawImpactEditor(impact, action) {
   });
 }
 
+const splitColors = ["var(--brass)", "var(--verdigris)", "var(--cobalt)", "var(--heather)", "var(--oxblood)", "var(--kind-anime)", "var(--kind-album)", "var(--kind-track)"];
+
+function memberTitle(member) {
+  return member.entry?.title || member.id;
+}
+
+/**
+ * Tree editor for a shared impact's split. A group divides its own amount
+ * among its children by one rule: explicit fractions (any rest unassigned),
+ * even parts, or weights. A member's share of the impact is the product of
+ * portions down its path. One level is shown at a time; groups open with a
+ * breadcrumb back. Saving sends the whole tree.
+ */
+function splitPortions(group) {
+  const children = group.children;
+  if (group.rule === "explicit") return children.map((child) => Number(child.share) || 0);
+  if (group.rule === "even") return children.map(() => 1 / Math.max(1, children.length));
+  const total = children.reduce((sum, child) => sum + (Number(child.weight) || 0), 0);
+  return children.map((child) => (total > 0 ? (Number(child.weight) || 0) / total : 0));
+}
+
+function formatShare(value) {
+  return value >= 0.1 || value === 0 ? value.toFixed(2) : value.toFixed(4);
+}
+
+function bindSplitTree(container, impact, entryId) {
+  const original = JSON.stringify(impact.shared.split);
+  let tree = JSON.parse(original);
+  let path = [];
+  let filter = "";
+  let showAll = false;
+  let selected = new Set();
+  const titles = new Map(impact.shared.members.map((member) => [member.id, member.entry?.title || member.id]));
+  const nodeAt = (at) => at.reduce((node, index) => node.children[index], tree);
+  const current = () => nodeAt(path);
+  const amountAt = (at) => {
+    let amount = 1;
+    let node = tree;
+    for (const index of at) {
+      amount *= splitPortions(node)[index];
+      node = node.children[index];
+    }
+    return amount;
+  };
+  const nameOf = (node) => node.type === "member" ? (titles.get(node.entry) || node.entry) : (node.label || `${node.rule} group`);
+  const countOf = (node) => node.type === "member" ? 1 : node.children.reduce((sum, child) => sum + countOf(child), 0);
+  const entriesOf = (node, out = new Set()) => {
+    if (node.type === "member") out.add(node.entry);
+    else node.children.forEach((child) => entriesOf(child, out));
+    return out;
+  };
+  const round = (value) => Math.round(value * 10000) / 10000;
+  const resetView = () => {
+    selected = new Set();
+    filter = "";
+    showAll = false;
+  };
+
+  const render = () => {
+    const group = current();
+    const portions = splitPortions(group);
+    const amount = amountAt(path);
+    const assigned = group.rule === "explicit" ? portions.reduce((a, b) => a + b, 0) : 1;
+    const crumbs = [`<button type="button" class="link-button" data-crumb="0">whole impact</button>`];
+    path.forEach((_, depth) => crumbs.push(`<button type="button" class="link-button" data-crumb="${depth + 1}">${escapeHtml(nameOf(nodeAt(path.slice(0, depth + 1))))}</button>`));
+    const needle = filter.trim().toLowerCase();
+    const rows = group.children
+      .map((child, index) => ({ child, index }))
+      .filter(({ child }) => !needle || nameOf(child).toLowerCase().includes(needle));
+    const visible = showAll || needle ? rows : rows.slice(0, 15);
+    let left = 0;
+    const segments = group.children.map((child, index) => {
+      const width = portions[index];
+      const markup = `<span class="split-seg${child.type === "member" && child.entry === entryId ? " current" : ""}${child.type === "group" ? " group" : ""}" data-seg="${index}" style="left:${left * 100}%;width:${width * 100}%;background:${splitColors[index % splitColors.length]}" title="${escapeHtml(nameOf(child))} ${formatShare(width)}"></span>`;
+      left += width;
+      return markup;
+    }).join("");
+    let edge = 0;
+    const handles = group.rule === "explicit" ? group.children.map((_, index) => {
+      edge += portions[index];
+      return `<span class="split-handle" data-handle="${index}" role="slider" tabindex="0" aria-label="boundary ${index + 1}" style="left:${edge * 100}%"></span>`;
+    }).join("") : "";
+    const valueField = (child, index) => {
+      if (group.rule === "explicit") return `<input type="number" min="0" max="1" step="0.01" data-share="${index}" value="${round(Number(child.share) || 0)}" aria-label="share">`;
+      if (group.rule === "weighted") return `<input type="number" min="0" step="any" data-weight="${index}" value="${round(Number(child.weight) || 0)}" aria-label="weight">`;
+      return `<span class="dim split-equal">equal</span>`;
+    };
+    const ruleNames = { explicit: "explicit shares", even: "evenly", weighted: "by weight" };
+    container.innerHTML = `<div class="split-editor">
+      ${path.length ? `<nav class="split-crumbs">${crumbs.join('<span class="dim"> › </span>')}</nav>` : ""}
+      <div class="split-head">
+        <label class="split-rule">split <select data-rule>${Object.entries(ruleNames).map(([rule, label]) => `<option value="${rule}" ${rule === group.rule ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+        ${path.length ? `<label class="split-label">label <input data-label value="${escapeHtml(group.label || "")}" placeholder="${escapeHtml(group.rule)} group"></label>` : ""}
+        <span class="dim split-worth">${path.length ? `worth <span class="mono">${formatShare(amount)}</span> of the impact · ` : ""}${countOf(group)} entries</span>
+      </div>
+      <div class="split-bar editable" data-split-bar>${segments}${handles}</div>
+      ${group.children.length > 10 ? `<input class="split-filter" type="search" data-filter placeholder="filter ${group.children.length} parts…" value="${escapeHtml(filter)}">` : ""}
+      <div class="split-legend">${visible.map(({ child, index }) => `<div class="split-row tree">
+        <input type="checkbox" data-select="${index}" ${selected.has(index) ? "checked" : ""} aria-label="select">
+        <span class="split-swatch" style="background:${splitColors[index % splitColors.length]}"></span>
+        <span class="split-name">${child.type === "group" ? `<button type="button" class="link-button" data-open="${index}">${escapeHtml(nameOf(child))} ›</button> <small class="dim">${escapeHtml(ruleNames[child.rule])} · ${countOf(child)}</small>` : `${escapeHtml(nameOf(child))}${child.entry === entryId ? ' <small class="dim">(this entry)</small>' : ""}`}</span>
+        ${valueField(child, index)}
+        <span class="mono dim split-eff" data-eff="${index}" title="share of the whole impact">${formatShare(amount * portions[index])}</span>
+        ${child.type === "group" ? `<button type="button" class="link-button" data-ungroup="${index}">ungroup</button>` : `<button type="button" class="chip-x" data-remove="${index}" aria-label="remove">×</button>`}
+      </div>`).join("")}</div>
+      ${visible.length < rows.length ? `<button type="button" class="link-button" data-show-all>show all ${rows.length}</button>` : ""}
+      <div class="split-tools">
+        <span class="split-add"><input type="search" data-add placeholder="add an entry…" autocomplete="off"><span class="split-results" data-results></span></span>
+        <button class="link-button" type="button" data-group-selected ${selected.size ? "" : "disabled"}>group selected</button>
+        ${group.rule === "explicit" ? `<button class="link-button" type="button" data-split-even>split evenly</button><button class="link-button" type="button" data-split-normalize>normalize to 1</button>` : ""}
+      </div>
+      <div class="split-footer">
+        <span class="split-total" data-split-total>${group.rule === "explicit" ? `assigned <span class="mono">${formatShare(assigned)}</span>${assigned < .9995 ? ` · unassigned <span class="mono">${formatShare(1 - assigned)}</span>` : ""}` : ""}</span>
+        <span class="split-save" ${JSON.stringify(tree) === original ? "hidden" : ""}><button class="link-button" type="button" data-split-reset>reset</button><button class="button primary" type="button" data-split-save>save split</button></span>
+      </div>
+    </div>`;
+    bind();
+  };
+
+  // While dragging or typing, only positions and numbers move.
+  const paint = () => {
+    const group = current();
+    const portions = splitPortions(group);
+    const amount = amountAt(path);
+    let left = 0;
+    portions.forEach((portion, index) => {
+      const seg = container.querySelector(`[data-seg="${index}"]`);
+      if (seg instanceof HTMLElement) {
+        seg.style.left = `${left * 100}%`;
+        seg.style.width = `${portion * 100}%`;
+      }
+      left += portion;
+      const handle = container.querySelector(`[data-handle="${index}"]`);
+      if (handle instanceof HTMLElement) handle.style.left = `${left * 100}%`;
+      const input = container.querySelector(`[data-share="${index}"]`);
+      if (input instanceof HTMLInputElement && document.activeElement !== input) input.value = String(round(portion));
+      const eff = container.querySelector(`[data-eff="${index}"]`);
+      if (eff) eff.textContent = formatShare(amount * portion);
+    });
+    const total = container.querySelector("[data-split-total]");
+    if (total && group.rule === "explicit") total.innerHTML = `assigned <span class="mono">${formatShare(left)}</span>${left < .9995 ? ` · unassigned <span class="mono">${formatShare(1 - left)}</span>` : ""}`;
+    const save = container.querySelector(".split-save");
+    if (save instanceof HTMLElement) save.hidden = JSON.stringify(tree) === original;
+  };
+
+  // Switching a group's rule keeps every child's current portion.
+  const setRule = (group, rule) => {
+    const portions = splitPortions(group);
+    group.children.forEach((child, index) => {
+      child.share = round(portions[index]);
+      child.weight = round(portions[index]);
+    });
+    group.rule = rule;
+  };
+
+  let searchTimer = 0;
+  const bind = () => {
+    const group = current();
+    container.querySelectorAll("[data-crumb]").forEach((button) => button.addEventListener("click", () => {
+      path = path.slice(0, Number(button.dataset.crumb));
+      resetView();
+      render();
+    }));
+    container.querySelector("[data-rule]")?.addEventListener("change", (event) => {
+      setRule(group, event.target.value);
+      render();
+    });
+    container.querySelector("[data-label]")?.addEventListener("input", (event) => {
+      group.label = event.target.value.trim() || undefined;
+      paint();
+    });
+    container.querySelector("[data-filter]")?.addEventListener("input", (event) => {
+      filter = event.target.value;
+      const caret = event.target.selectionStart;
+      render();
+      const field = container.querySelector("[data-filter]");
+      if (field instanceof HTMLInputElement) {
+        field.focus();
+        field.setSelectionRange(caret, caret);
+      }
+    });
+    container.querySelector("[data-show-all]")?.addEventListener("click", () => {
+      showAll = true;
+      render();
+    });
+    container.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", () => {
+      path = [...path, Number(button.dataset.open)];
+      resetView();
+      render();
+    }));
+    container.querySelectorAll("[data-select]").forEach((box) => box.addEventListener("change", () => {
+      const index = Number(box.dataset.select);
+      if (box.checked) selected.add(index);
+      else selected.delete(index);
+      const button = container.querySelector("[data-group-selected]");
+      if (button instanceof HTMLButtonElement) button.disabled = selected.size < 1;
+    }));
+    container.querySelectorAll("[data-share]").forEach((input) => input.addEventListener("input", () => {
+      const index = Number(input.dataset.share);
+      const others = splitPortions(group).reduce((a, b) => a + b, 0) - (Number(group.children[index].share) || 0);
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) return;
+      group.children[index].share = round(Math.min(Math.max(0, value), 1 - others));
+      paint();
+    }));
+    container.querySelectorAll("[data-weight]").forEach((input) => input.addEventListener("input", () => {
+      const value = Number(input.value);
+      if (!Number.isFinite(value) || value < 0) return;
+      group.children[Number(input.dataset.weight)].weight = value;
+      paint();
+    }));
+    container.querySelectorAll("[data-remove]").forEach((button) => button.addEventListener("click", () => {
+      if (countOf(tree) <= 1) {
+        showToast("A shared impact needs at least one entry; delete the impact instead", "error");
+        return;
+      }
+      group.children.splice(Number(button.dataset.remove), 1);
+      // A group left empty goes away with its last member.
+      while (path.length && current().children.length === 0) {
+        const index = path[path.length - 1];
+        path = path.slice(0, -1);
+        current().children.splice(index, 1);
+      }
+      selected = new Set();
+      render();
+    }));
+    container.querySelectorAll("[data-ungroup]").forEach((button) => button.addEventListener("click", () => {
+      const index = Number(button.dataset.ungroup);
+      const inner = group.children[index];
+      const innerPortions = splitPortions(inner);
+      const lifted = inner.children.map((child, i) => ({
+        ...child,
+        share: round((Number(inner.share) || 0) * innerPortions[i]),
+        weight: round((Number(inner.weight) || 0) * innerPortions[i]),
+      }));
+      group.children.splice(index, 1, ...lifted);
+      selected = new Set();
+      render();
+    }));
+    container.querySelector("[data-group-selected]")?.addEventListener("click", () => {
+      const indices = [...selected].sort((a, b) => a - b);
+      if (!indices.length) return;
+      const portions = splitPortions(group);
+      const sum = indices.reduce((total, index) => total + portions[index], 0);
+      const inner = sum > 0 ? (index) => round(portions[index] / sum) : () => 0;
+      const node = {
+        type: "group",
+        rule: "even",
+        share: round(indices.reduce((total, index) => total + (Number(group.children[index].share) || 0), 0)),
+        weight: round(indices.reduce((total, index) => total + (Number(group.children[index].weight) || 0), 0)),
+        children: indices.map((index) => ({ ...group.children[index], share: inner(index), weight: inner(index) })),
+      };
+      for (const index of [...indices].reverse()) group.children.splice(index, 1);
+      group.children.splice(indices[0], 0, node);
+      selected = new Set();
+      render();
+    });
+    container.querySelector("[data-split-even]")?.addEventListener("click", () => {
+      const assigned = splitPortions(group).reduce((a, b) => a + b, 0);
+      group.children.forEach((child) => child.share = round(assigned / group.children.length));
+      render();
+    });
+    container.querySelector("[data-split-normalize]")?.addEventListener("click", () => {
+      const assigned = splitPortions(group).reduce((a, b) => a + b, 0);
+      if (assigned <= 0) return;
+      group.children.forEach((child) => child.share = round((Number(child.share) || 0) / assigned));
+      render();
+    });
+    const add = container.querySelector("[data-add]");
+    const results = container.querySelector("[data-results]");
+    add?.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      const query = add.value.trim();
+      if (!query) {
+        if (results) results.innerHTML = "";
+        return;
+      }
+      searchTimer = setTimeout(async () => {
+        try {
+          const found = await getJson(`/api/v1/entries?q=${encodeURIComponent(query)}&limit=8`);
+          if (!results) return;
+          results.innerHTML = found.entries.map((entry) => `<button type="button" class="split-result" data-pick="${escapeHtml(entry.id)}" data-title="${escapeHtml(entry.title)}">${escapeHtml(entry.title)} ${kindTag(entry.kind)}</button>`).join("") || `<span class="dim">no match</span>`;
+          results.querySelectorAll("[data-pick]").forEach((pick) => pick.addEventListener("click", () => {
+            const id = pick.dataset.pick;
+            if (entriesOf(tree).has(id)) {
+              showToast("That entry is already in the split", "error");
+              return;
+            }
+            titles.set(id, pick.dataset.title || id);
+            const weights = group.children.map((child) => Number(child.weight) || 0);
+            const mean = weights.length ? weights.reduce((a, b) => a + b, 0) / weights.length : 1;
+            group.children.push({ type: "member", entry: id, share: 0, weight: round(mean || 1) });
+            render();
+          }));
+        } catch (error) {
+          showToast(error?.message || String(error), "error");
+        }
+      }, 200);
+    });
+    const bar = container.querySelector("[data-split-bar]");
+    container.querySelectorAll("[data-handle]").forEach((handle) => {
+      if (!(handle instanceof HTMLElement) || !(bar instanceof HTMLElement)) return;
+      const index = Number(handle.dataset.handle);
+      // Boundary `index` sits after child `index`; it trades between that
+      // child and the next, or the last child and the unassigned rest.
+      const move = (at) => {
+        const portions = splitPortions(group);
+        const lower = portions.slice(0, index).reduce((a, b) => a + b, 0);
+        const upper = index < portions.length - 1 ? lower + portions[index] + portions[index + 1] : 1;
+        const boundary = Math.min(upper, Math.max(lower, Math.round(at * 100) / 100));
+        if (index < portions.length - 1) group.children[index + 1].share = round(upper - boundary);
+        group.children[index].share = round(boundary - lower);
+        paint();
+      };
+      handle.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        handle.setPointerCapture(event.pointerId);
+        const onMove = (moveEvent) => {
+          const rect = bar.getBoundingClientRect();
+          move((moveEvent.clientX - rect.left) / rect.width);
+        };
+        const onUp = () => {
+          handle.removeEventListener("pointermove", onMove);
+          handle.removeEventListener("pointerup", onUp);
+        };
+        handle.addEventListener("pointermove", onMove);
+        handle.addEventListener("pointerup", onUp);
+      });
+      handle.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        const step = event.shiftKey ? .1 : .01;
+        const edgeAt = splitPortions(group).slice(0, index + 1).reduce((a, b) => a + b, 0);
+        move(edgeAt + (event.key === "ArrowRight" ? step : -step));
+      });
+    });
+    container.querySelector("[data-split-reset]")?.addEventListener("click", () => {
+      tree = JSON.parse(original);
+      path = [];
+      resetView();
+      render();
+    });
+    container.querySelector("[data-split-save]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      if (button instanceof HTMLButtonElement) button.disabled = true;
+      try {
+        await sendJson(`/api/v1/entries/${encodeURIComponent(currentEntryData.entry.id)}/impacts/${encodeURIComponent(impact.id)}/shares`, "PUT", { split: tree });
+        await refreshEntry(currentEntryData.entry.id, { keepEditorFor: impact.id });
+        showToast("Split saved");
+      } catch (error) {
+        if (button instanceof HTMLButtonElement) button.disabled = false;
+        showToast(error?.message || String(error), "error");
+      }
+    });
+  };
+  render();
+}
+
+/** Each shared impact's "details & edit" carries its split editor. */
+function bindInlineSplits(data) {
+  app.querySelectorAll("[data-inline-split]").forEach((container) => {
+    if (!(container instanceof HTMLElement)) return;
+    const impact = data.impacts.find((item) => item.id === container.dataset.inlineSplit);
+    if (impact?.shared?.split) bindSplitTree(container, impact, data.entry.id);
+  });
+}
+
+const progressBasisCache = new Map();
+
+/** What the stores say for this entry's progress (length, episodes). */
+function progressBasis(entryId) {
+  if (!progressBasisCache.has(entryId)) {
+    progressBasisCache.set(entryId, fetch(`/api/v1/entries/${encodeURIComponent(entryId)}/progress-basis`)
+      .then((response) => (response.ok ? response.json() : {}))
+      .catch(() => ({})));
+  }
+  return progressBasisCache.get(entryId);
+}
+
+/**
+ * Progress fields default to the store's values (as the importer does for
+ * XML that leaves them out): blank fields are filled, and a field that
+ * differs from the store shows the store's value with a "use" link.
+ */
+async function bindProgressBasis(root, entryId) {
+  const kind = root.closest(".impact-form")?.querySelector('select[name="kind"]')?.value;
+  const targets = {
+    music_consumed_progress: [["duration_minutes", "length_minutes", formatDurationInput]],
+    anime_consumed: [
+      ["episodes", "episodes", (value) => String(value)],
+      ["episode_duration_minutes", "episode_minutes", formatDurationInput],
+    ],
+  }[kind];
+  if (!targets) return;
+  const basis = await progressBasis(entryId);
+  // A TV episode counts 20 minutes (OP/ED excluded), not the store's length.
+  const tvDefault = basis?.store_episode_minutes == null || basis.episode_minutes !== basis.store_episode_minutes;
+  for (const [name, key, format] of targets) {
+    const source = key === "episode_minutes" && tvDefault
+      ? (basis?.store_episode_minutes != null ? `TV default · store ${formatDurationInput(basis.store_episode_minutes)} incl. OP/ED` : "TV default")
+      : "from store";
+    const input = root.querySelector(`input[name="${name}"]`);
+    const value = basis?.[key];
+    if (!(input instanceof HTMLInputElement) || value == null) continue;
+    const stored = format(value);
+    if (!input.value.trim()) input.value = stored;
+    const hint = document.createElement("small");
+    hint.className = "store-hint";
+    const sync = () => {
+      const same = input.value.trim() === stored || Math.abs(Number(input.value) - Number(stored)) < 1e-6;
+      hint.innerHTML = same
+        ? escapeHtml(source)
+        : `${escapeHtml(source)}: ${escapeHtml(stored)} <button class="link-button" type="button">use</button>`;
+      hint.querySelector("button")?.addEventListener("click", () => {
+        input.value = stored;
+        sync();
+      });
+    };
+    input.addEventListener("input", sync);
+    input.closest(".form-field")?.append(hint);
+    sync();
+  }
+}
+
 function openImpactEditor(impact = null, action) {
   if (!currentEntryData) return;
   const entryId = currentEntryData.entry.id;
@@ -1056,14 +1636,20 @@ function openImpactEditor(impact = null, action) {
   fields.source ||= entryId;
   fields.dah_factor = String(impact?.contributor_share ?? 1);
   fields.note = impact?.note || impact?.source_comment || "";
+  // A shared impact edits its whole group: values plus every share.
+  // A shared impact's split has its own editor above this form; the form keeps it.
+  const shareMarkup = impact?.shared
+    ? `<input type="hidden" name="shares" value="${escapeHtml(JSON.stringify(impact.shared.members.map((member) => ({ contributor: member.id, factor: member.factor }))))}">`
+    : `<input type="hidden" name="dah_factor" value="${escapeHtml(fields.dah_factor)}">`;
   const body = `
     ${impact ? "" : `<p class="form-note editor-intro">Per DAH_standards — pick the kind, fill in its own parameters, and the score vector is computed from the spec's formula rather than picked by hand.</p>`}
-    <div class="form-grid">
-      ${textField(fields, "source", "source entry", entryId)}
+    ${impact?.shared ? `<p class="form-note editor-intro">Shared impact — these values apply to every entry in the split; the split itself is edited above.</p>` : ""}
+    <div class="impact-form">
+      <input type="hidden" name="source" value="${escapeHtml(fields.source)}">
       ${impactKindField(fields.kind)}
-      <div id="impact-kind-fields" class="form-grid full">${impactKindFields(fields.kind, fields)}</div>
-      ${rangeField(fields, "dah_factor", "contributor share", "1")}
-      ${field("note", `<textarea name="note" rows="3">${escapeHtml(fields.note)}</textarea>`)}
+      <div id="impact-kind-fields" class="form-grid">${impactKindFields(fields.kind, fields)}</div>
+      ${shareMarkup}
+      ${field("note", `<textarea name="note" rows="2">${escapeHtml(fields.note)}</textarea>`)}
     </div>`;
   const refresh = async (message) => {
     await refreshEntry(entryId);
@@ -1081,16 +1667,86 @@ function openImpactEditor(impact = null, action) {
     },
     impact ? async () => {
       await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts/${encodeURIComponent(impact.id)}`, "DELETE");
-      await refresh("Impact deleted");
+      await refresh(impact.shared ? "Share removed" : "Impact deleted");
     } : null,
   );
+  bindEmotionSplits(editor);
+  const kindFields = editor.querySelector("#impact-kind-fields");
+  if (kindFields instanceof HTMLElement) bindProgressBasis(kindFields, entryId);
   const kindSelect = editor.querySelector('select[name="kind"]');
   kindSelect?.addEventListener("change", () => {
     const target = editor.querySelector("#impact-kind-fields");
     if (target instanceof HTMLElement && kindSelect instanceof HTMLSelectElement) {
       target.innerHTML = impactKindFields(kindSelect.value, {});
       bindRangeOutputs(target);
+      bindEmotionSplits(target);
+      bindProgressBasis(target, entryId);
     }
+  });
+}
+
+/**
+ * An entry field you fill by searching titles. The hidden input carries the
+ * id; typing an exact raw id still works, since the text is used as is until
+ * a result is picked.
+ */
+function entryPickerField(name, label, id, title, placeholder = "search entries…") {
+  return `<div class="form-field entry-picker" data-entry-picker>
+    <span>${escapeHtml(label)}</span>
+    <div class="entry-picker-body">
+      <input type="hidden" name="${name}" value="${escapeHtml(id)}">
+      <input type="search" data-entry-query value="${escapeHtml(title || id)}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" ${id ? "" : "required"}>
+      <small class="dim mono" data-entry-id>${escapeHtml(id)}</small>
+      <div class="entry-picker-results" data-entry-results></div>
+    </div>
+  </div>`;
+}
+
+function bindEntryPickers(root) {
+  root.querySelectorAll("[data-entry-picker]").forEach((picker) => {
+    const hidden = picker.querySelector('input[type="hidden"]');
+    const query = picker.querySelector("[data-entry-query]");
+    const idLabel = picker.querySelector("[data-entry-id]");
+    const results = picker.querySelector("[data-entry-results]");
+    if (!(hidden instanceof HTMLInputElement) || !(query instanceof HTMLInputElement) || !results || !idLabel) return;
+    let timer;
+    let controller;
+    const choose = (id, title) => {
+      hidden.value = id;
+      query.value = title || id;
+      idLabel.textContent = id;
+      results.innerHTML = "";
+    };
+    query.addEventListener("input", () => {
+      hidden.value = query.value.trim();
+      idLabel.textContent = "";
+      clearTimeout(timer);
+      const text = query.value.trim();
+      if (!text) {
+        results.innerHTML = "";
+        return;
+      }
+      timer = setTimeout(async () => {
+        controller?.abort();
+        controller = new AbortController();
+        try {
+          const response = await fetch(`/api/v1/entries?q=${encodeURIComponent(text)}&limit=8`, { signal: controller.signal });
+          const found = await response.json();
+          results.innerHTML = (found.entries || []).map((entry) => `<button type="button" class="split-result" data-pick="${escapeHtml(entry.id)}" data-title="${escapeHtml(entry.title)}">${escapeHtml(entry.title)} ${kindTag(entry.kind)} <span class="dim mono">${escapeHtml(entry.id)}</span></button>`).join("") || `<span class="dim">no match — the text is used as a raw id</span>`;
+          results.querySelectorAll("[data-pick]").forEach((pick) => pick.addEventListener("click", () => choose(pick.dataset.pick, pick.dataset.title)));
+        } catch (error) {
+          if (error?.name !== "AbortError") showToast(error?.message || String(error), "error");
+        }
+      }, 200);
+    });
+    query.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      const first = results.querySelector("[data-pick]");
+      if (first instanceof HTMLElement) {
+        event.preventDefault();
+        first.click();
+      }
+    });
   });
 }
 
@@ -1099,6 +1755,7 @@ function relationKindFields(kind, fields) {
   if (kind === "killed_by") return `${rangeField(fields, "potential", "lost potential")}${rangeField(fields, "effect", "actual effect")}`;
   if (kind === "remix") return `<p class="form-note full">Fixed 0.2 scalar borrow — no extra parameters.</p>`;
   if (kind === "feature_music") return `<p class="form-note full">Fixed 0.2 on the Music anchor only — no extra parameters.</p>`;
+  if (kind === "credit") return `${field("roles", `<input name="roles" type="text" value="${escapeHtml(fieldValue(fields, "roles"))}" placeholder="vocal+image/2" required list="role-names" autocomplete="off"><datalist id="role-names">${roleNames.map((name) => `<option value="${name}">`).join("")}</datalist>`, `from = contributor, to = work. Roles join with +, scale with * or /: ${roleNames.slice(0, 9).join(", ")}…`)}`;
   return `<p class="error full">Unknown relation kind.</p>`;
 }
 
@@ -1109,14 +1766,14 @@ function openRelationEditor(relation = null, action) {
   fields.kind = relation?.kind || "contains";
   fields.from_entry = relation?.from || entryId;
   fields.to_entry = relation?.to || "";
+  const titleOf = (id) => (id === entryId ? currentEntryData.entry.title : id && relation?.other?.id === id ? relation.other.title : "");
   const body = `
   ${relation ? "" : `<p class="form-note editor-intro">The relation's kind already implies its transform under DAH_standards — no separate scalar/regional/transport choice to make.</p>`}
   <div class="form-grid">
     ${selectField(fields, "kind", "relation kind", relationKinds, fields.kind)}
-    ${textField(fields, "from_entry", "from entry")}
-    ${textField(fields, "to_entry", "to entry", "", "text", `required placeholder="other entry's raw id"`)}
+    ${entryPickerField("from_entry", "from entry", fields.from_entry, titleOf(fields.from_entry))}
+    ${entryPickerField("to_entry", "to entry", fields.to_entry, titleOf(fields.to_entry))}
     <div id="relation-kind-fields" class="form-grid full">${relationKindFields(fields.kind, fields)}</div>
-    <p class="form-note full">from/to take a raw entry id (the one in this page's URL, or another entry's) — <a href="/entries" data-link>browse entries</a> to find one.</p>
   </div>`;
   const refresh = async (message) => {
     await refreshEntry(entryId);
@@ -1137,6 +1794,7 @@ function openRelationEditor(relation = null, action) {
       await refresh("Relation deleted");
     } : null,
   );
+  bindEntryPickers(editor);
   const kindSelect = editor.querySelector('select[name="kind"]');
   kindSelect?.addEventListener("change", () => {
     const target = editor.querySelector("#relation-kind-fields");
@@ -1284,6 +1942,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         ${data.relations.length ? `<div class="relation-sections">${relationSectionsMarkup(data.relations)}</div>` : `<p class="empty">No relations yet.</p>`}
         <div class="section-actions"><button class="button primary" type="button" data-action="add-relation">add relation</button></div>
       </section>`;
+    bindInlineSplits(data);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {
       if (!(element instanceof HTMLDetailsElement)) return;
       const key = element.getAttribute("data-disclosure");

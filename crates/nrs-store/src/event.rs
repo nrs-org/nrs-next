@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     EntryAdd,
+    EntryEdit,
     ImpactAdd,
     ImpactEdit,
     ImpactDelete,
@@ -24,6 +25,7 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::EntryAdd => "entry.add",
+            EventKind::EntryEdit => "entry.edit",
             EventKind::ImpactAdd => "impact.add",
             EventKind::ImpactEdit => "impact.edit",
             EventKind::ImpactDelete => "impact.delete",

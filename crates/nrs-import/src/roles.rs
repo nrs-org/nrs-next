@@ -362,6 +362,68 @@ pub fn vector_to_transform(v: Vec11) -> nrs_core::Transform {
     nrs_core::Transform::Regional(map)
 }
 
+/// Terms of a stored credit's roles (several `<role>` tags for one
+/// contributor are stored joined with "; " and add up, like the importer).
+pub fn parse_credit_roles(roles: &str) -> Result<Vec<RoleTerm>, String> {
+    let mut terms = Vec::new();
+    for part in roles.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        terms.extend(parse_role_expression(&part.replace(' ', ""))?);
+    }
+    if terms.is_empty() {
+        return Err("empty roles expression".into());
+    }
+    Ok(terms)
+}
+
+/// The credit transform for `roles` on a work with `vars`.
+pub fn credit_transform(roles: &str, vars: &MusicVars) -> Result<nrs_core::Transform, String> {
+    Ok(vector_to_transform(weight_vector(
+        &parse_credit_roles(roles)?,
+        vars,
+    )))
+}
+
+fn transforms_close(a: &nrs_core::Transform, b: &nrs_core::Transform) -> bool {
+    use nrs_core::Transform::*;
+    let close = |x: f32, y: f32| (x - y).abs() <= 1e-4 * x.abs().max(y.abs()).max(1.0);
+    match (a, b) {
+        (Scalar(x), Scalar(y)) => close(*x, *y),
+        (Regional(x), Regional(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| close(*v, *w)))
+        }
+        _ => false,
+    }
+}
+
+/// A work's `MusicVars` aren't stored once imported, so recover them from
+/// its stored credits `(roles, transform)`: the defaults with or without
+/// featuring, and with any 0.05-step `arrange` override (`<musicvar>`), the
+/// first that reproduces every credit. `None` when nothing does.
+pub fn infer_music_vars(credits: &[(String, nrs_core::Transform)]) -> Option<MusicVars> {
+    let mut parsed = Vec::new();
+    for (roles, transform) in credits {
+        parsed.push((parse_credit_roles(roles).ok()?, transform));
+    }
+    let mentions = parsed.iter().any(|(terms, _)| mentions_image_feat(terms));
+    let arranges = std::iter::once(0.5).chain((0..=20).map(|step| step as f32 / 20.0));
+    for arrange in arranges {
+        for feat in [mentions, !mentions] {
+            let vars = MusicVars {
+                feat,
+                arrange,
+                ..Default::default()
+            };
+            if parsed.iter().all(|(terms, transform)| {
+                transforms_close(&vector_to_transform(weight_vector(terms, &vars)), transform)
+            }) {
+                return Some(vars);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +531,26 @@ mod tests {
     #[test]
     fn unknown_role_name_errors() {
         assert!(parse_role_expression("not_a_role").is_err());
+    }
+
+    #[test]
+    fn infers_feat_and_arrange_overrides_from_stored_credits() {
+        let vars = MusicVars {
+            feat: true,
+            arrange: 0.75,
+            ..Default::default()
+        };
+        let credits: Vec<(String, nrs_core::Transform)> = ["compose+arrange/2", "vocal+image"]
+            .iter()
+            .map(|roles| (roles.to_string(), credit_transform(roles, &vars).unwrap()))
+            .collect();
+        let inferred = infer_music_vars(&credits).unwrap();
+        assert!(inferred.feat);
+        assert_eq!(inferred.arrange, 0.75);
+        // Several <role> tags for one contributor add up.
+        assert_eq!(
+            credit_transform("vocal; image/2", &vars).unwrap(),
+            credit_transform("vocal+image/2", &vars).unwrap()
+        );
     }
 }

@@ -1299,8 +1299,10 @@ version = "0.1.0"
 dependencies = [
  "boa_engine",
  "nrs-core",
+ "nrs-entry-store",
  "nrs-store",
  "roxmltree",
+ "rusqlite",
  "serde_json",
  "time",
 ]

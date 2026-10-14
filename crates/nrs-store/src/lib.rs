@@ -14,7 +14,9 @@ mod resync;
 mod review;
 mod review_queue;
 mod schema;
+mod shared;
 mod snapshot;
+mod split;
 
 use std::path::{Path, PathBuf};
 
@@ -26,8 +28,16 @@ pub use event::EventKind;
 pub use events::EventRecord;
 pub use import::ImportExtras;
 pub use preferences::Preference;
-pub use resync::ResyncPlan;
+pub use resync::{ReboundEntry, ResyncPlan, RetitledEntry, SharedBase, SharedChange};
 pub use review_queue::ReviewImpact;
+pub use split::{
+    flatten as flatten_split, infer as infer_split, remove_member as remove_split_member,
+    validate as validate_split, SplitNode, SplitRule,
+};
+pub use shared::{
+    expand as expand_shared_impact, member_impact_id, split_member_impact_id, ImpactMember,
+    SharedImpact, MEMBER_ID_SEP,
+};
 
 use review::ReviewLog;
 

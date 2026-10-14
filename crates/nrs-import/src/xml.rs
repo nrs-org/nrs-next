@@ -56,6 +56,17 @@ pub struct ParsedEntry {
     /// ids and bare artist entries).
     pub store: String,
     pub store_id: String,
+    /// `<bind url="..."/>`: canonical URLs of the store records this entry
+    /// is (stripped XML). Titles and store-asserted containment come from
+    /// these via `stores::apply_store_facts`.
+    pub binds: Vec<String>,
+    /// `title` was filled in from a store, not written in the XML. Scoring
+    /// rules that read the title (the "feat." credit rule) skip it: a store
+    /// re-titling a record must not move a score.
+    pub title_from_store: bool,
+    /// `<unlink id="..."/>`: children whose store-asserted `contains` edge
+    /// this entry refuses (the store's tracklist says so, NRS doesn't).
+    pub unlinks: Vec<String>,
     pub best_girl: Option<String>,
     pub impacts: Vec<ParsedImpact>,
     pub relations: Vec<ParsedRelation>,
@@ -160,15 +171,21 @@ pub enum ImpactKind {
     },
     AnimeConsumedProgress {
         boredom: f32,
-        episodes: f32,
-        episode_duration_minutes: f32,
+        /// `None` when the XML leaves it to the anime store
+        /// (`stores::apply_store_facts` fills the bound entry's count).
+        episodes: Option<f32>,
+        /// `None` when the XML leaves it out: the anime store's length for
+        /// movies and shorts, NRS's 20-minute default otherwise.
+        episode_duration_minutes: Option<f32>,
     },
     ConsumedProgress {
         boredom: f32,
         duration_minutes: f32,
     },
     MusicConsumedProgress {
-        duration_minutes: f32,
+        /// `None` when the XML leaves it to musiclib
+        /// (`stores::apply_store_facts` fills the bound track's length).
+        duration_minutes: Option<f32>,
     },
     /// `<regularImpact><score><component value=".." factor=".."/>...`:
     /// a raw, already-computed value directly at a named old factor
@@ -438,6 +455,9 @@ fn parse_entry(
         title,
         store: "none".into(),
         store_id: id.clone(),
+        binds: Vec::new(),
+        title_from_store: false,
+        unlinks: Vec::new(),
         best_girl: None,
         impacts: Vec::new(),
         relations: Vec::new(),
@@ -472,6 +492,18 @@ fn parse_entry(
                 );
             }
             "source" => parse_source(child, &mut entry),
+            "bind" => match child.attribute("url") {
+                Some(url) => entry.binds.push(url.to_string()),
+                None => warnings.push(format!(
+                    "{context_prefix}: <bind> missing required attribute 'url', skipped"
+                )),
+            },
+            "unlink" => match child.attribute("id") {
+                Some(target) => entry.unlinks.push(transform_id(target, Some(&id))),
+                None => warnings.push(format!(
+                    "{context_prefix}: <unlink> missing required attribute 'id', skipped"
+                )),
+            },
             "bestGirl" => entry.best_girl = child.attribute("name").map(String::from),
             "contains" => {
                 for (to, factor) in parse_contains(child, 1.0, &id) {
@@ -970,11 +1002,13 @@ fn parse_impact_kind(
         }),
         "animeConsumedProgress" => Some(ImpactKind::AnimeConsumedProgress {
             boredom: req_f32(node, "boredom", context, warnings)?,
-            episodes: req_f32(node, "episodes", context, warnings)?,
+            episodes: match node.attribute("episodes") {
+                None => None,
+                Some(_) => Some(req_f32(node, "episodes", context, warnings)?),
+            },
             episode_duration_minutes: node
                 .attribute("episodeDuration")
-                .and_then(parse_duration_minutes)
-                .unwrap_or(20.0),
+                .and_then(parse_duration_minutes),
         }),
         "consumedProgress" => Some(ImpactKind::ConsumedProgress {
             boredom: req_f32(node, "boredom", context, warnings)?,
@@ -989,15 +1023,15 @@ fn parse_impact_kind(
                 })?,
         }),
         "musicConsumedProgress" => Some(ImpactKind::MusicConsumedProgress {
-            duration_minutes: node
-                .attribute("length")
-                .and_then(parse_duration_minutes)
-                .or_else(|| {
+            duration_minutes: match node.attribute("length") {
+                None => None,
+                Some(length) => Some(parse_duration_minutes(length).or_else(|| {
                     warnings.push(format!(
                         "{context}: <musicConsumedProgress> unparseable 'length'"
                     ));
                     None
-                })?,
+                })?),
+            },
         }),
         // `<consumed>`'s duration attribute is (inconsistently, but
         // per-schema) named "length", unlike consumedProgress's "duration".
@@ -1092,6 +1126,27 @@ mod tests {
             .iter()
             .find(|e| e.id == id)
             .unwrap_or_else(|| panic!("no entry {id}"))
+    }
+
+    #[test]
+    fn parses_bind_and_unlink() {
+        let doc = parse_str(
+            r#"<document>
+                <entry id="M-1">
+                    <bind url="https://musicbrainz.org/release/r" />
+                    <unlink id="$-2" />
+                    <entry id="$-1"><bind url="https://youtu.be/abcdefghijk" /></entry>
+                </entry>
+            </document>"#,
+            today(),
+        )
+        .unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let album = entry(&doc, "M-1");
+        assert_eq!(album.title, "");
+        assert_eq!(album.binds, ["https://musicbrainz.org/release/r"]);
+        assert_eq!(album.unlinks, ["M-1-2"]);
+        assert_eq!(entry(&doc, "M-1-1").binds, ["https://youtu.be/abcdefghijk"]);
     }
 
     #[test]

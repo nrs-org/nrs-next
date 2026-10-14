@@ -231,8 +231,36 @@ SELECT CAST(strftime('%s', 'now') AS INTEGER), 'schema.migrate', NULL, NULL, NUL
 WHERE changes() > 0;
 "#;
 
+const SCHEMA_V8: &str = r#"
+-- Shared impacts: one impact split between several entries (an XML
+-- impact with <contributor> children) is stored once, with its unscaled
+-- base atoms, plus one row per contributor and its share. Scoring sees one
+-- expanded copy per member (base atoms x factor). An impact without member
+-- rows is an ordinary impact on its `target`. Shares need not sum to 1: a
+-- share given to a null/unknown entry is simply absent.
+CREATE TABLE IF NOT EXISTS impact_member (
+    impact      TEXT NOT NULL REFERENCES impact(id),
+    contributor TEXT NOT NULL REFERENCES entry(id),
+    factor      REAL NOT NULL,
+    PRIMARY KEY (impact, contributor)
+);
+CREATE INDEX IF NOT EXISTS idx_impact_member_contributor ON impact_member(contributor);
+"#;
+
+const SCHEMA_V9: &str = r#"
+-- A shared impact's split as edited in the app: a JSON tree of groups
+-- (explicit / even / weighted) over its members (see `split.rs`).
+-- `impact_member` stays the flattened result that scoring reads. Shared
+-- impacts without a row here get a tree inferred from their shares.
+CREATE TABLE IF NOT EXISTS impact_split (
+    impact TEXT PRIMARY KEY REFERENCES impact(id),
+    tree   TEXT NOT NULL
+);
+"#;
+
 const MIGRATIONS: &[&str] = &[
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

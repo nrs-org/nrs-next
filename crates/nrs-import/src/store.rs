@@ -27,5 +27,7 @@ pub fn import_extras(extras: &BuildExtras) -> ImportExtras {
                 (id.clone(), (kind.to_string(), params.clone(), *factor))
             })
             .collect(),
+        impact_share: extras.impact_share.clone(),
+        shared_base: extras.shared_base.clone(),
     }
 }

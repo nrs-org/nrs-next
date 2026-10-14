@@ -362,10 +362,20 @@ fn atoms_for(
             )
         }
         ImpactKind::AnimeConsumedProgress {
+            episodes: None, ..
+        } => {
+            warnings.push(format!(
+                "{context}: <animeConsumedProgress> has no 'episodes' and no store count, skipped"
+            ));
+            (Vec::new(), None)
+        }
+        ImpactKind::AnimeConsumedProgress {
             boredom,
-            episodes,
+            episodes: Some(episodes),
             episode_duration_minutes,
         } => {
+            let episode_duration_minutes =
+                &episode_duration_minutes.unwrap_or(crate::stores::DEFAULT_EPISODE_MINUTES);
             params.insert("boredom".into(), boredom.to_string());
             params.insert("episodes".into(), episodes.to_string());
             params.insert(
@@ -388,7 +398,17 @@ fn atoms_for(
                 Some("consumed"),
             )
         }
-        ImpactKind::MusicConsumedProgress { duration_minutes } => {
+        ImpactKind::MusicConsumedProgress {
+            duration_minutes: None,
+        } => {
+            warnings.push(format!(
+                "{context}: <musicConsumedProgress> has no 'length' and no store length, skipped"
+            ));
+            (Vec::new(), None)
+        }
+        ImpactKind::MusicConsumedProgress {
+            duration_minutes: Some(duration_minutes),
+        } => {
             params.insert("duration_minutes".into(), duration_minutes.to_string());
             (
                 legacy::music_consumed_progress(source, *duration_minutes),
@@ -458,6 +478,12 @@ pub struct BuildExtras {
     /// `factor` before saving, so re-editing never silently discards
     /// the share.
     pub impact_dah: BTreeMap<ImpactId, (&'static str, BTreeMap<String, String>, f32)>,
+    /// Impacts that are one contributor's share of a shared impact (an
+    /// XML impact split between entries): impact id -> (shared key, share).
+    /// The key is the first share's id; `nrs-store` stores the group once.
+    pub impact_share: BTreeMap<ImpactId, (String, f32)>,
+    /// Shared key -> the unscaled base atoms each share was scaled from.
+    pub shared_base: BTreeMap<String, Vec<Atom>>,
 }
 
 /// Whether `kind`'s anchor was a default guess rather than a confident
@@ -559,7 +585,10 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, BuildExtras, Vec<Strin
             let mentions_feat = by_id
                 .values()
                 .any(|terms| roles::mentions_image_feat(terms));
-            let title_has_feat = parsed.title.contains("feat.") || parsed.title.contains("ft.");
+            // Only a title written in the XML counts: a store title is not
+            // NRS's call (stripped XML pins featuring with <musicvar feat>).
+            let title_has_feat = !parsed.title_from_store
+                && (parsed.title.contains("feat.") || parsed.title.contains("ft."));
             let mut vars = roles::MusicVars {
                 feat: mentions_feat || title_has_feat,
                 ..Default::default()
@@ -675,10 +704,17 @@ fn push_impact(
     extras: &mut BuildExtras,
     warnings: &mut Vec<String>,
 ) {
+    // Anything but "the declaring entry, whole" is a shared impact: several
+    // contributors, a partial share, or a share given away entirely.
+    let shared = !matches!(
+        impact.contributors.as_slice(),
+        [(only, factor)] if *only == source.0 && *factor == 1.0
+    );
     let (base_atoms, dah) = atoms_for(&impact.kind, source, context, warnings);
     if base_atoms.is_empty() {
         return;
     }
+    let mut shared_key: Option<String> = None;
     for (contributor_id, factor) in &impact.contributors {
         if !known_ids.contains(contributor_id.as_str()) {
             warnings.push(format!(
@@ -695,6 +731,14 @@ fn push_impact(
             })
             .collect();
         let id = ImpactId(format!("i{}", impacts.len() + 1));
+        if shared {
+            let key = shared_key.get_or_insert_with(|| id.0.clone()).clone();
+            extras
+                .shared_base
+                .entry(key.clone())
+                .or_insert_with(|| base_atoms.clone());
+            extras.impact_share.insert(id.clone(), (key, *factor));
+        }
         if let Some(comment) = &impact.source_comment {
             extras.source_comments.insert(id.clone(), comment.clone());
         }

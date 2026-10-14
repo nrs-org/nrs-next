@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use nrs_core::{
     Anchor, AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, RelKind, Relation,
-    SourceId, TimeParams, Transform,
+    TimeParams, Transform,
 };
 
 use crate::error::{Result, StoreError};
@@ -59,46 +59,6 @@ fn insert_atom(tx: &Transaction, impact_id: &str, atom: &Atom) -> Result<()> {
         params![impact_id, atom.source.0, blend, atom.magnitude, time],
     )?;
     Ok(())
-}
-
-fn read_impact(tx: &Transaction, id: &ImpactId) -> Result<Option<Impact>> {
-    let target: Option<String> = tx
-        .query_row(
-            "SELECT target FROM impact WHERE id = ?1",
-            params![id.0],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(target) = target else {
-        return Ok(None);
-    };
-
-    let mut stmt = tx.prepare(
-        "SELECT source, blend, magnitude, time FROM impact_atom \
-         WHERE impact = ?1 ORDER BY rowid",
-    )?;
-    let rows = stmt.query_map(params![id.0], |row| {
-        let source: String = row.get(0)?;
-        let blend: String = row.get(1)?;
-        let magnitude: f32 = row.get(2)?;
-        let time: String = row.get(3)?;
-        Ok((source, blend, magnitude, time))
-    })?;
-    let mut atoms = Vec::new();
-    for row in rows {
-        let (source, blend, magnitude, time) = row?;
-        atoms.push(Atom {
-            source: SourceId(source),
-            blend: serde_json::from_str(&blend)?,
-            magnitude,
-            time: serde_json::from_str(&time)?,
-        });
-    }
-    Ok(Some(Impact {
-        id: id.clone(),
-        target: EntryId(target),
-        atoms,
-    }))
 }
 
 fn read_relation(tx: &Transaction, id: &str) -> Result<Option<Relation>> {
@@ -272,7 +232,7 @@ impl Store {
 
     pub fn edit_impact(&mut self, id: &ImpactId, atoms: &[Atom], note: Option<&str>) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let before = read_impact(&tx, id)?;
+        let before = crate::shared::read_record(&tx, id)?;
         tx.execute("DELETE FROM impact_atom WHERE impact = ?1", params![id.0])?;
         for atom in atoms {
             insert_atom(&tx, &id.0, atom)?;
@@ -281,7 +241,7 @@ impl Store {
             "UPDATE impact SET note = ?2 WHERE id = ?1",
             params![id.0, note],
         )?;
-        let after = read_impact(&tx, id)?;
+        let after = crate::shared::read_record(&tx, id)?;
         append_event(
             &tx,
             EventKind::ImpactEdit,
@@ -306,7 +266,7 @@ impl Store {
         let source_comment = self.review.get(&id.0).source_comment;
 
         let tx = self.conn.transaction()?;
-        let before = read_impact(&tx, id)?;
+        let before = crate::shared::read_record(&tx, id)?;
         let has_note: Option<String> = tx
             .query_row(
                 "SELECT note FROM impact WHERE id = ?1",
@@ -323,7 +283,7 @@ impl Store {
                 )?;
             }
         }
-        let after = read_impact(&tx, id)?;
+        let after = crate::shared::read_record(&tx, id)?;
         append_event(
             &tx,
             EventKind::ImpactConfirm,
@@ -340,8 +300,10 @@ impl Store {
 
     pub fn delete_impact(&mut self, id: &ImpactId) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let before = read_impact(&tx, id)?;
+        let before = crate::shared::read_record(&tx, id)?;
         tx.execute("DELETE FROM impact_atom WHERE impact = ?1", params![id.0])?;
+        tx.execute("DELETE FROM impact_member WHERE impact = ?1", params![id.0])?;
+        tx.execute("DELETE FROM impact_split WHERE impact = ?1", params![id.0])?;
         tx.execute("DELETE FROM impact WHERE id = ?1", params![id.0])?;
         append_event(
             &tx,

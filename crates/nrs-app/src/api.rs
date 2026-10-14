@@ -1123,10 +1123,32 @@ struct Impact {
     anchors: Vec<AnchorShare>,
     params: Value,
     contributor_share: Option<f32>,
+    /// Set when this impact is shared between entries: every member and
+    /// its share (`contributor_share` is this entry's).
+    shared: Option<SharedView>,
     note: Option<String>,
     source_comment: Option<String>,
     needs_review: bool,
     atoms: Vec<Atom>,
+}
+
+#[derive(Serialize)]
+struct SharedView {
+    /// Sum of the shares; below 1 when part of the impact goes to no
+    /// known entry.
+    total: f32,
+    members: Vec<SharedMemberView>,
+    /// How the shares are grouped (explicit / even / weighted groups):
+    /// stored if edited in the app, otherwise inferred from the shares.
+    split: Option<nrs_store::SplitNode>,
+    split_stored: bool,
+}
+
+#[derive(Serialize)]
+struct SharedMemberView {
+    id: String,
+    entry: Option<EntrySummary>,
+    factor: f32,
 }
 
 fn section_name(section: ImpactSection) -> &'static str {
@@ -1199,6 +1221,22 @@ fn impact_response(
             .collect(),
         params,
         contributor_share: impact.dah_factor,
+        shared: (!impact.members.is_empty()).then(|| SharedView {
+            total: impact.members.iter().map(|member| member.factor).sum(),
+            members: impact
+                .members
+                .iter()
+                .map(|member| SharedMemberView {
+                    id: member.contributor.0.clone(),
+                    entry: entries
+                        .get(member.contributor.0.as_str())
+                        .map(|entry| EntrySummary::new(entry, hints)),
+                    factor: member.factor,
+                })
+                .collect(),
+            split: impact.split.clone(),
+            split_stored: impact.split_stored,
+        }),
         note: impact.note.clone(),
         source_comment: impact.source_comment.clone(),
         needs_review: impact.needs_review,
@@ -1304,6 +1342,61 @@ fn relation_kind(kind: RelKind) -> &'static str {
     }
 }
 
+/// Progress values the stores supply for an entry's `<bind url>`, which
+/// the importer fills into progress impacts that leave them out.
+#[derive(Serialize, Default)]
+pub(super) struct ProgressBasisResponse {
+    url: Option<String>,
+    length_minutes: Option<f32>,
+    episodes: Option<f32>,
+    episode_minutes: Option<f32>,
+    store_episode_minutes: Option<f32>,
+}
+
+pub(super) async fn progress_basis(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> ApiResult<ProgressBasisResponse> {
+    let entry = {
+        let store = state.store.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "entry API requires database mode",
+            )
+        })?;
+        let store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        store
+            .list_entries()
+            .map_err(|error| store_error("load entries", error))?
+            .into_iter()
+            .find(|entry| entry.id.0 == entry_id)
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "entry not found"))?
+    };
+    // Only `<bind url>` entries (store "url") have a store record.
+    if entry.store != "url" {
+        return Ok(Json(ProgressBasisResponse::default()));
+    }
+    let url = entry.store_id;
+    let (musiclib_db, anime_store_url) = (state.musiclib_db.clone(), state.anime_store_url.clone());
+    let lookup_url = url.clone();
+    let basis = tokio::task::spawn_blocking(move || {
+        let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store_url);
+        nrs_import::progress_basis(&lookup_url, &sources)
+    })
+    .await
+    .map_err(|error| store_error("run store lookup", error))?
+    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(ProgressBasisResponse {
+        url: Some(url),
+        length_minutes: basis.length_minutes,
+        episodes: basis.episodes,
+        episode_minutes: Some(basis.episode_minutes),
+        store_episode_minutes: basis.store_episode_minutes,
+    }))
+}
+
 #[derive(Serialize)]
 pub(super) struct EntryResponse {
     entry: EntrySummary,
@@ -1368,6 +1461,11 @@ pub(super) async fn entry_detail(
             };
             let other = lookup.get(other_id)?;
             let (section, label) = relation_presentation(relation.kind, is_from);
+            let params = relation_params(
+                relation.kind,
+                &relation.transform,
+                relation.dah_params.as_deref(),
+            );
             Some(Relation {
                 id: relation.id,
                 kind: relation_kind(relation.kind),
@@ -1376,13 +1474,9 @@ pub(super) async fn entry_detail(
                 from: relation.from.0,
                 to: relation.to.0,
                 other: EntrySummary::new(other, &hints),
-                editable: relation.dah_params.is_some() && relation.kind != RelKind::Credit,
+                editable: params.is_some(),
                 transform: relation_transform(&relation.transform),
-                params: relation
-                    .dah_params
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str(value).ok())
-                    .unwrap_or_else(|| json!({})),
+                params: params.unwrap_or_else(|| json!({})),
             })
         })
         .collect();
@@ -1417,6 +1511,12 @@ pub(super) async fn impact_raw_edit(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
     let existing = scoped_impact(&store, &entry_id, &impact_id)?;
+    if !existing.members.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "this impact is shared between entries; edit its split with the share editor",
+        ));
+    }
     if existing.dah_kind.is_some() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1535,8 +1635,16 @@ pub(super) async fn impact_add(
 pub(super) async fn impact_edit(
     State(state): State<Arc<AppState>>,
     Path((entry_id, impact_id)): Path<(String, String)>,
-    Json(fields): Json<HashMap<String, String>>,
+    Json(mut fields): Json<HashMap<String, String>>,
 ) -> ApiResult<MutationResponse> {
+    // The split of a shared impact has its own editor; this form only
+    // changes its values, computed unscaled (share 1).
+    fields.remove("shares");
+    let unscaled = {
+        let mut fields = fields.clone();
+        fields.insert("dah_factor".into(), "1".into());
+        prepare_impact(&entry_id, fields)?
+    };
     let (kind, atoms, note, factor, fields) = prepare_impact(&entry_id, fields)?;
     let store = state.store.as_ref().ok_or_else(|| {
         api_error(
@@ -1554,6 +1662,19 @@ pub(super) async fn impact_edit(
             StatusCode::BAD_REQUEST,
             "use the raw editor for an impact without standards metadata",
         ));
+    }
+    if !existing.members.is_empty() {
+        let (kind, atoms, note, _, fields) = unscaled;
+        store
+            .edit_shared_values(&id, &atoms, note.as_deref())
+            .map_err(|error| store_error("edit shared impact", error))?;
+        store
+            .set_impact_dah(&id, &kind, &dah_params_json(&fields), 1.0)
+            .map_err(|error| store_error("save impact metadata", error))?;
+        return Ok(Json(MutationResponse {
+            ok: true,
+            id: Some(impact_id),
+        }));
     }
     store
         .edit_impact(&id, &atoms, note.as_deref())
@@ -1580,14 +1701,293 @@ pub(super) async fn impact_delete(
     let mut store = store
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-    scoped_impact(&store, &entry_id, &impact_id)?;
-    store
-        .delete_impact(&ImpactId(impact_id.clone()))
-        .map_err(|error| store_error("delete impact", error))?;
+    let existing = scoped_impact(&store, &entry_id, &impact_id)?;
+    if existing.members.is_empty() {
+        store
+            .delete_impact(&ImpactId(impact_id.clone()))
+            .map_err(|error| store_error("delete impact", error))?;
+    } else {
+        // From an entry's page, deleting a shared impact takes out only
+        // this entry's share.
+        store
+            .remove_impact_member(&ImpactId(impact_id.clone()), &EntryId(entry_id))
+            .map_err(|error| store_error("remove share", error))?;
+    }
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(impact_id),
     }))
+}
+
+#[derive(Deserialize)]
+struct ShareInput {
+    contributor: String,
+    factor: f32,
+}
+
+/// Validates a shared impact's split: every contributor a known entry,
+/// every share in 0..=1.
+fn shares_to_members(
+    store: &nrs_store::Store,
+    shares: Vec<ShareInput>,
+) -> Result<Vec<nrs_store::ImpactMember>, (StatusCode, Json<ApiError>)> {
+    let known: std::collections::HashSet<String> = store
+        .list_entries()
+        .map_err(|error| store_error("load entries", error))?
+        .into_iter()
+        .map(|entry| entry.id.0)
+        .collect();
+    let mut members = Vec::with_capacity(shares.len());
+    for share in shares {
+        if !known.contains(&share.contributor) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown entry {}", share.contributor),
+            ));
+        }
+        if !share.factor.is_finite() || !(0.0..=1.0).contains(&share.factor) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("share for {} must be between 0 and 1", share.contributor),
+            ));
+        }
+        members.push(nrs_store::ImpactMember {
+            contributor: EntryId(share.contributor),
+            factor: share.factor,
+        });
+    }
+    Ok(members)
+}
+
+/// A split as the editor sends it: a tree of groups, or flat shares.
+#[derive(Deserialize)]
+pub(super) struct SharesUpdate {
+    split: Option<nrs_store::SplitNode>,
+    shares: Option<Vec<ShareInput>>,
+}
+
+/// Turns an ordinary impact into a shared one (this entry as its only
+/// member), so its split editor can add more entries.
+pub(super) async fn impact_make_shared(
+    State(state): State<Arc<AppState>>,
+    Path((entry_id, impact_id)): Path<(String, String)>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "impact writes require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    let existing = scoped_impact(&store, &entry_id, &impact_id)?;
+    if !existing.members.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "this impact is already shared"));
+    }
+    store
+        .make_impact_shared(&ImpactId(impact_id.clone()))
+        .map_err(|error| store_error("share impact", error))?;
+    Ok(Json(MutationResponse {
+        ok: true,
+        id: Some(impact_id),
+    }))
+}
+
+/// Changes only a shared impact's split, keeping its values and note.
+pub(super) async fn impact_shares_edit(
+    State(state): State<Arc<AppState>>,
+    Path((entry_id, impact_id)): Path<(String, String)>,
+    Json(update): Json<SharesUpdate>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "impact writes require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    scoped_impact(&store, &entry_id, &impact_id)?;
+    let id = ImpactId(impact_id.clone());
+    let shared = store
+        .shared_impact(&id)
+        .map_err(|error| store_error("load shared impact", error))?
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "this impact is not shared"))?;
+    match (update.split, update.shares) {
+        (Some(tree), _) => {
+            // Every member must be a known entry; the store checks the rest.
+            let flat = nrs_store::flatten_split(&tree);
+            shares_to_members(
+                &store,
+                flat.into_iter()
+                    .map(|member| ShareInput {
+                        contributor: member.contributor.0,
+                        factor: member.factor.clamp(0.0, 1.0),
+                    })
+                    .collect(),
+            )?;
+            store
+                .set_impact_split(&id, &tree)
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        }
+        (None, Some(shares)) => {
+            let members = shares_to_members(&store, shares)?;
+            store
+                .edit_shared_impact(&id, &shared.atoms, &members, shared.note.as_deref())
+                .map_err(|error| store_error("edit shares", error))?;
+        }
+        (None, None) => {
+            return Err(api_error(StatusCode::BAD_REQUEST, "send a split or shares"));
+        }
+    }
+    Ok(Json(MutationResponse {
+        ok: true,
+        id: Some(impact_id),
+    }))
+}
+
+/// A relation's standards parameters: the stored form, or, for an imported
+/// relation (none stored), what its transform implies. `None` when it can't
+/// be edited as a form (a credit without its roles expression).
+fn relation_params(kind: RelKind, transform: &Transform, dah_params: Option<&str>) -> Option<Value> {
+    let stored = dah_params.and_then(|params| serde_json::from_str::<Value>(params).ok());
+    if kind == RelKind::Credit {
+        return stored.filter(|params| params["roles"].is_string());
+    }
+    if stored.is_some() {
+        return stored;
+    }
+    match (kind, transform) {
+        (RelKind::Contains, Transform::Scalar(factor)) => Some(json!({ "factor": factor.to_string() })),
+        (RelKind::Remix | RelKind::FeatureMusic, _) => Some(json!({})),
+        // `killed_by` scales by potential × effect only, so the product is
+        // all a transform keeps: shown as the potential, at full effect.
+        (RelKind::KilledBy, Transform::Regional(map)) => map
+            .get(&nrs_core::AnchorId("comedy".into()))
+            .map(|comedy| {
+                let product = (comedy / (0.2 * 0.4) * 10_000.0).round() / 10_000.0;
+                json!({ "potential": product.to_string(), "effect": "1" })
+            }),
+        _ => None,
+    }
+}
+
+/// A credit's transform from its roles expression, plus the work's other
+/// credits that change with it. The work's music variables aren't stored,
+/// so they're recovered from its existing credits; featuring follows the
+/// roles (an `image_feat` role anywhere on the work), unless the work had
+/// it pinned. `replacing` is the credit being edited, if any.
+#[allow(clippy::type_complexity)]
+fn credit_writes(
+    store: &nrs_store::Store,
+    replacing: Option<&str>,
+    work: &EntryId,
+    roles: &str,
+) -> Result<(Transform, Vec<(nrs_store::EntryRelation, Transform)>), (StatusCode, Json<ApiError>)> {
+    use nrs_import::roles;
+    let terms = roles::parse_credit_roles(roles).map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    let siblings: Vec<nrs_store::EntryRelation> = store
+        .relations_for_entry(work)
+        .map_err(|error| store_error("load credits", error))?
+        .into_iter()
+        .filter(|r| r.kind == RelKind::Credit && &r.to == work && Some(r.id.as_str()) != replacing)
+        .collect();
+    let mut stored: Vec<(String, Transform)> = Vec::new();
+    let mut others = Vec::new();
+    for sibling in &siblings {
+        let roles = relation_params(sibling.kind, &sibling.transform, sibling.dah_params.as_deref())
+            .and_then(|p| p["roles"].as_str().map(String::from))
+            .ok_or_else(|| api_error(StatusCode::CONFLICT, "another credit on this work has no roles expression"))?;
+        stored.push((roles.clone(), sibling.transform.clone()));
+        others.push((sibling, roles));
+    }
+    if let Some(id) = replacing {
+        if let Some(old) = store
+            .relations_for_entry(work)
+            .map_err(|error| store_error("load credits", error))?
+            .into_iter()
+            .find(|r| r.id == id && &r.to == work)
+        {
+            if let Some(roles) = relation_params(old.kind, &old.transform, old.dah_params.as_deref())
+                .and_then(|p| p["roles"].as_str().map(String::from))
+            {
+                stored.push((roles, old.transform));
+            }
+        }
+    }
+    let vars = if stored.is_empty() {
+        roles::MusicVars::default()
+    } else {
+        roles::infer_music_vars(&stored).ok_or_else(|| {
+            api_error(StatusCode::CONFLICT, "couldn't recover this work's music variables from its credits")
+        })?
+    };
+    let mentions = |roles: &str| {
+        roles::parse_credit_roles(roles).is_ok_and(|t| roles::mentions_image_feat(&t))
+    };
+    let pinned = vars.feat && !stored.iter().any(|(r, _)| mentions(r));
+    let feat = pinned
+        || roles::mentions_image_feat(&terms)
+        || others.iter().any(|(_, r)| mentions(r));
+    let vars = roles::MusicVars { feat, ..vars };
+    let transform = roles::vector_to_transform(roles::weight_vector(&terms, &vars));
+    let mut updates = Vec::new();
+    for (sibling, roles) in others {
+        let next = roles::credit_transform(&roles, &vars).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
+        if next != sibling.transform {
+            updates.push((sibling.clone(), next));
+        }
+    }
+    Ok((transform, updates))
+}
+
+/// Writes a credit (new when `id` is `None`) and refreshes the work's
+/// other credits when featuring flips.
+fn write_credit(
+    store: &mut nrs_store::Store,
+    id: Option<&str>,
+    fields: &HashMap<String, String>,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    let from = EntryId(fields.get("from_entry").cloned().unwrap_or_default());
+    let to = EntryId(fields.get("to_entry").cloned().unwrap_or_default());
+    let roles = fields.get("roles").map(|r| r.trim().to_string()).unwrap_or_default();
+    let (transform, updates) = credit_writes(store, id, &to, &roles)?;
+    let id = match id {
+        Some(id) => {
+            store
+                .edit_relation(id, RelKind::Credit, &from, &to, &transform)
+                .map_err(|error| store_error("edit credit", error))?;
+            id.to_string()
+        }
+        None => store
+            .add_relation(RelKind::Credit, &from, &to, &transform)
+            .map_err(|error| store_error("add credit", error))?,
+    };
+    store
+        .set_relation_dah(&id, &json!({ "roles": roles }).to_string())
+        .map_err(|error| store_error("save credit roles", error))?;
+    for (sibling, transform) in updates {
+        store
+            .edit_relation(&sibling.id, sibling.kind, &sibling.from, &sibling.to, &transform)
+            .map_err(|error| store_error("refresh credit", error))?;
+    }
+    Ok(id)
+}
+
+fn check_relation_ends(
+    fields: &HashMap<String, String>,
+    entry_id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let end = |name: &str| fields.get(name).map(|v| v.trim()).unwrap_or("");
+    if end("from_entry").is_empty() || end("to_entry").is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "from_entry and to_entry are required"));
+    }
+    if end("from_entry") != entry_id && end("to_entry") != entry_id {
+        return Err(api_error(StatusCode::BAD_REQUEST, "relation must touch this entry"));
+    }
+    Ok(())
 }
 
 fn relation_from_fields(
@@ -1611,6 +2011,17 @@ pub(super) async fn relation_add(
     Path(entry_id): Path<String>,
     Json(fields): Json<HashMap<String, String>>,
 ) -> ApiResult<MutationResponse> {
+    if fields.get("kind").map(String::as_str) == Some("credit") {
+        let store = state.store.as_ref().ok_or_else(|| {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "relation writes require database mode")
+        })?;
+        let mut store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        check_relation_ends(&fields, &entry_id)?;
+        let id = write_credit(&mut store, None, &fields)?;
+        return Ok(Json(MutationResponse { ok: true, id: Some(id) }));
+    }
     let relation = relation_from_fields(&fields)?;
     if relation.from.0 != entry_id && relation.to.0 != entry_id {
         return Err(api_error(
@@ -1650,7 +2061,6 @@ pub(super) async fn relation_edit(
     Path((entry_id, relation_id)): Path<(String, String)>,
     Json(fields): Json<HashMap<String, String>>,
 ) -> ApiResult<MutationResponse> {
-    let relation = relation_from_fields(&fields)?;
     let store = state.store.as_ref().ok_or_else(|| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1661,12 +2071,18 @@ pub(super) async fn relation_edit(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
     let existing = scoped_relation(&store, &entry_id, &relation_id)?;
-    if existing.dah_params.is_none() || existing.kind == RelKind::Credit {
+    if relation_params(existing.kind, &existing.transform, existing.dah_params.as_deref()).is_none() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "this imported relation has no editable standards parameters",
         ));
     }
+    if fields.get("kind").map(String::as_str) == Some("credit") {
+        check_relation_ends(&fields, &entry_id)?;
+        let id = write_credit(&mut store, Some(&relation_id), &fields)?;
+        return Ok(Json(MutationResponse { ok: true, id: Some(id) }));
+    }
+    let relation = relation_from_fields(&fields)?;
     if relation.from.0 != entry_id && relation.to.0 != entry_id {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1744,6 +2160,8 @@ mod tests {
                 snapshot,
                 store: Some(std::sync::Mutex::new(crate::TrackedStore::new(store))),
                 anime_store: nrs_entry_store::HttpEntryStore::new("http://127.0.0.1:3738").unwrap(),
+                musiclib_db: None,
+                anime_store_url: None,
                 scores_cache: Default::default(),
                 kind_hints: Default::default(),
             }),
@@ -1917,7 +2335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imported_relations_cannot_be_rebuilt_with_default_weights() {
+    async fn imported_relations_edit_from_their_transform_not_defaults() {
         let (state, a, b, _) = test_state();
         let id = state
             .store
@@ -1932,23 +2350,42 @@ mod tests {
                 &Transform::Scalar(0.37),
             )
             .unwrap();
-        let result = relation_edit(
+        // The form starts from the stored weight, not the default 1.
+        assert_eq!(
+            relation_params(RelKind::Contains, &Transform::Scalar(0.37), None),
+            Some(json!({ "factor": "0.37" }))
+        );
+        relation_edit(
             State(state.clone()),
             Path((a.clone(), id)),
             Json(HashMap::from([
                 ("kind".into(), "contains".into()),
                 ("from_entry".into(), a.clone()),
                 ("to_entry".into(), b),
-                ("factor".into(), "1".into()),
+                ("factor".into(), "0.5".into()),
             ])),
         )
-        .await;
-        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        .await
+        .unwrap_or_else(|(_, error)| panic!("{}", error.0.error));
         let store = state.store.as_ref().unwrap().lock().unwrap();
         assert_eq!(
             store.relations_for_entry(&EntryId(a)).unwrap()[0].transform,
-            Transform::Scalar(0.37)
+            Transform::Scalar(0.5)
         );
+    }
+
+    #[test]
+    fn killed_by_params_rebuild_the_same_transform() {
+        let original = nrs_import::killed_by(EntryId("a".into()), EntryId("b".into()), 0.5, 0.4);
+        let params = relation_params(RelKind::KilledBy, &original.transform, None).unwrap();
+        let fields: HashMap<String, String> = params
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+        let rebuilt = build_relation("killed_by", EntryId("a".into()), EntryId("b".into()), &fields).unwrap();
+        assert_eq!(rebuilt.transform, original.transform);
     }
 
     #[test]

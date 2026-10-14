@@ -39,6 +39,29 @@ pub struct ImportExtras {
     /// nrs-app's kind-based editor works on bulk-imported impacts too,
     /// not only ones created through it.
     pub impact_dah: BTreeMap<ImpactId, (String, BTreeMap<String, String>, f32)>,
+    /// Snapshot impacts that are one contributor's share of a shared
+    /// impact: impact id -> (shared key, share). All impacts with one key
+    /// came from one XML element and are stored as one shared impact.
+    pub impact_share: BTreeMap<ImpactId, (String, f32)>,
+    /// Shared key -> the unscaled base atoms, exactly as the importer
+    /// computed them before splitting, so expansion reproduces the
+    /// snapshot's per-contributor values bit for bit.
+    pub shared_base: BTreeMap<String, Vec<nrs_core::Atom>>,
+}
+
+/// Where a shared impact lives when it isn't scored directly: the entry
+/// that declared it (its atoms' source) if that is an entry, else its
+/// first member.
+pub(crate) fn shared_home(
+    base: &[nrs_core::Atom],
+    first_member: &EntryId,
+    known: &BTreeSet<String>,
+) -> EntryId {
+    base.first()
+        .map(|atom| atom.source.0.clone())
+        .filter(|source| known.contains(source))
+        .map(EntryId)
+        .unwrap_or_else(|| first_member.clone())
 }
 
 fn now_ts() -> i64 {
@@ -117,8 +140,69 @@ impl Store {
             )?;
         }
 
+        let known: BTreeSet<String> = snap.entries.iter().map(|e| e.id.0.clone()).collect();
+        let mut shared_written: BTreeSet<&str> = BTreeSet::new();
         let mut review_states = Vec::with_capacity(snap.impacts.len());
         for impact in &snap.impacts {
+            // A contributor's share of a shared impact: write the shared
+            // impact once (keyed by its first member's id), then the member.
+            let share = extras.impact_share.get(&impact.id);
+            if let Some((key, factor)) = share {
+                if shared_written.insert(key.as_str()) {
+                    let base = extras.shared_base.get(key).ok_or_else(|| {
+                        crate::error::StoreError::InvalidData(format!(
+                            "no base atoms for shared impact {key}"
+                        ))
+                    })?;
+                    let (dah_kind, dah_params) = match extras.impact_dah.get(&impact.id) {
+                        Some((kind, params, _)) => {
+                            (Some(kind.as_str()), Some(serde_json::to_string(params)?))
+                        }
+                        None => (None, None),
+                    };
+                    tx.execute(
+                        "INSERT INTO impact (id, target, note, created, dah_kind, dah_params, dah_factor) \
+                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                        params![
+                            key,
+                            shared_home(base, &impact.target, &known).0,
+                            now_ts(),
+                            dah_kind,
+                            dah_params,
+                            dah_kind.map(|_| 1.0f32)
+                        ],
+                    )?;
+                    for atom in base {
+                        tx.execute(
+                            "INSERT INTO impact_atom (impact, source, blend, magnitude, time) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                key,
+                                atom.source.0,
+                                serde_json::to_string(&atom.blend)?,
+                                atom.magnitude,
+                                serde_json::to_string(&atom.time)?
+                            ],
+                        )?;
+                    }
+                    let source_comment = extras.comments.get(&impact.id).cloned();
+                    let needs_review = extras.needs_review.contains(&impact.id);
+                    if source_comment.is_some() || needs_review {
+                        review_states.push((
+                            key.clone(),
+                            ReviewState {
+                                source_comment,
+                                needs_review,
+                            },
+                        ));
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO impact_member (impact, contributor, factor) VALUES (?1, ?2, ?3)",
+                    params![key, impact.target.0, factor],
+                )?;
+                continue;
+            }
             let dah = extras
                 .impact_dah
                 .get(&impact.id)

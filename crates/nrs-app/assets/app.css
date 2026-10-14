@@ -605,3 +605,123 @@ input[type="range"] { accent-color: var(--brass); }
   .group-count { grid-column: 3; }
   .group-anchors { display: none; }
 }
+
+/* Shared impacts: one impact split between entries (see bindSplitEditor). */
+.share-pill { display: inline-flex; gap: .3rem; align-items: center; margin-left: .5rem; padding: .05rem .45rem; border: 1px solid var(--ink-600); border-radius: 999px; color: var(--bone-300); font-size: .68rem; font-weight: 500; letter-spacing: .02em; vertical-align: middle; }
+.share-pill .mono { color: var(--brass); }
+.split-bar { position: relative; height: .7rem; border-radius: 999px; overflow: hidden; background: repeating-linear-gradient(135deg, var(--ink-800) 0 6px, var(--ink-700) 6px 12px); }
+.split-bar.editable { height: 1.6rem; overflow: visible; border-radius: .4rem; margin: .35rem 0 .2rem; }
+.split-seg { position: absolute; top: 0; bottom: 0; opacity: .85; }
+.split-bar.editable .split-seg:first-of-type { border-radius: .4rem 0 0 .4rem; }
+.split-seg.current { opacity: 1; box-shadow: inset 0 0 0 2px var(--bone-100); }
+.split-handle { position: absolute; top: -.2rem; bottom: -.2rem; width: .9rem; margin-left: -.45rem; cursor: ew-resize; touch-action: none; z-index: 1; }
+.split-handle::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 3px; margin-left: -1.5px; border-radius: 2px; background: var(--bone-100); box-shadow: 0 0 0 1px var(--ink-950); }
+.split-handle:focus-visible::after, .split-handle:hover::after { background: var(--brass); }
+.split-readout { margin: .5rem 0; }
+.split-caption { margin: .35rem 0 0; color: var(--bone-500); font-size: .78rem; line-height: 1.6; }
+.split-swatch { display: inline-block; width: .55rem; height: .55rem; margin-right: .3rem; border-radius: 2px; vertical-align: baseline; }
+.split-legend { display: grid; gap: .3rem; margin-top: .5rem; }
+.split-row { display: grid; grid-template-columns: auto minmax(0, 1fr) 5rem; gap: .5rem; align-items: center; color: var(--bone-300); font-size: .82rem; }
+.split-row input { width: 100%; }
+.split-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.split-footer { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: space-between; align-items: center; margin-top: .5rem; color: var(--bone-500); font-size: .78rem; }
+.split-tools { display: flex; gap: .4rem; }
+.card-split { margin: .7rem 0 .2rem; padding: .6rem .7rem; border: 1px solid var(--ink-700); border-radius: .5rem; background: var(--ink-900); }
+.card-split .split-editor { margin: 0; }
+.split-save { display: flex; justify-content: flex-end; gap: .4rem; margin-top: .5rem; }
+
+/* Split tree editor (bindSplitTree). */
+.link-button { padding: 0; border: 0; background: none; color: var(--brass); font: inherit; cursor: pointer; text-align: left; }
+.link-button:hover { text-decoration: underline; }
+.split-crumbs { margin-bottom: .45rem; font-size: .8rem; }
+.split-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; color: var(--bone-300); font-size: .8rem; }
+.split-head select, .split-head input { margin-left: .3rem; }
+.split-worth { margin-left: auto; }
+.split-seg.group { background-image: repeating-linear-gradient(90deg, transparent 0 7px, rgba(20, 22, 26, .35) 7px 8px); }
+.split-filter { width: 100%; margin-top: .4rem; }
+.split-row.tree { grid-template-columns: auto auto minmax(0, 1fr) 5.5rem 4.2rem auto; }
+.split-row.tree .button { padding: .15rem .5rem; }
+.split-eff { text-align: right; font-size: .72rem; }
+.split-equal { font-size: .72rem; text-align: center; }
+.split-tools { flex-wrap: wrap; align-items: flex-start; margin-top: .6rem; }
+.split-add { position: relative; display: inline-flex; flex-direction: column; min-width: 14rem; }
+.split-results { display: flex; flex-direction: column; gap: .15rem; margin-top: .2rem; }
+.split-result { padding: .25rem .4rem; border: 1px solid var(--ink-600); border-radius: .3rem; background: var(--ink-850); color: var(--bone-300); text-align: left; cursor: pointer; font-size: .78rem; }
+.split-result:hover { border-color: var(--brass); }
+
+/* Emotion split (blendFields): anchors as segments summing to 1. */
+.emotion-split .split-seg { display: flex; align-items: center; justify-content: center; overflow: hidden; color: var(--ink-950); font: 600 .68rem Archivo, sans-serif; white-space: nowrap; }
+.split-row.emotion { grid-template-columns: auto minmax(0, 1fr) 5rem auto; }
+.split-row.emotion .button { padding: .15rem .5rem; }
+
+/* Compact impact form: label left, control right; short sliders. */
+.impact-form { display: grid; gap: .5rem; }
+.impact-form .form-field { grid-template-columns: 5.5rem minmax(0, 1fr); align-items: center; column-gap: .75rem; row-gap: .2rem; font-size: .76rem; }
+.impact-form .form-field > small, .impact-form .form-field > .expression-row { grid-column: 2; }
+.impact-form .form-field input:not([type="range"]):not([type="checkbox"]), .impact-form .form-field select, .impact-form .form-field textarea { padding: .3rem .5rem; font-size: .8rem; }
+.impact-form .form-field select { width: auto; max-width: 100%; }
+.impact-form .form-field input[type="number"], .impact-form .form-field input[type="text"] { max-width: 9rem; }
+.impact-form > .form-field:has(textarea) { align-items: start; }
+.impact-form > .form-field:has(textarea) > span { padding-top: .35rem; }
+.impact-form .form-grid { grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .5rem 1.5rem; }
+.impact-form .form-field.full { grid-column: 1 / -1; }
+.impact-form .range-control { grid-template-columns: minmax(5rem, 9rem) 2.4rem; gap: .5rem; justify-content: start; }
+.impact-form .range-control output { text-align: left; }
+.impact-form .range-bounds { display: none; }
+.impact-form .date-range { max-width: 20rem; }
+.impact-form .expression-row { justify-content: flex-start; gap: .25rem 1rem; font-size: .7rem; }
+.details-body .detail-actions { margin-top: .35rem; gap: 1rem; }
+.details-body .detail-actions .link-button { font-size: .74rem; }
+.details-body .editor-actions { margin-top: .8rem; padding-top: .6rem; }
+.details-body .editor-actions .button { padding: .3rem .75rem; }
+
+/* Compact emotion split. */
+.emotion-split .emo-body { display: grid; gap: .3rem; min-width: 0; }
+.emotion-split .split-bar.editable { height: 1rem; margin: 0; border-radius: .25rem; max-width: 26rem; }
+.emotion-split .split-bar.editable .split-seg:first-of-type { border-radius: .25rem 0 0 .25rem; }
+.emotion-split .split-seg { font-size: .6rem; }
+.emotion-split .split-handle { top: -.15rem; bottom: -.15rem; }
+.emo-rows { display: flex; flex-wrap: wrap; gap: .3rem .5rem; align-items: center; }
+.emo-chips { display: contents; }
+.emo-chip { display: inline-flex; align-items: center; gap: .3rem; padding: .1rem .15rem .1rem .4rem; border: 1px solid var(--ink-600); border-radius: .3rem; color: var(--bone-300); font-size: .74rem; }
+.emo-chip .split-swatch { margin: 0; }
+.impact-form .emo-chip input[type="number"] { width: 3.6rem; padding: .1rem .3rem; font-size: .74rem; }
+.chip-x { border: 0; background: none; color: var(--bone-500); cursor: pointer; padding: 0 .2rem; font-size: .9rem; line-height: 1; }
+.chip-x:hover { color: var(--oxblood); }
+.impact-form .emo-rows select { padding: .15rem .35rem; font-size: .74rem; }
+.impact-form .form-field > select, .impact-form .form-field > input, .impact-form .range-control, .impact-form .date-range { justify-self: start; }
+.impact-form .form-field > textarea { justify-self: stretch; }
+.details-body .editor-actions .danger-button { font-size: .78rem; padding: 0; }
+
+/* Compact split tree editor. */
+.split-save[hidden], [data-split-total]:empty { display: none; }
+.card-split { margin: .35rem 0 .6rem; padding: .45rem .6rem; }
+.card-split .split-head { font-size: .74rem; }
+.card-split .split-head select, .card-split .split-head input { padding: .12rem .3rem; font-size: .74rem; border: 1px solid var(--ink-600); border-radius: .25rem; background: var(--ink-950); color: var(--bone-100); }
+.card-split .split-bar.editable { height: 1rem; margin: .35rem 0 .25rem; border-radius: .25rem; }
+.card-split .split-bar.editable .split-seg:first-of-type { border-radius: .25rem 0 0 .25rem; }
+.card-split .split-handle { top: -.15rem; bottom: -.15rem; }
+.card-split .split-legend { gap: .1rem; margin-top: .3rem; }
+.card-split .split-row.tree { grid-template-columns: auto auto minmax(0, 1fr) 4.5rem 3.6rem auto; gap: .45rem; font-size: .76rem; }
+.card-split .split-row input[type="number"] { width: 100%; padding: .1rem .3rem; font-size: .74rem; border: 1px solid var(--ink-600); border-radius: .25rem; background: var(--ink-950); color: var(--bone-100); }
+.card-split .split-tools { gap: .3rem .9rem; align-items: center; margin-top: .4rem; font-size: .74rem; }
+.card-split .split-add input { padding: .15rem .4rem; font-size: .74rem; border: 1px solid var(--ink-600); border-radius: .25rem; background: var(--ink-950); color: var(--bone-100); }
+.card-split .split-add { min-width: 12rem; }
+.card-split .split-footer { margin-top: .35rem; font-size: .72rem; }
+.card-split .split-save { align-items: center; gap: .8rem; }
+.card-split .split-save .button { padding: .25rem .65rem; }
+.card-split .split-filter { padding: .15rem .4rem; font-size: .74rem; }
+.link-button:disabled { color: var(--bone-700); cursor: default; text-decoration: none; }
+
+/* Store-supplied progress defaults. */
+.impact-form .store-hint { grid-column: 2; color: var(--bone-700); font-size: .72rem; }
+.impact-form .store-hint .link-button { font-size: inherit; margin-left: .3rem; }
+
+#impact-kind-fields:empty { display: none; }
+
+/* Entry picker (relation from/to). */
+.entry-picker-body { display: flex; flex-direction: column; gap: .2rem; min-width: 0; }
+.entry-picker-body [data-entry-id]:empty { display: none; }
+.entry-picker-results { display: flex; flex-direction: column; gap: .15rem; }
+.entry-picker-results:empty { display: none; }
+.entry-picker-results .split-result .dim { margin-left: .3rem; font-size: .7rem; }

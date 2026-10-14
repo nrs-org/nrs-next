@@ -10,9 +10,9 @@ use nrs_core::{
 };
 
 use crate::error::Result;
-use crate::{StoredParams, DEFAULT_MEDIUM};
 use crate::relkind::rel_kind_from_str;
 use crate::Store;
+use crate::{StoredParams, DEFAULT_MEDIUM};
 
 impl Store {
     /// Loads the whole scoring substrate.
@@ -94,15 +94,21 @@ impl Store {
             let target: String = row.get(1)?;
             Ok((id, target))
         })?;
+        // A shared impact scores as one copy per member (base x share).
+        let mut members = crate::shared::load_all_members(&self.conn)?;
         let mut impacts = Vec::new();
         for row in rows {
             let (id, target) = row?;
             let atoms = atoms_by_impact.remove(&id).unwrap_or_default();
-            impacts.push(Impact {
+            let impact = Impact {
                 id: ImpactId(id),
                 target: EntryId(target),
                 atoms,
-            });
+            };
+            match members.remove(&impact.id.0) {
+                Some(members) => impacts.extend(crate::shared::expand(&impact, &members)),
+                None => impacts.push(impact),
+            }
         }
         Ok(impacts)
     }

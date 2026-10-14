@@ -3,7 +3,12 @@
 //! since (see `nrs_store::Store::plan_resync`). Dry run by default.
 //!
 //! Usage: `cargo run -p nrs-import --features scripting --bin resync --
-//! <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose]`
+//! <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose]
+//! [--musiclib-db PATH] [--anime-store URL]`
+//!
+//! Stripped XML (`<bind url>` entries) gets its titles and store-asserted
+//! containment from the stores; `--musiclib-db`/`--anime-store` default to
+//! `NRS_MUSICLIB_DB`/`NRS_ANIME_STORE_URL`.
 //!
 //! `--today` defaults to the database's last `snapshot.import` date, so
 //! date-dependent impacts (memes, waifus, PADS running "to today") are
@@ -27,18 +32,39 @@ struct Args {
     today: Option<time::Date>,
     apply: bool,
     verbose: bool,
+    musiclib_db: Option<PathBuf>,
+    anime_store: Option<String>,
 }
 
 fn parse_args() -> Args {
     let usage =
-        "usage: resync <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose]";
+        "usage: resync <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose] \
+         [--musiclib-db PATH] [--anime-store URL]";
     let mut positional = Vec::new();
     let (mut today, mut apply, mut verbose) = (None, false, false);
+    let mut musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(PathBuf::from);
+    let mut anime_store = std::env::var("NRS_ANIME_STORE_URL").ok();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--apply" => apply = true,
             "--verbose" => verbose = true,
+            "--musiclib-db" => {
+                musiclib_db = Some(
+                    args.next()
+                        .unwrap_or_else(|| {
+                            eprintln!("{usage}");
+                            exit(1)
+                        })
+                        .into(),
+                )
+            }
+            "--anime-store" => {
+                anime_store = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("{usage}");
+                    exit(1)
+                }))
+            }
             "--today" => {
                 let value = args.next().unwrap_or_else(|| {
                     eprintln!("{usage}");
@@ -63,6 +89,8 @@ fn parse_args() -> Args {
         today,
         apply,
         verbose,
+        musiclib_db,
+        anime_store,
     }
 }
 
@@ -86,7 +114,12 @@ fn main() {
             .unwrap_or_else(|| fail("no snapshot.import event; pass --today", "")),
     };
     eprintln!("parsing {} as of {today}", args.xml.display());
-    let doc = nrs_import::parse_file(&args.xml, today).unwrap_or_else(|e| fail("parse error", e));
+    let mut doc =
+        nrs_import::parse_file(&args.xml, today).unwrap_or_else(|e| fail("parse error", e));
+    let sources = nrs_import::StoreSources::from_env(&args.musiclib_db, &args.anime_store);
+    let store_warnings =
+        nrs_import::resolve_binds(&mut doc, &sources).unwrap_or_else(|e| fail("store lookup", e));
+    doc.warnings.extend(store_warnings);
     let (snapshot, extras, conversion_warnings) = nrs_import::build_snapshot(&doc);
     let warnings = doc.warnings.len() + conversion_warnings.len();
     if args.verbose {
@@ -165,6 +198,28 @@ fn report(plan: &ResyncPlan, snapshot: &Snapshot, extras: &nrs_store::ImportExtr
     for entry in &plan.entries_to_add {
         println!("  + {}", name(&entry.id));
     }
+    println!("entries to retitle: {}", plan.entries_to_retitle.len());
+    for retitle in plan.entries_to_retitle.iter().take(20) {
+        println!(
+            "  ~ {}: {:?} -> {:?}",
+            retitle.id.0,
+            retitle.before.as_deref().unwrap_or(""),
+            retitle.after
+        );
+    }
+    if plan.entries_to_retitle.len() > 20 {
+        println!("  ... and {} more", plan.entries_to_retitle.len() - 20);
+    }
+    println!("entries to rebind: {}", plan.entries_to_rebind.len());
+    for rebind in plan.entries_to_rebind.iter().take(5) {
+        println!(
+            "  ~ {}: {}:{} -> {}:{}",
+            rebind.id.0, rebind.before.0, rebind.before.1, rebind.after.0, rebind.after.1
+        );
+    }
+    if plan.entries_to_rebind.len() > 5 {
+        println!("  ... and {} more", plan.entries_to_rebind.len() - 5);
+    }
 
     let mut by_kind: BTreeMap<String, (usize, f32)> = BTreeMap::new();
     let mut by_target: BTreeMap<&EntryId, f32> = BTreeMap::new();
@@ -197,6 +252,20 @@ fn report(plan: &ResyncPlan, snapshot: &Snapshot, extras: &nrs_store::ImportExtr
     for impact in &plan.impacts_kept {
         println!("  = {} on {}", impact.id.0, name(&impact.target));
     }
+    let (mut created, mut folded, mut extended) = (0, 0, 0);
+    let mut folded_rows = 0;
+    for change in &plan.shared_changes {
+        match change.base {
+            nrs_store::SharedBase::New => created += 1,
+            nrs_store::SharedBase::Fold(_) => folded += 1,
+            nrs_store::SharedBase::Existing(_) => extended += 1,
+        }
+        folded_rows += change.fold.len();
+    }
+    println!(
+        "shared impacts: {created} new, {folded} folded from {folded_rows} per-contributor rows, \
+         {extended} gaining members"
+    );
 
     println!("relations to add: {}", plan.relations_to_add.len());
     if verbose {
