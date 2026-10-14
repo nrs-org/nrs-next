@@ -1,4 +1,4 @@
-//! Blocking client for the NRS Store Protocol v0.3.
+//! Blocking client for the NRS Store Protocol v0.4.
 //!
 //! NRS persists only the opaque `(store, store_id)` returned by a type
 //! store. Provider identifiers, aliases, metadata aggregation, and
@@ -104,6 +104,34 @@ pub struct RelationSuggestion {
     pub evidence: String,
 }
 
+/// A provider record `discover` found (spec §5c), ingested or not.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Candidate {
+    /// What `ingest` takes to get this record's entry.
+    pub query: String,
+    /// The store's entry for it, when the store has one.
+    pub store_id: Option<String>,
+    pub title: String,
+    pub kind: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub canonical_url: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+}
+
+/// One page of `discover` results.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DiscoverPage {
+    pub candidates: Vec<Candidate>,
+    pub next_page: Option<u32>,
+}
+
 /// Which end of a suggested relation the queried entry is.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -206,6 +234,7 @@ impl HttpEntryStore {
             "resolve" => capabilities.operations.resolve,
             "lookup" => capabilities.operations.lookup,
             "search" => capabilities.operations.search,
+            "discover" => capabilities.operations.discover,
             "ingest" => capabilities.operations.ingest,
             "suggest_relations" => capabilities.operations.suggest_relations,
             _ => false,
@@ -245,6 +274,31 @@ impl HttpEntryStore {
                 .timeout(REQUEST_TIMEOUT)
                 .send_json(body),
         )
+    }
+}
+
+impl HttpEntryStore {
+    /// Provider records matching one filter (`q`, or one the store lists
+    /// in `Capabilities::discover`), 1-based `page` (0.4).
+    pub fn discover(
+        &self,
+        filter: (&str, &str),
+        kind: Option<&str>,
+        limit: usize,
+        page: u32,
+    ) -> Result<DiscoverPage> {
+        self.ensure_operation("discover")?;
+        let mut url = self.endpoint(&["nrs-store", "v1", "discover"])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair(filter.0, filter.1);
+            if let Some(kind) = kind {
+                pairs.append_pair("kind", kind);
+            }
+            pairs.append_pair("limit", &limit.to_string());
+            pairs.append_pair("page", &page.to_string());
+        }
+        self.get_url(url)
     }
 }
 
@@ -351,7 +405,16 @@ pub struct Capabilities {
     pub store: String,
     pub protocol_version: String,
     pub operations: Operations,
+    /// Present when `operations.discover` is (0.4).
+    #[serde(default)]
+    pub discover: Option<DiscoverCapabilities>,
     pub jobs: JobCapabilities,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoverCapabilities {
+    /// The filters `discover` takes, e.g. `["q", "season"]`.
+    pub filters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +426,9 @@ pub struct Operations {
     /// Added in 0.3.
     #[serde(default)]
     pub search: bool,
+    /// Added in 0.4.
+    #[serde(default)]
+    pub discover: bool,
     pub ingest: bool,
     pub suggest_relations: bool,
 }
@@ -572,6 +638,29 @@ mod tests {
         assert_eq!(suggestions[0].target.as_ref().unwrap().title, "Album");
         assert_eq!(suggestions[1].direction, Direction::Outgoing);
         assert_eq!(suggestions[1].target, None);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn discovers_a_season_page() {
+        let capabilities = r#"{"store":"anime","protocol_version":"0.4","operations":{"resolve":true,"discover":true,"ingest":true,"suggest_relations":false},"discover":{"filters":["q","season"]},"jobs":{"streaming":false}}"#;
+        let responses = [
+            MockResponse::ok("GET /nrs-store/v1/capabilities HTTP/1.1", capabilities),
+            MockResponse::ok(
+                "GET /nrs-store/v1/discover?season=2026-fall&limit=50&page=2 HTTP/1.1",
+                r#"{"candidates":[{"query":"https://myanimelist.net/anime/5","store_id":null,"title":"New Show","kind":"anime","urls":["https://myanimelist.net/anime/5"]}],"next_page":null}"#,
+            ),
+        ];
+        let (base_url, server) = mock_server(responses);
+        let client = HttpEntryStore::new(&base_url).unwrap();
+
+        let page = client
+            .discover(("season", "2026-fall"), None, 50, 2)
+            .unwrap();
+        assert_eq!(page.next_page, None);
+        assert_eq!(page.candidates[0].query, "https://myanimelist.net/anime/5");
+        assert_eq!(page.candidates[0].store_id, None);
 
         server.join().unwrap();
     }
