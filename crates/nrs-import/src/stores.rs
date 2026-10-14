@@ -22,7 +22,7 @@
 //! musiclib entry), the parent doesn't `<unlink>` it, and the XML doesn't
 //! already declare it.
 
-use nrs_entry_store::{EntryStore, HttpEntryStore};
+use nrs_entry_store::{Directions, EntryStore, HttpEntryStore};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -313,7 +313,10 @@ fn load_music(base_url: &str, urls: &BTreeSet<&str>, facts: &mut StoreFacts) -> 
 
     let bound: HashSet<&str> = facts.music_entry.values().map(String::as_str).collect();
     for parent in releases {
-        for suggestion in store.suggest_relations(&parent).map_err(err)? {
+        for suggestion in store
+            .suggest_relations(&parent, Directions::Outgoing)
+            .map_err(err)?
+        {
             if suggestion.kind == "contains" && bound.contains(suggestion.target_store_id.as_str())
             {
                 facts

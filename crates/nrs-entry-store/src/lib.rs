@@ -1,4 +1,4 @@
-//! Blocking client for the NRS Store Protocol v0.2.
+//! Blocking client for the NRS Store Protocol v0.3.
 //!
 //! NRS persists only the opaque `(store, store_id)` returned by a type
 //! store. Provider identifiers, aliases, metadata aggregation, and
@@ -49,8 +49,36 @@ pub struct EntryMeta {
     pub kind: String,
     pub cover_url: Option<String>,
     pub release_date: Option<String>,
+    /// Added in 0.3, like `canonical_url` and `urls` (see `EntrySummary`).
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub canonical_url: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
     #[serde(default)]
     pub extra: Value,
+}
+
+/// An entry as `search` and suggestion targets describe it: `resolve`'s
+/// fields without `extra` (spec §5).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EntrySummary {
+    pub store_id: String,
+    pub title: String,
+    pub kind: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    /// The URL to bind the entry by.
+    #[serde(default)]
+    pub canonical_url: Option<String>,
+    /// Every URL the store knows the entry by, `canonical_url` included.
+    #[serde(default)]
+    pub urls: Vec<String>,
 }
 
 /// A `lookup` match: the store ID a query already belongs to, plus
@@ -65,9 +93,33 @@ pub struct LookupMatch {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RelationSuggestion {
     pub kind: String,
+    /// Absent from pre-0.3 stores, which only suggest outgoing relations.
+    #[serde(default)]
+    pub direction: Direction,
     pub target_store_id: String,
+    /// The target's summary, when the store sends one (0.3).
+    #[serde(default)]
+    pub target: Option<EntrySummary>,
     pub confidence: f32,
     pub evidence: String,
+}
+
+/// Which end of a suggested relation the queried entry is.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// The queried entry is the source (an album `contains` the target).
+    #[default]
+    Outgoing,
+    /// The target is the source (the target album `contains` this track).
+    Incoming,
+}
+
+/// The suggestions to ask `suggest_relations` for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Directions {
+    Outgoing,
+    Both,
 }
 
 /// The language-independent boundary from `INFRA.md` §7.
@@ -76,8 +128,14 @@ pub trait EntryStore {
     /// The entry `query` already belongs to, without fetching; `None` when
     /// the store knows no such entry.
     fn lookup(&self, query: &str) -> Result<Option<LookupMatch>>;
+    /// Entries the store already has matching `query`, best first (0.3).
+    fn search(&self, query: &str, kind: Option<&str>, limit: usize) -> Result<Vec<EntrySummary>>;
     fn ingest(&self, query: &str) -> Result<String>;
-    fn suggest_relations(&self, store_id: &str) -> Result<Vec<RelationSuggestion>>;
+    fn suggest_relations(
+        &self,
+        store_id: &str,
+        directions: Directions,
+    ) -> Result<Vec<RelationSuggestion>>;
 }
 
 #[derive(Clone)]
@@ -147,6 +205,7 @@ impl HttpEntryStore {
         let supported = match operation {
             "resolve" => capabilities.operations.resolve,
             "lookup" => capabilities.operations.lookup,
+            "search" => capabilities.operations.search,
             "ingest" => capabilities.operations.ingest,
             "suggest_relations" => capabilities.operations.suggest_relations,
             _ => false,
@@ -206,6 +265,21 @@ impl EntryStore for HttpEntryStore {
         }
     }
 
+    fn search(&self, query: &str, kind: Option<&str>, limit: usize) -> Result<Vec<EntrySummary>> {
+        self.ensure_operation("search")?;
+        let mut url = self.endpoint(&["nrs-store", "v1", "search"])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", query);
+            if let Some(kind) = kind {
+                pairs.append_pair("kind", kind);
+            }
+            pairs.append_pair("limit", &limit.to_string());
+        }
+        let response: SearchResults = self.get_url(url)?;
+        Ok(response.results)
+    }
+
     fn ingest(&self, query: &str) -> Result<String> {
         self.ensure_operation("ingest")?;
         let created: JobCreated =
@@ -251,15 +325,23 @@ impl EntryStore for HttpEntryStore {
         }
     }
 
-    fn suggest_relations(&self, store_id: &str) -> Result<Vec<RelationSuggestion>> {
+    fn suggest_relations(
+        &self,
+        store_id: &str,
+        directions: Directions,
+    ) -> Result<Vec<RelationSuggestion>> {
         self.ensure_operation("suggest_relations")?;
-        let response: Suggestions = self.get(&[
+        let mut url = self.endpoint(&[
             "nrs-store",
             "v1",
             "entries",
             store_id,
             "suggested-relations",
         ])?;
+        if directions == Directions::Both {
+            url.query_pairs_mut().append_pair("directions", "both");
+        }
+        let response: Suggestions = self.get_url(url)?;
         Ok(response.suggestions)
     }
 }
@@ -278,6 +360,9 @@ pub struct Operations {
     /// Added in 0.2; absent from older stores.
     #[serde(default)]
     pub lookup: bool,
+    /// Added in 0.3.
+    #[serde(default)]
+    pub search: bool,
     pub ingest: bool,
     pub suggest_relations: bool,
 }
@@ -310,6 +395,11 @@ struct Job {
 #[derive(Deserialize)]
 struct IngestResult {
     store_id: String,
+}
+
+#[derive(Deserialize)]
+struct SearchResults {
+    results: Vec<EntrySummary>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +542,36 @@ mod tests {
             client.lookup("x"),
             Err(Error::Unsupported("lookup"))
         ));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn searches_then_suggests_both_directions() {
+        let capabilities = r#"{"store":"musiclib","protocol_version":"0.3","operations":{"resolve":true,"lookup":true,"search":true,"ingest":false,"suggest_relations":true},"jobs":{"streaming":false}}"#;
+        let responses = [
+            MockResponse::ok("GET /nrs-store/v1/capabilities HTTP/1.1", capabilities),
+            MockResponse::ok(
+                "GET /nrs-store/v1/search?q=love+me&kind=track&limit=5 HTTP/1.1",
+                r#"{"results":[{"store_id":"7","title":"Love Me","kind":"track","subtitle":"X","canonical_url":"https://e/7","urls":["https://e/7"]}]}"#,
+            ),
+            MockResponse::ok("GET /nrs-store/v1/capabilities HTTP/1.1", capabilities),
+            MockResponse::ok(
+                "GET /nrs-store/v1/entries/7/suggested-relations?directions=both HTTP/1.1",
+                r#"{"suggestions":[{"kind":"contains","direction":"incoming","target_store_id":"9","target":{"store_id":"9","title":"Album","kind":"release"},"confidence":1.0,"evidence":"tracklist track 1"},{"kind":"contains","target_store_id":"8","confidence":1.0,"evidence":"old store"}]}"#,
+            ),
+        ];
+        let (base_url, server) = mock_server(responses);
+        let client = HttpEntryStore::new(&base_url).unwrap();
+
+        let results = client.search("love me", Some("track"), 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].canonical_url.as_deref(), Some("https://e/7"));
+        let suggestions = client.suggest_relations("7", Directions::Both).unwrap();
+        assert_eq!(suggestions[0].direction, Direction::Incoming);
+        assert_eq!(suggestions[0].target.as_ref().unwrap().title, "Album");
+        assert_eq!(suggestions[1].direction, Direction::Outgoing);
+        assert_eq!(suggestions[1].target, None);
 
         server.join().unwrap();
     }
