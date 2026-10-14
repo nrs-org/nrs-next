@@ -1088,9 +1088,13 @@ function editionLabel(edition) {
   return parts.filter(Boolean).join(" · ");
 }
 
+// How the target relates to this entry, as the relation sections word it.
 function relatedPhrase(suggestion) {
-  if (suggestion.kind === "contains") return suggestion.direction === "incoming" ? "on" : "contains";
-  return suggestion.direction === "incoming" ? `${suggestion.kind} of` : suggestion.kind;
+  const incoming = suggestion.direction === "incoming";
+  if (suggestion.kind === "contains") return incoming ? "on" : "contains";
+  // Remix relations run from the source to the derived work.
+  if (suggestion.kind === "remix") return incoming ? "remix of" : "remixed into";
+  return incoming ? `${suggestion.kind} of` : suggestion.kind;
 }
 
 function relatedRow(suggestion, index) {
