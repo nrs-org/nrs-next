@@ -2418,6 +2418,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_shared_impact_from_a_member_deletes_it_for_all() {
+        let (state, a, b, id) = test_state();
+        {
+            let mut store = state.store.as_ref().unwrap().lock().unwrap();
+            let impact = ImpactId(id.clone());
+            store.make_impact_shared(&impact).unwrap();
+            let atoms = store.impacts_for_entry(&EntryId(a.clone())).unwrap()[0]
+                .atoms
+                .clone();
+            let members = [&a, &b].map(|e| nrs_store::ImpactMember {
+                contributor: EntryId(e.clone()),
+                factor: 0.5,
+            });
+            store
+                .edit_shared_impact(&impact, &atoms, &members, None)
+                .unwrap();
+        }
+        let result = impact_delete(State(state.clone()), Path((b.clone(), id))).await;
+        assert!(result.is_ok());
+        let store = state.store.as_ref().unwrap().lock().unwrap();
+        assert!(store.impacts_for_entry(&EntryId(a)).unwrap().is_empty());
+        assert!(store.impacts_for_entry(&EntryId(b)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn raw_review_edits_preserve_time_support_and_provenance() {
         let (state, a, _, id) = test_state();
         let result = impact_raw_edit(
@@ -2473,31 +2498,6 @@ mod tests {
     async fn scores_page_sorts_filters_and_compares() {
         let (state, a, b, _) = test_state();
         let page = |query: ScoresQuery| scores(State(state.clone()), Query(query));
-    #[tokio::test]
-    async fn deleting_a_shared_impact_from_a_member_deletes_it_for_all() {
-        let (state, a, b, id) = test_state();
-        {
-            let mut store = state.store.as_ref().unwrap().lock().unwrap();
-            let impact = ImpactId(id.clone());
-            store.make_impact_shared(&impact).unwrap();
-            let atoms = store.impacts_for_entry(&EntryId(a.clone())).unwrap()[0]
-                .atoms
-                .clone();
-            let members = [&a, &b].map(|e| nrs_store::ImpactMember {
-                contributor: EntryId(e.clone()),
-                factor: 0.5,
-            });
-            store
-                .edit_shared_impact(&impact, &atoms, &members, None)
-                .unwrap();
-        }
-        let result = impact_delete(State(state.clone()), Path((b.clone(), id))).await;
-        assert!(result.is_ok());
-        let store = state.store.as_ref().unwrap().lock().unwrap();
-        assert!(store.impacts_for_entry(&EntryId(a)).unwrap().is_empty());
-        assert!(store.impacts_for_entry(&EntryId(b)).unwrap().is_empty());
-    }
-
 
         let all = page(ScoresQuery::default()).await.ok().unwrap().0;
         assert_eq!((all.total, all.database_total), (2, 2));
