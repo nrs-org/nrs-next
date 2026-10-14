@@ -304,10 +304,40 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
   font-size: .68rem;
   white-space: nowrap;
 }
-.impact-card[data-category="craft"] .category-badge { color: var(--verdigris); border-color: rgba(76, 181, 162, .25); background: rgba(76, 181, 162, .08); }
-.impact-card[data-category="progress"] .category-badge { color: var(--cobalt); border-color: rgba(102, 141, 213, .25); background: rgba(102, 141, 213, .08); }
-.impact-card[data-category="response"] .category-badge, .impact-group[data-category="response"] .category-badge { color: var(--brass); border-color: rgba(209, 169, 79, .5); background: rgba(209, 169, 79, .08); }
-.impact-card[data-category="highlight"] .category-badge { color: var(--oxblood); border-color: rgba(196, 107, 105, .25); background: rgba(196, 107, 105, .08); }
+/* Impact colors: each category sets an `--accent`, and each impact kind
+   overrides it so kinds within one category tell apart (AEI vs NEI,
+   meme vs politics). Borders, badges and metric bars all read it. */
+:is(.impact-card, .impact-group)[data-category="response"] { --accent: var(--brass); }
+:is(.impact-card, .impact-group)[data-category="craft"] { --accent: var(--verdigris); }
+:is(.impact-card, .impact-group)[data-category="progress"] { --accent: var(--cobalt); }
+:is(.impact-card, .impact-group)[data-category="personal"] { --accent: var(--heather); }
+:is(.impact-card, .impact-group):is([data-category="adjustment"], [data-category="highlight"]) { --accent: var(--oxblood); }
+:is(.impact-card, .impact-group)[data-impact-kind="aei"] { --accent: #d3ac68; }
+:is(.impact-card, .impact-group)[data-impact-kind="nei"] { --accent: #e0906a; }
+:is(.impact-card, .impact-group)[data-impact-kind="cry"] { --accent: #7fb2e0; }
+:is(.impact-card, .impact-group)[data-impact-kind="pads"] { --accent: #b5c46e; }
+:is(.impact-card, .impact-group)[data-impact-kind="jumpscare"] { --accent: #e07a8f; }
+:is(.impact-card, .impact-group)[data-impact-kind="sleepless_night"] { --accent: #9a8fe0; }
+:is(.impact-card, .impact-group)[data-impact-kind="ehi"] { --accent: #c96e60; }
+:is(.impact-card, .impact-group)[data-impact-kind="epi"] { --accent: #e0906a; }
+:is(.impact-card, .impact-group)[data-impact-kind="music"] { --accent: #c49bd2; }
+:is(.impact-card, .impact-group)[data-impact-kind="visual"] { --accent: #7fb0a0; }
+:is(.impact-card, .impact-group)[data-impact-kind="writing"] { --accent: #a9bf74; }
+:is(.impact-card, .impact-group)[data-impact-kind="consumed"] { --accent: #86a8d5; }
+:is(.impact-card, .impact-group)[data-impact-kind="anime_consumed"] { --accent: #7fc4c8; }
+:is(.impact-card, .impact-group)[data-impact-kind="music_consumed_progress"] { --accent: #b69ac5; }
+:is(.impact-card, .impact-group)[data-impact-kind="dropped"] { --accent: #c96e60; }
+:is(.impact-card, .impact-group)[data-impact-kind="meme"] { --accent: #e6a96b; }
+:is(.impact-card, .impact-group)[data-impact-kind="politics"] { --accent: #b69ac5; }
+:is(.impact-card, .impact-group)[data-impact-kind="waifu"] { --accent: #e08db4; }
+:is(.impact-card, .impact-group)[data-impact-kind="osu_song"] { --accent: #7fc4c8; }
+:is(.impact-card, .impact-group)[data-impact-kind="interest_field"] { --accent: #a9bf74; }
+:is(.impact-card, .impact-group)[data-impact-kind="additional"] { --accent: #a29c8c; }
+:is(.impact-card, .impact-group)[data-category] .category-badge {
+  color: var(--accent, var(--bone-500));
+  border-color: color-mix(in srgb, var(--accent, var(--ink-600)) 45%, transparent);
+  background: color-mix(in srgb, var(--accent, transparent) 8%, transparent);
+}
 
 .back-link { display: inline-block; color: var(--bone-500); margin-bottom: 1.75rem; font-size: .8rem; }
 .back-link:hover { color: var(--brass); }
@@ -347,11 +377,7 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
   background: var(--ink-900);
   border-radius: 0;
 }
-.impact-card[data-category="response"] { border-color: rgba(209, 169, 79, .55); }
-.impact-card[data-category="craft"] { border-color: rgba(76, 181, 162, .5); }
-.impact-card[data-category="progress"] { border-color: rgba(102, 141, 213, .55); }
-.impact-card[data-category="personal"] { border-color: rgba(166, 136, 203, .5); }
-.impact-card[data-category="adjustment"], .impact-card[data-category="highlight"] { border-color: rgba(196, 107, 105, .55); }
+.impact-card[data-category], .impact-group[data-category] { border-color: color-mix(in srgb, var(--accent, var(--ink-700)) 55%, transparent); }
 .card-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: flex-start; gap: .75rem; padding: .85rem 1rem; }
 .card-copy { min-width: 0; }
 .impact-title { font-size: .94rem; margin-bottom: .25rem; }
@@ -361,9 +387,7 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 .metric-label { color: var(--bone-700); font-size: .62rem; text-transform: uppercase; letter-spacing: .08em; }
 .metric-bar { height: .25rem; width: 5rem; background: var(--ink-700); margin: .5rem 0 0 auto; border-radius: 1rem; overflow: hidden; }
 .metric-bar span { display: block; height: 100%; background: var(--brass); }
-[data-category="craft"] .metric-bar span { background: var(--verdigris); }
-[data-category="progress"] .metric-bar span { background: var(--cobalt); }
-[data-category="highlight"] .metric-bar span { background: var(--oxblood); }
+[data-category] .metric-bar span { background: var(--accent, var(--brass)); }
 .chips { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
 .chip { color: var(--bone-300); font-family: Plex Mono, monospace; }
 .chip small { color: var(--bone-700); margin-left: .25rem; }
@@ -396,7 +420,7 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 .edit-link:hover { color: var(--brass); }
 .section-actions { margin-top: 1rem; }
 
-.impact-group { border: 1px solid rgba(209, 169, 79, .55); background: var(--ink-900); }
+.impact-group { border: 1px solid var(--ink-700); background: var(--ink-900); }
 .impact-group > summary {
   display: grid;
   grid-template-columns: auto auto minmax(12rem, 1fr) auto auto;

@@ -647,7 +647,7 @@ function impactCard(impact) {
     ? `<p class="source-line">from <a href="${pathForEntry(source.id)}" data-link>${escapeHtml(source.title)}</a> ${kindTag(source.kind)}</p>`
     : "";
   return `
-    <article class="impact-card" data-category="${escapeHtml(impact.category)}">
+    <article class="impact-card" data-category="${escapeHtml(impact.category)}" data-impact-kind="${escapeHtml(impact.kind || "")}">
       <div class="card-head"><div class="category-badge">${escapeHtml(impact.category)}</div>
         <div class="card-copy">
           <h3 class="impact-title">${escapeHtml(impact.title)}${impact.shared ? `<span class="share-pill" title="shared between ${impact.shared.members.length} entries">shared <span class="mono">${Number(impact.contributor_share ?? 0).toFixed(2)}</span></span>` : ""}${impact.needs_review ? '<span class="review-flag">needs review</span>' : ""}</h3>
@@ -676,7 +676,7 @@ function groupedImpactCard(items) {
   const first = items[0];
   const anchors = [...new Set(items.flatMap((impact) => impact.anchors.map(({ anchor }) => anchor)))];
   const reviews = items.filter((impact) => impact.needs_review).length;
-  return `<details class="impact-group" data-category="${escapeHtml(first.category)}" data-disclosure="group-${escapeHtml(first.kind)}"><summary>
+  return `<details class="impact-group" data-category="${escapeHtml(first.category)}" data-impact-kind="${escapeHtml(first.kind || "")}" data-disclosure="group-${escapeHtml(first.kind)}"><summary>
     <span class="disclosure">▶</span><span class="category-badge">${escapeHtml(first.category)}</span>
     <span class="group-copy"><strong>${escapeHtml(first.title)}</strong><span class="group-description">${escapeHtml(first.description)}</span></span>
     <span class="group-count">${items.length} <small>moments</small>${reviews ? ` <em>${reviews} need review</em>` : ""}</span>
