@@ -262,6 +262,25 @@ fn report(plan: &ResyncPlan, snapshot: &Snapshot, extras: &nrs_store::ImportExtr
         "shared impacts: {created} new, {folded} folded from {folded_rows} per-contributor rows, \
          {extended} gaining members"
     );
+    if verbose {
+        for change in &plan.shared_changes {
+            let members = change
+                .add
+                .iter()
+                .map(|i| format!("{} {:.3}", i.target.0, mass(i)));
+            let folded = change
+                .fold
+                .iter()
+                .map(|(_, e, share)| format!("{} {share:.2}", e.0));
+            let kind = change.add.first().map_or("?".to_string(), kind);
+            println!(
+                "  * {} [{kind}] {:?}: {}",
+                change.key,
+                change.base,
+                members.chain(folded).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
 
     println!("relations to add: {}", plan.relations_to_add.len());
     if verbose {
