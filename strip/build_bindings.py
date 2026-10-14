@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LEDGERS = ROOT / "result-vgmdb-musicbrainz"
 NRS_DB = ROOT / "nrs.db"
 MUSICLIB_DB = ROOT / "musiclib.db"
+LEGACY_XML = ROOT.parent / "nrs-impl" / "nrs"
 OUT = Path(__file__).resolve().parent / "bindings.tsv"
 
 
@@ -56,6 +57,11 @@ def main() -> None:
         row[0]: (row[1], row[2])
         for row in nrs.execute("SELECT id, store, store_id FROM entry")
     }
+    # Entries added to the XML after nrs.db was imported have no store row,
+    # but can still bind through a ledger decision or their legacy id.
+    for path in LEGACY_XML.rglob("*.xml"):
+        for entry_id in re.findall(r'<entry\s[^>]*?\bid="([^"$][^"]*)"', path.read_text(encoding="utf-8")):
+            entries.setdefault(entry_id, ("", ""))
 
     # entry_id -> (url, origin); later sources overwrite earlier ones.
     chosen: dict[str, tuple[str, str]] = {}

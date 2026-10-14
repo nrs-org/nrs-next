@@ -42,7 +42,8 @@ python3 -I strip/strip_xml.py        # ../nrs-impl/nrs -> ../nrs-impl/nrs-strip
 ```
 
 `build_bindings.py` reads the migration ledgers in `result-vgmdb-musicbrainz/`,
-`nrs.db` and `musiclib.db`.
+`nrs.db` (plus any entry ids in `../nrs-impl/nrs` it lacks) and
+`musiclib.db`.
 
 ## Check and import
 
