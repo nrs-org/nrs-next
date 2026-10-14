@@ -361,9 +361,7 @@ fn atoms_for(
                 Some("writing"),
             )
         }
-        ImpactKind::AnimeConsumedProgress {
-            episodes: None, ..
-        } => {
+        ImpactKind::AnimeConsumedProgress { episodes: None, .. } => {
             warnings.push(format!(
                 "{context}: <animeConsumedProgress> has no 'episodes' and no store count, skipped"
             ));

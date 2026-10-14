@@ -16,8 +16,8 @@ use super::{
     build_impact_atoms, build_relation, dah_factor_field, dah_params_json, entry_display_name,
     entry_kind, impact_anchor_mix, impact_kind_presentation, impact_period_summary,
     impact_primary_metric, impact_section, normalize_duration_fields, normalize_period_fields,
-    parsed_dah_params, rows, used_anchors, AppState, ImpactSection, KindHints,
-    SortBy, SortDir, TrackedStore, ENTRY_KINDS,
+    parsed_dah_params, rows, used_anchors, AppState, ImpactSection, KindHints, SortBy, SortDir,
+    TrackedStore, ENTRY_KINDS,
 };
 
 #[derive(Serialize)]
@@ -180,9 +180,7 @@ impl ScoresKey {
 fn time_override(stored: TimeParams, shared: Option<f32>, length: Option<f32>) -> TimeParams {
     TimeParams {
         shared: shared.map_or(stored.shared, |v| v.clamp(0.0, 1.0)),
-        length_days: length
-            .filter(|v| *v > 0.0)
-            .unwrap_or(stored.length_days),
+        length_days: length.filter(|v| *v > 0.0).unwrap_or(stored.length_days),
     }
 }
 
@@ -314,7 +312,10 @@ impl ScoresView {
             length_bits: time.length_days.to_bits(),
         };
         let ranking = scored(state, key)?.ok_or_else(|| {
-            api_error(StatusCode::CONFLICT, "the store changed while scoring; retry")
+            api_error(
+                StatusCode::CONFLICT,
+                "the store changed while scoring; retry",
+            )
         })?;
         let comparing =
             query.cmp_gen.is_some() || query.cmp_shared.is_some() || query.cmp_length.is_some();
@@ -1886,7 +1887,10 @@ pub(super) async fn impact_make_shared(
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
     let existing = scoped_impact(&store, &entry_id, &impact_id)?;
     if !existing.members.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "this impact is already shared"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "this impact is already shared",
+        ));
     }
     store
         .make_impact_shared(&ImpactId(impact_id.clone()))
@@ -1954,7 +1958,11 @@ pub(super) async fn impact_shares_edit(
 /// A relation's standards parameters: the stored form, or, for an imported
 /// relation (none stored), what its transform implies. `None` when it can't
 /// be edited as a form (a credit without its roles expression).
-fn relation_params(kind: RelKind, transform: &Transform, dah_params: Option<&str>) -> Option<Value> {
+fn relation_params(
+    kind: RelKind,
+    transform: &Transform,
+    dah_params: Option<&str>,
+) -> Option<Value> {
     let stored = dah_params.and_then(|params| serde_json::from_str::<Value>(params).ok());
     if kind == RelKind::Credit {
         return stored.filter(|params| params["roles"].is_string());
@@ -1963,16 +1971,18 @@ fn relation_params(kind: RelKind, transform: &Transform, dah_params: Option<&str
         return stored;
     }
     match (kind, transform) {
-        (RelKind::Contains, Transform::Scalar(factor)) => Some(json!({ "factor": factor.to_string() })),
+        (RelKind::Contains, Transform::Scalar(factor)) => {
+            Some(json!({ "factor": factor.to_string() }))
+        }
         (RelKind::Remix | RelKind::FeatureMusic, _) => Some(json!({})),
         // `killed_by` scales by potential × effect only, so the product is
         // all a transform keeps: shown as the potential, at full effect.
-        (RelKind::KilledBy, Transform::Regional(map)) => map
-            .get(&nrs_core::AnchorId("comedy".into()))
-            .map(|comedy| {
+        (RelKind::KilledBy, Transform::Regional(map)) => {
+            map.get(&nrs_core::AnchorId("comedy".into())).map(|comedy| {
                 let product = (comedy / (0.2 * 0.4) * 10_000.0).round() / 10_000.0;
                 json!({ "potential": product.to_string(), "effect": "1" })
-            }),
+            })
+        }
         _ => None,
     }
 }
@@ -1990,7 +2000,8 @@ fn credit_writes(
     roles: &str,
 ) -> Result<(Transform, Vec<(nrs_store::EntryRelation, Transform)>), (StatusCode, Json<ApiError>)> {
     use nrs_import::roles;
-    let terms = roles::parse_credit_roles(roles).map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    let terms =
+        roles::parse_credit_roles(roles).map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     let siblings: Vec<nrs_store::EntryRelation> = store
         .relations_for_entry(work)
         .map_err(|error| store_error("load credits", error))?
@@ -2000,9 +2011,18 @@ fn credit_writes(
     let mut stored: Vec<(String, Transform)> = Vec::new();
     let mut others = Vec::new();
     for sibling in &siblings {
-        let roles = relation_params(sibling.kind, &sibling.transform, sibling.dah_params.as_deref())
-            .and_then(|p| p["roles"].as_str().map(String::from))
-            .ok_or_else(|| api_error(StatusCode::CONFLICT, "another credit on this work has no roles expression"))?;
+        let roles = relation_params(
+            sibling.kind,
+            &sibling.transform,
+            sibling.dah_params.as_deref(),
+        )
+        .and_then(|p| p["roles"].as_str().map(String::from))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::CONFLICT,
+                "another credit on this work has no roles expression",
+            )
+        })?;
         stored.push((roles.clone(), sibling.transform.clone()));
         others.push((sibling, roles));
     }
@@ -2013,8 +2033,9 @@ fn credit_writes(
             .into_iter()
             .find(|r| r.id == id && &r.to == work)
         {
-            if let Some(roles) = relation_params(old.kind, &old.transform, old.dah_params.as_deref())
-                .and_then(|p| p["roles"].as_str().map(String::from))
+            if let Some(roles) =
+                relation_params(old.kind, &old.transform, old.dah_params.as_deref())
+                    .and_then(|p| p["roles"].as_str().map(String::from))
             {
                 stored.push((roles, old.transform));
             }
@@ -2024,21 +2045,24 @@ fn credit_writes(
         roles::MusicVars::default()
     } else {
         roles::infer_music_vars(&stored).ok_or_else(|| {
-            api_error(StatusCode::CONFLICT, "couldn't recover this work's music variables from its credits")
+            api_error(
+                StatusCode::CONFLICT,
+                "couldn't recover this work's music variables from its credits",
+            )
         })?
     };
     let mentions = |roles: &str| {
         roles::parse_credit_roles(roles).is_ok_and(|t| roles::mentions_image_feat(&t))
     };
     let pinned = vars.feat && !stored.iter().any(|(r, _)| mentions(r));
-    let feat = pinned
-        || roles::mentions_image_feat(&terms)
-        || others.iter().any(|(_, r)| mentions(r));
+    let feat =
+        pinned || roles::mentions_image_feat(&terms) || others.iter().any(|(_, r)| mentions(r));
     let vars = roles::MusicVars { feat, ..vars };
     let transform = roles::vector_to_transform(roles::weight_vector(&terms, &vars));
     let mut updates = Vec::new();
     for (sibling, roles) in others {
-        let next = roles::credit_transform(&roles, &vars).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
+        let next = roles::credit_transform(&roles, &vars)
+            .map_err(|e| api_error(StatusCode::CONFLICT, e))?;
         if next != sibling.transform {
             updates.push((sibling.clone(), next));
         }
@@ -2055,7 +2079,10 @@ fn write_credit(
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let from = EntryId(fields.get("from_entry").cloned().unwrap_or_default());
     let to = EntryId(fields.get("to_entry").cloned().unwrap_or_default());
-    let roles = fields.get("roles").map(|r| r.trim().to_string()).unwrap_or_default();
+    let roles = fields
+        .get("roles")
+        .map(|r| r.trim().to_string())
+        .unwrap_or_default();
     let (transform, updates) = credit_writes(store, id, &to, &roles)?;
     let id = match id {
         Some(id) => {
@@ -2073,7 +2100,13 @@ fn write_credit(
         .map_err(|error| store_error("save credit roles", error))?;
     for (sibling, transform) in updates {
         store
-            .edit_relation(&sibling.id, sibling.kind, &sibling.from, &sibling.to, &transform)
+            .edit_relation(
+                &sibling.id,
+                sibling.kind,
+                &sibling.from,
+                &sibling.to,
+                &transform,
+            )
             .map_err(|error| store_error("refresh credit", error))?;
     }
     Ok(id)
@@ -2085,10 +2118,16 @@ fn check_relation_ends(
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     let end = |name: &str| fields.get(name).map(|v| v.trim()).unwrap_or("");
     if end("from_entry").is_empty() || end("to_entry").is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "from_entry and to_entry are required"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "from_entry and to_entry are required",
+        ));
     }
     if end("from_entry") != entry_id && end("to_entry") != entry_id {
-        return Err(api_error(StatusCode::BAD_REQUEST, "relation must touch this entry"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "relation must touch this entry",
+        ));
     }
     Ok(())
 }
@@ -2116,14 +2155,20 @@ pub(super) async fn relation_add(
 ) -> ApiResult<MutationResponse> {
     if fields.get("kind").map(String::as_str) == Some("credit") {
         let store = state.store.as_ref().ok_or_else(|| {
-            api_error(StatusCode::SERVICE_UNAVAILABLE, "relation writes require database mode")
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relation writes require database mode",
+            )
         })?;
         let mut store = store
             .lock()
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
         check_relation_ends(&fields, &entry_id)?;
         let id = write_credit(&mut store, None, &fields)?;
-        return Ok(Json(MutationResponse { ok: true, id: Some(id) }));
+        return Ok(Json(MutationResponse {
+            ok: true,
+            id: Some(id),
+        }));
     }
     let relation = relation_from_fields(&fields)?;
     if relation.from.0 != entry_id && relation.to.0 != entry_id {
@@ -2174,7 +2219,13 @@ pub(super) async fn relation_edit(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
     let existing = scoped_relation(&store, &entry_id, &relation_id)?;
-    if relation_params(existing.kind, &existing.transform, existing.dah_params.as_deref()).is_none() {
+    if relation_params(
+        existing.kind,
+        &existing.transform,
+        existing.dah_params.as_deref(),
+    )
+    .is_none()
+    {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "this imported relation has no editable standards parameters",
@@ -2183,7 +2234,10 @@ pub(super) async fn relation_edit(
     if fields.get("kind").map(String::as_str) == Some("credit") {
         check_relation_ends(&fields, &entry_id)?;
         let id = write_credit(&mut store, Some(&relation_id), &fields)?;
-        return Ok(Json(MutationResponse { ok: true, id: Some(id) }));
+        return Ok(Json(MutationResponse {
+            ok: true,
+            id: Some(id),
+        }));
     }
     let relation = relation_from_fields(&fields)?;
     if relation.from.0 != entry_id && relation.to.0 != entry_id {
@@ -2487,7 +2541,13 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
             .collect();
-        let rebuilt = build_relation("killed_by", EntryId("a".into()), EntryId("b".into()), &fields).unwrap();
+        let rebuilt = build_relation(
+            "killed_by",
+            EntryId("a".into()),
+            EntryId("b".into()),
+            &fields,
+        )
+        .unwrap();
         assert_eq!(rebuilt.transform, original.transform);
     }
 

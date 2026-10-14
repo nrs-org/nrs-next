@@ -127,9 +127,10 @@ fn pair_close<'a>(
         let found = left_b.iter().position(|other| {
             let (shape_b, mags_b) = shape(other);
             shape_a == shape_b
-                && mags_a.iter().zip(&mags_b).all(|(x, y)| {
-                    (x - y).abs() <= tolerance * x.abs().max(y.abs())
-                })
+                && mags_a
+                    .iter()
+                    .zip(&mags_b)
+                    .all(|(x, y)| (x - y).abs() <= tolerance * x.abs().max(y.abs()))
         });
         match found {
             Some(index) => {
@@ -145,11 +146,7 @@ fn pair_close<'a>(
         }
     }
     close.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
-    println!(
-        "impacts within {:.2}%: {}",
-        tolerance * 100.0,
-        close.len()
-    );
+    println!("impacts within {:.2}%: {}", tolerance * 100.0, close.len());
     for (target, change) in close.iter().take(show) {
         println!("  ~ {target} {:+.3}%", change * 100.0);
     }
@@ -177,9 +174,7 @@ fn main() {
             "--music-store" => music_store = Some(value()),
             "--anime-store" => anime_store = Some(value()),
             "--show" => show = value().parse().unwrap_or_else(|e| fail("--show", e)),
-            "--tolerance" => {
-                tolerance = value().parse().unwrap_or_else(|e| fail("--tolerance", e))
-            }
+            "--tolerance" => tolerance = value().parse().unwrap_or_else(|e| fail("--tolerance", e)),
             _ => positional.push(arg),
         }
     }

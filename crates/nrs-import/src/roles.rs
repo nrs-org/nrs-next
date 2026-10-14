@@ -390,7 +390,8 @@ fn transforms_close(a: &nrs_core::Transform, b: &nrs_core::Transform) -> bool {
         (Scalar(x), Scalar(y)) => close(*x, *y),
         (Regional(x), Regional(y)) => {
             x.len() == y.len()
-                && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| close(*v, *w)))
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| close(*v, *w)))
         }
         _ => false,
     }

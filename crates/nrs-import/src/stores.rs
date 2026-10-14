@@ -22,9 +22,9 @@
 //! musiclib entry), the parent doesn't `<unlink>` it, and the XML doesn't
 //! already declare it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use nrs_entry_store::{EntryStore, HttpEntryStore};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::xml::{ImpactKind, ParsedDocument, ParsedRelation};
 
@@ -89,7 +89,9 @@ pub fn apply_store_facts(doc: &mut ParsedDocument, facts: &StoreFacts) -> Vec<St
             .filter(|&&minutes| !is_tv_episode(minutes));
         for impact in &mut entry.impacts {
             match &mut impact.kind {
-                ImpactKind::MusicConsumedProgress { duration_minutes } if duration_minutes.is_none() => {
+                ImpactKind::MusicConsumedProgress { duration_minutes }
+                    if duration_minutes.is_none() =>
+                {
                     *duration_minutes = length.copied();
                 }
                 ImpactKind::AnimeConsumedProgress {
@@ -142,8 +144,7 @@ pub fn apply_store_facts(doc: &mut ParsedDocument, facts: &StoreFacts) -> Vec<St
 
     let mut derived: BTreeSet<(String, String)> = BTreeSet::new();
     for (parent, child) in &facts.music_contains {
-        let (Some(parent), Some(child)) =
-            (nrs_of.get(parent.as_str()), nrs_of.get(child.as_str()))
+        let (Some(parent), Some(child)) = (nrs_of.get(parent.as_str()), nrs_of.get(child.as_str()))
         else {
             continue;
         };
@@ -294,7 +295,10 @@ fn load_music(base_url: &str, urls: &BTreeSet<&str>, facts: &mut StoreFacts) -> 
         };
         let meta = store.resolve(&found.store_id).map_err(err)?;
         let bound = found.extra["identifier"].as_str().unwrap_or(url);
-        let sources = meta.extra["sources"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let sources = meta.extra["sources"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Some(title) = music_title(sources, bound).or(meta.extra["entry_title"].as_str()) {
             facts.titles.insert(url.to_string(), title.to_string());
         }
@@ -310,7 +314,8 @@ fn load_music(base_url: &str, urls: &BTreeSet<&str>, facts: &mut StoreFacts) -> 
     let bound: HashSet<&str> = facts.music_entry.values().map(String::as_str).collect();
     for parent in releases {
         for suggestion in store.suggest_relations(&parent).map_err(err)? {
-            if suggestion.kind == "contains" && bound.contains(suggestion.target_store_id.as_str()) {
+            if suggestion.kind == "contains" && bound.contains(suggestion.target_store_id.as_str())
+            {
                 facts
                     .music_contains
                     .insert((parent.clone(), suggestion.target_store_id));
@@ -380,7 +385,9 @@ fn load_anime(
                         facts.episodes.insert(url.to_string(), count as f32);
                     }
                     if let Some(seconds) = basis["episode_duration_seconds"].as_f64() {
-                        facts.episode_minutes.insert(url.to_string(), seconds as f32 / 60.0);
+                        facts
+                            .episode_minutes
+                            .insert(url.to_string(), seconds as f32 / 60.0);
                     }
                     facts.titles.insert(url.to_string(), meta.title);
                     break;
@@ -464,9 +471,19 @@ mod tests {
         f.episode_minutes.insert("u:movie".into(), 110.0);
         apply_store_facts(&mut d, &f);
         let kinds: Vec<&ImpactKind> = d.entries.iter().map(|e| &e.impacts[0].kind).collect();
-        assert_eq!(kinds[0], &ImpactKind::MusicConsumedProgress { duration_minutes: Some(4.5) });
+        assert_eq!(
+            kinds[0],
+            &ImpactKind::MusicConsumedProgress {
+                duration_minutes: Some(4.5)
+            }
+        );
         // A written value wins over the store.
-        assert_eq!(kinds[1], &ImpactKind::MusicConsumedProgress { duration_minutes: Some(3.0) });
+        assert_eq!(
+            kinds[1],
+            &ImpactKind::MusicConsumedProgress {
+                duration_minutes: Some(3.0)
+            }
+        );
         // A TV-length episode keeps NRS's default (left `None` here).
         assert_eq!(
             kinds[2],
