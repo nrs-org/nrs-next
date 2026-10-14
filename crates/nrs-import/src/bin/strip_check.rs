@@ -6,7 +6,7 @@
 //! which is allowed to differ.
 //!
 //! Usage: `cargo run -p nrs-import --features scripting --bin strip_check --
-//! <legacy .xml> <stripped .xml> [--today YYYY-MM-DD] [--musiclib-db PATH]
+//! <legacy .xml> <stripped .xml> [--today YYYY-MM-DD] [--music-store URL]
 //! [--anime-store URL] [--show N] [--tolerance REL]`
 //!
 //! `--tolerance` pairs up leftover impacts that differ only in atom
@@ -159,7 +159,7 @@ fn pair_close<'a>(
 fn main() {
     let mut positional = Vec::new();
     let mut today = time::macros::date!(2026 - 09 - 11);
-    let mut musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(PathBuf::from);
+    let mut music_store = std::env::var("NRS_MUSIC_STORE_URL").ok();
     let mut anime_store = std::env::var("NRS_ANIME_STORE_URL").ok();
     let mut show = 10;
     let mut tolerance = 0.0_f32;
@@ -174,7 +174,7 @@ fn main() {
                 let format = time::format_description::well_known::Iso8601::DATE;
                 today = time::Date::parse(&value(), &format).unwrap_or_else(|e| fail("--today", e));
             }
-            "--musiclib-db" => musiclib_db = Some(value().into()),
+            "--music-store" => music_store = Some(value()),
             "--anime-store" => anime_store = Some(value()),
             "--show" => show = value().parse().unwrap_or_else(|e| fail("--show", e)),
             "--tolerance" => {
@@ -192,7 +192,7 @@ fn main() {
     let (legacy, stripped) = (PathBuf::from(legacy), PathBuf::from(stripped));
 
     let none = nrs_import::StoreSources::default();
-    let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store);
+    let sources = nrs_import::StoreSources::from_env(&music_store, &anime_store);
     let (a, wa) = build(&legacy, today, &none);
     let (b, wb) = build(&stripped, today, &sources);
     println!(

@@ -49,15 +49,18 @@ python3 -I strip/strip_xml.py        # ../nrs-impl/nrs -> ../nrs-impl/nrs-strip
 ```sh
 cargo run -p nrs-import --features scripting --bin strip_check -- \
   ../nrs-impl/nrs/NRSImplMain.xml ../nrs-impl/nrs-strip/NRSImplMain.xml \
-  --musiclib-db musiclib.db --anime-store http://127.0.0.1:3738
+  --music-store http://127.0.0.1:4600 --anime-store http://127.0.0.1:3738
 
-NRS_MUSICLIB_DB=musiclib.db NRS_ANIME_STORE_URL=http://127.0.0.1:3738 \
+NRS_MUSIC_STORE_URL=http://127.0.0.1:4600 NRS_ANIME_STORE_URL=http://127.0.0.1:3738 \
   cargo run -p nrs-import --features scripting --bin import -- \
   ../nrs-impl/nrs-strip/NRSImplMain.xml new.db
 ```
 
-`resync` takes `--musiclib-db` / `--anime-store` (or the same environment
-variables), and nrs-app's XML mode reads the environment variables.
+`resync` takes `--music-store` / `--anime-store` (or the same environment
+variables), and nrs-app's XML mode reads the environment variables. Both
+stores are Store Protocol servers: musiclib's is `../musiclib-rs`'s `server`
+binary, which runs without provider credentials (ingest is then disabled;
+NRS only needs `lookup`, `resolve` and `suggest_relations`).
 
 `strip_check --tolerance 0.01` pairs impacts that only differ slightly in
 magnitude (store lengths a few seconds off the written ones). As of

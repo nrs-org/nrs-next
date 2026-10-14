@@ -1379,10 +1379,11 @@ pub(super) async fn progress_basis(
         return Ok(Json(ProgressBasisResponse::default()));
     }
     let url = entry.store_id;
-    let (musiclib_db, anime_store_url) = (state.musiclib_db.clone(), state.anime_store_url.clone());
+    let (music_store_url, anime_store_url) =
+        (state.music_store_url.clone(), state.anime_store_url.clone());
     let lookup_url = url.clone();
     let basis = tokio::task::spawn_blocking(move || {
-        let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store_url);
+        let sources = nrs_import::StoreSources::from_env(&music_store_url, &anime_store_url);
         nrs_import::progress_basis(&lookup_url, &sources)
     })
     .await
@@ -2160,7 +2161,7 @@ mod tests {
                 snapshot,
                 store: Some(std::sync::Mutex::new(crate::TrackedStore::new(store))),
                 anime_store: nrs_entry_store::HttpEntryStore::new("http://127.0.0.1:3738").unwrap(),
-                musiclib_db: None,
+                music_store_url: None,
                 anime_store_url: None,
                 scores_cache: Default::default(),
                 kind_hints: Default::default(),

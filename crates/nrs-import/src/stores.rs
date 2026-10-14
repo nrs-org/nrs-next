@@ -2,8 +2,9 @@
 //!
 //! Stripped XML leaves out what the type stores know: titles, and the
 //! album -> track containment of the music store. `load_store_facts` reads
-//! those for every bound URL (musiclib's database directly, read-only; the
-//! anime store through the Store Protocol), and `apply_store_facts` folds
+//! those for every bound URL through the Store Protocol (musiclib by
+//! `lookup`, which never fetches; the anime store by `ingest`), and
+//! `apply_store_facts` folds
 //! them into a parsed document before `build_snapshot`, so the snapshot is
 //! the same shape the legacy XML produced.
 //!
@@ -22,8 +23,8 @@
 //! already declare it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
 use nrs_entry_store::{EntryStore, HttpEntryStore};
+use serde_json::Value;
 
 use crate::xml::{ImpactKind, ParsedDocument, ParsedRelation};
 
@@ -32,10 +33,10 @@ use crate::xml::{ImpactKind, ParsedDocument, ParsedRelation};
 pub struct StoreFacts {
     /// Bind URL -> display title.
     pub titles: HashMap<String, String>,
-    /// Bind URL -> musiclib entry id.
-    pub music_entry: HashMap<String, i64>,
+    /// Bind URL -> musiclib store ID.
+    pub music_entry: HashMap<String, String>,
     /// musiclib `release -> track` edges among `music_entry` values.
-    pub music_contains: HashSet<(i64, i64)>,
+    pub music_contains: HashSet<(String, String)>,
     /// Bind URL -> track length in minutes (musiclib).
     pub lengths: HashMap<String, f32>,
     /// Bind URL -> episode count (anime store).
@@ -109,18 +110,18 @@ pub fn apply_store_facts(doc: &mut ParsedDocument, facts: &StoreFacts) -> Vec<St
     }
 
     // NRS entry ids per musiclib entry (an id declared twice counts once).
-    let mut per_music: BTreeMap<i64, BTreeSet<&str>> = BTreeMap::new();
+    let mut per_music: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for entry in &doc.entries {
         for url in &entry.binds {
-            if let Some(&music) = facts.music_entry.get(url) {
+            if let Some(music) = facts.music_entry.get(url) {
                 per_music
-                    .entry(music)
+                    .entry(music.as_str())
                     .or_default()
                     .insert(entry.id.as_str());
             }
         }
     }
-    let nrs_of: HashMap<i64, String> = per_music
+    let nrs_of: HashMap<&str, String> = per_music
         .into_iter()
         .filter(|(_, ids)| ids.len() == 1)
         .map(|(music, ids)| (music, ids.into_iter().next().unwrap().to_string()))
@@ -141,7 +142,9 @@ pub fn apply_store_facts(doc: &mut ParsedDocument, facts: &StoreFacts) -> Vec<St
 
     let mut derived: BTreeSet<(String, String)> = BTreeSet::new();
     for (parent, child) in &facts.music_contains {
-        let (Some(parent), Some(child)) = (nrs_of.get(parent), nrs_of.get(child)) else {
+        let (Some(parent), Some(child)) =
+            (nrs_of.get(parent.as_str()), nrs_of.get(child.as_str()))
+        else {
             continue;
         };
         if parent != child {
@@ -178,18 +181,18 @@ pub fn apply_store_facts(doc: &mut ParsedDocument, facts: &StoreFacts) -> Vec<St
 /// available stores can't answer for keep an empty title (and a warning).
 #[derive(Debug, Default, Clone)]
 pub struct StoreSources<'a> {
-    pub musiclib_db: Option<&'a Path>,
+    pub music_store_url: Option<&'a str>,
     pub anime_store_url: Option<&'a str>,
 }
 
+/// Where musiclib's server listens by default.
+pub const DEFAULT_MUSIC_STORE_URL: &str = "http://127.0.0.1:4600";
+
 impl<'a> StoreSources<'a> {
-    /// `NRS_MUSICLIB_DB` / `NRS_ANIME_STORE_URL`, for callers without flags.
-    pub fn from_env(
-        musiclib_db: &'a Option<std::path::PathBuf>,
-        anime: &'a Option<String>,
-    ) -> Self {
+    /// `NRS_MUSIC_STORE_URL` / `NRS_ANIME_STORE_URL`, for callers without flags.
+    pub fn from_env(music: &'a Option<String>, anime: &'a Option<String>) -> Self {
         StoreSources {
-            musiclib_db: musiclib_db.as_deref(),
+            music_store_url: music.as_deref(),
             anime_store_url: anime.as_deref(),
         }
     }
@@ -206,9 +209,9 @@ pub fn resolve_binds(
         return Ok(Vec::new());
     }
     let mut warnings = Vec::new();
-    if sources.musiclib_db.is_none() && sources.anime_store_url.is_none() {
+    if sources.music_store_url.is_none() && sources.anime_store_url.is_none() {
         warnings.push(format!(
-            "{bound} entries use <bind> but no store was given (--musiclib-db / --anime-store): \
+            "{bound} entries use <bind> but no store was given (--music-store / --anime-store): \
              their titles and store-asserted containment are missing"
         ));
     }
@@ -233,9 +236,8 @@ pub struct ProgressBasis {
 pub fn progress_basis(url: &str, sources: &StoreSources) -> Result<ProgressBasis, String> {
     let urls = BTreeSet::from([url]);
     let mut facts = StoreFacts::default();
-    if let Some(path) = sources.musiclib_db {
-        load_musiclib(path, &urls, &mut facts)
-            .map_err(|e| format!("musiclib {}: {e}", path.display()))?;
+    if let Some(base_url) = sources.music_store_url {
+        load_music(base_url, &urls, &mut facts)?;
     }
     if let Some(base_url) = sources.anime_store_url {
         let mut warnings = Vec::new();
@@ -267,9 +269,8 @@ pub fn load_store_facts(
         .collect();
     let mut facts = StoreFacts::default();
     let mut warnings = Vec::new();
-    if let Some(path) = sources.musiclib_db {
-        load_musiclib(path, &urls, &mut facts)
-            .map_err(|e| format!("musiclib {}: {e}", path.display()))?;
+    if let Some(base_url) = sources.music_store_url {
+        load_music(base_url, &urls, &mut facts)?;
     }
     if let Some(base_url) = sources.anime_store_url {
         load_anime(base_url, &urls, &mut facts, &mut warnings)?;
@@ -277,76 +278,74 @@ pub fn load_store_facts(
     Ok((facts, warnings))
 }
 
-fn load_musiclib(
-    path: &Path,
-    urls: &BTreeSet<&str>,
-    facts: &mut StoreFacts,
-) -> rusqlite::Result<()> {
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut entry_of =
-        conn.prepare("SELECT entry_id FROM entry_source WHERE identifier = ?1 LIMIT 1")?;
-    // The bound pair's own primary alias first, then any alias on the
-    // musiclib entry (a merged entry's other sources).
-    let mut title_of = conn.prepare(
-        "SELECT a.name FROM entry_alias a JOIN entry_source s \
-           ON s.source = a.source AND s.identifier = a.identifier \
-         WHERE s.entry_id = ?1 \
-         ORDER BY (a.identifier = ?2) DESC, a.\"primary\" DESC, a.id LIMIT 1",
-    )?;
-    // The bound record's own length first, then the musiclib entry's other
-    // sources: MusicBrainz, then Spotify, then the rest.
-    let mut length_of = conn.prepare(
-        "SELECT duration_ms FROM entry_source \
-         WHERE entry_id = ?1 AND duration_ms > 0 \
-         ORDER BY (identifier = ?2) DESC, \
-           CASE source WHEN 'musicbrainz' THEN 0 WHEN 'spotify' THEN 1 ELSE 2 END, \
-           source, identifier \
-         LIMIT 1",
-    )?;
+/// musiclib through the Store Protocol. `lookup` maps a URL to its entry
+/// without fetching; `resolve`'s `extra.sources` lists every pair of the
+/// entry, so the pair the URL matched comes first for its title and length;
+/// `suggest_relations` gives a release's tracks.
+fn load_music(base_url: &str, urls: &BTreeSet<&str>, facts: &mut StoreFacts) -> Result<(), String> {
+    let err = |e: nrs_entry_store::Error| format!("music store {base_url}: {e}");
+    let store = HttpEntryStore::new(base_url)
+        .map_err(err)?
+        .expecting_store("musiclib");
+    let mut releases = Vec::new();
     for &url in urls {
-        let Some(entry) = entry_of
-            .query_row([url], |row| row.get::<_, i64>(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })?
-        else {
+        let Some(found) = store.lookup(url).map_err(err)? else {
             continue;
         };
-        facts.music_entry.insert(url.to_string(), entry);
-        if let Ok(title) =
-            title_of.query_row(rusqlite::params![entry, url], |row| row.get::<_, String>(0))
-        {
-            facts.titles.insert(url.to_string(), title);
+        let meta = store.resolve(&found.store_id).map_err(err)?;
+        let bound = found.extra["identifier"].as_str().unwrap_or(url);
+        let sources = meta.extra["sources"].as_array().map(Vec::as_slice).unwrap_or_default();
+        if let Some(title) = music_title(sources, bound).or(meta.extra["entry_title"].as_str()) {
+            facts.titles.insert(url.to_string(), title.to_string());
         }
-        if let Ok(ms) =
-            length_of.query_row(rusqlite::params![entry, url], |row| row.get::<_, i64>(0))
-        {
+        if let Some(ms) = music_length_ms(sources, bound) {
             facts.lengths.insert(url.to_string(), ms as f32 / 60_000.0);
         }
+        if meta.kind == "release" {
+            releases.push(found.store_id.clone());
+        }
+        facts.music_entry.insert(url.to_string(), found.store_id);
     }
 
-    let bound: HashSet<i64> = facts.music_entry.values().copied().collect();
-    let mut children = conn.prepare(
-        "SELECT DISTINCT c.entry_id FROM entry_source p \
-           JOIN entry pe ON pe.id = p.entry_id \
-           JOIN entry_child ch ON ch.parent_source = p.source AND ch.parent_identifier = p.identifier \
-           JOIN entry_source c ON c.source = ch.child_source AND c.identifier = ch.child_identifier \
-           JOIN entry ce ON ce.id = c.entry_id \
-         WHERE p.entry_id = ?1 AND pe.entry_type = 'release' AND ce.entry_type = 'track'",
-    )?;
-    for &parent in &bound {
-        let rows = children.query_map([parent], |row| row.get::<_, i64>(0))?;
-        for child in rows {
-            let child = child?;
-            if bound.contains(&child) {
-                facts.music_contains.insert((parent, child));
+    let bound: HashSet<&str> = facts.music_entry.values().map(String::as_str).collect();
+    for parent in releases {
+        for suggestion in store.suggest_relations(&parent).map_err(err)? {
+            if suggestion.kind == "contains" && bound.contains(suggestion.target_store_id.as_str()) {
+                facts
+                    .music_contains
+                    .insert((parent.clone(), suggestion.target_store_id));
             }
         }
     }
     Ok(())
+}
+
+/// The bound pair's own title.
+fn music_title<'a>(sources: &'a [Value], bound: &str) -> Option<&'a str> {
+    sources
+        .iter()
+        .filter(|s| s["identifier"] == bound)
+        .find_map(|s| s["title"].as_str())
+}
+
+/// The bound pair's own length first, then the entry's other pairs:
+/// MusicBrainz, then Spotify, then the rest.
+fn music_length_ms(sources: &[Value], bound: &str) -> Option<i64> {
+    sources
+        .iter()
+        .filter_map(|s| {
+            let ms = s["duration_ms"].as_i64().filter(|&ms| ms > 0)?;
+            let source = s["source"].as_str().unwrap_or_default();
+            let identifier = s["identifier"].as_str().unwrap_or_default();
+            let rank = match source {
+                "musicbrainz" => 0,
+                "spotify" => 1,
+                _ => 2,
+            };
+            Some(((identifier != bound, rank, source, identifier), ms))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, ms)| ms)
 }
 
 /// URLs the anime store can ingest (anime, manga/novels, visual novels).
@@ -426,7 +425,7 @@ mod tests {
         out
     }
 
-    fn facts(entries: &[(&str, i64, &str)], edges: &[(i64, i64)]) -> StoreFacts {
+    fn facts(entries: &[(&str, &str, &str)], edges: &[(&str, &str)]) -> StoreFacts {
         StoreFacts {
             titles: entries
                 .iter()
@@ -434,9 +433,12 @@ mod tests {
                 .collect(),
             music_entry: entries
                 .iter()
-                .map(|(u, e, _)| (u.to_string(), *e))
+                .map(|(u, e, _)| (u.to_string(), e.to_string()))
                 .collect(),
-            music_contains: edges.iter().copied().collect(),
+            music_contains: edges
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect(),
             ..StoreFacts::default()
         }
     }
@@ -498,7 +500,7 @@ mod tests {
             <entry id="M-1"><bind url="u:album" /></entry>
             <entry id="F-1" title="Mine" />
         </document>"#);
-        let w = apply_store_facts(&mut d, &facts(&[("u:album", 1, "Album")], &[]));
+        let w = apply_store_facts(&mut d, &facts(&[("u:album", "1", "Album")], &[]));
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(d.entries[0].title, "Album");
         assert_eq!(
@@ -519,12 +521,12 @@ mod tests {
         </document>"#);
         let f = facts(
             &[
-                ("u:a", 1, "A"),
-                ("u:t1", 2, "t1"),
-                ("u:t2", 3, "t2"),
-                ("u:t3", 4, "t3"),
+                ("u:a", "1", "A"),
+                ("u:t1", "2", "t1"),
+                ("u:t2", "3", "t2"),
+                ("u:t3", "4", "t3"),
             ],
-            &[(1, 2), (1, 3), (1, 4)],
+            &[("1", "2"), ("1", "3"), ("1", "4")],
         );
         let w = apply_store_facts(&mut d, &f);
         assert!(w.is_empty(), "{w:?}");
@@ -541,7 +543,7 @@ mod tests {
         </document>"#);
         apply_store_facts(
             &mut d,
-            &facts(&[("u:a", 1, "A"), ("u:t", 2, "t")], &[(1, 2)]),
+            &facts(&[("u:a", "1", "A"), ("u:t", "2", "t")], &[("1", "2")]),
         );
         assert!(contains(&d, "A").is_empty());
     }
@@ -552,7 +554,7 @@ mod tests {
             <entry id="A"><bind url="u:a" /><unlink id="T1" /></entry>
             <entry id="T1"><bind url="u:gone" /></entry>
         </document>"#);
-        let w = apply_store_facts(&mut d, &facts(&[("u:a", 1, "A")], &[]));
+        let w = apply_store_facts(&mut d, &facts(&[("u:a", "1", "A")], &[]));
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w.iter().any(|m| m.contains("no store title")));
         assert!(w.iter().any(|m| m.contains("matches no store edge")));

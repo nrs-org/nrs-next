@@ -40,9 +40,9 @@ struct AppState {
     /// store, which the read-only XML-mode doesn't have.
     store: Option<Mutex<TrackedStore>>,
     anime_store: HttpEntryStore,
-    /// Where progress defaults come from (`NRS_MUSICLIB_DB`,
+    /// Where progress defaults come from (`NRS_MUSIC_STORE_URL`,
     /// `NRS_ANIME_STORE_URL`); see `api::progress_basis`.
-    musiclib_db: Option<std::path::PathBuf>,
+    music_store_url: Option<String>,
     anime_store_url: Option<String>,
     /// Recently scored rankings, so paging and re-sorting the scores
     /// table don't re-run the whole functional (see `api::scored`).
@@ -128,12 +128,12 @@ async fn main() {
             }
         };
         // Stripped XML: titles and store-asserted containment come from the
-        // stores (`NRS_MUSICLIB_DB`, `NRS_ANIME_STORE_URL`).
-        let musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(std::path::PathBuf::from);
+        // stores (`NRS_MUSIC_STORE_URL`, `NRS_ANIME_STORE_URL`).
+        let music_store_url = Some(music_store_url());
         let anime_store_url = Some(
             std::env::var("NRS_ANIME_STORE_URL").unwrap_or_else(|_| "http://127.0.0.1:3738".into()),
         );
-        let sources = nrs_import::StoreSources::from_env(&musiclib_db, &anime_store_url);
+        let sources = nrs_import::StoreSources::from_env(&music_store_url, &anime_store_url);
         match nrs_import::resolve_binds(&mut doc, &sources) {
             Ok(store_warnings) => doc.warnings.extend(store_warnings),
             Err(e) => {
@@ -175,7 +175,7 @@ async fn main() {
         snapshot,
         store: store.map(|store| Mutex::new(TrackedStore::new(store))),
         anime_store,
-        musiclib_db: std::env::var_os("NRS_MUSICLIB_DB").map(std::path::PathBuf::from),
+        music_store_url: Some(music_store_url()),
         anime_store_url: Some(anime_store_url),
         scores_cache: Default::default(),
         kind_hints: Default::default(),
@@ -261,6 +261,13 @@ enum SortDir {
     #[default]
     Desc,
     Asc,
+}
+
+/// musiclib's Store Protocol endpoint: `NRS_MUSIC_STORE_URL`, else its
+/// server's default.
+fn music_store_url() -> String {
+    std::env::var("NRS_MUSIC_STORE_URL")
+        .unwrap_or_else(|_| nrs_import::stores::DEFAULT_MUSIC_STORE_URL.into())
 }
 
 fn params(k_feat: KFeatMatrix, time: TimeParams) -> Params {

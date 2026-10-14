@@ -4,11 +4,11 @@
 //!
 //! Usage: `cargo run -p nrs-import --features scripting --bin resync --
 //! <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose]
-//! [--musiclib-db PATH] [--anime-store URL]`
+//! [--music-store URL] [--anime-store URL]`
 //!
 //! Stripped XML (`<bind url>` entries) gets its titles and store-asserted
-//! containment from the stores; `--musiclib-db`/`--anime-store` default to
-//! `NRS_MUSICLIB_DB`/`NRS_ANIME_STORE_URL`.
+//! containment from the stores; `--music-store`/`--anime-store` default to
+//! `NRS_MUSIC_STORE_URL`/`NRS_ANIME_STORE_URL`.
 //!
 //! `--today` defaults to the database's last `snapshot.import` date, so
 //! date-dependent impacts (memes, waifus, PADS running "to today") are
@@ -32,32 +32,28 @@ struct Args {
     today: Option<time::Date>,
     apply: bool,
     verbose: bool,
-    musiclib_db: Option<PathBuf>,
+    music_store: Option<String>,
     anime_store: Option<String>,
 }
 
 fn parse_args() -> Args {
     let usage =
         "usage: resync <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose] \
-         [--musiclib-db PATH] [--anime-store URL]";
+         [--music-store URL] [--anime-store URL]";
     let mut positional = Vec::new();
     let (mut today, mut apply, mut verbose) = (None, false, false);
-    let mut musiclib_db = std::env::var_os("NRS_MUSICLIB_DB").map(PathBuf::from);
+    let mut music_store = std::env::var("NRS_MUSIC_STORE_URL").ok();
     let mut anime_store = std::env::var("NRS_ANIME_STORE_URL").ok();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--apply" => apply = true,
             "--verbose" => verbose = true,
-            "--musiclib-db" => {
-                musiclib_db = Some(
-                    args.next()
-                        .unwrap_or_else(|| {
-                            eprintln!("{usage}");
-                            exit(1)
-                        })
-                        .into(),
-                )
+            "--music-store" => {
+                music_store = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("{usage}");
+                    exit(1)
+                }))
             }
             "--anime-store" => {
                 anime_store = Some(args.next().unwrap_or_else(|| {
@@ -89,7 +85,7 @@ fn parse_args() -> Args {
         today,
         apply,
         verbose,
-        musiclib_db,
+        music_store,
         anime_store,
     }
 }
@@ -116,7 +112,7 @@ fn main() {
     eprintln!("parsing {} as of {today}", args.xml.display());
     let mut doc =
         nrs_import::parse_file(&args.xml, today).unwrap_or_else(|e| fail("parse error", e));
-    let sources = nrs_import::StoreSources::from_env(&args.musiclib_db, &args.anime_store);
+    let sources = nrs_import::StoreSources::from_env(&args.music_store, &args.anime_store);
     let store_warnings =
         nrs_import::resolve_binds(&mut doc, &sources).unwrap_or_else(|e| fail("store lookup", e));
     doc.warnings.extend(store_warnings);

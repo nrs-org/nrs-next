@@ -1,4 +1,4 @@
-//! Blocking client for the NRS Store Protocol v0.1.
+//! Blocking client for the NRS Store Protocol v0.2.
 //!
 //! NRS persists only the opaque `(store, store_id)` returned by a type
 //! store. Provider identifiers, aliases, metadata aggregation, and
@@ -53,6 +53,15 @@ pub struct EntryMeta {
     pub extra: Value,
 }
 
+/// A `lookup` match: the store ID a query already belongs to, plus
+/// store-specific details of the match.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LookupMatch {
+    pub store_id: String,
+    #[serde(default)]
+    pub extra: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RelationSuggestion {
     pub kind: String,
@@ -64,6 +73,9 @@ pub struct RelationSuggestion {
 /// The language-independent boundary from `INFRA.md` §7.
 pub trait EntryStore {
     fn resolve(&self, store_id: &str) -> Result<EntryMeta>;
+    /// The entry `query` already belongs to, without fetching; `None` when
+    /// the store knows no such entry.
+    fn lookup(&self, query: &str) -> Result<Option<LookupMatch>>;
     fn ingest(&self, query: &str) -> Result<String>;
     fn suggest_relations(&self, store_id: &str) -> Result<Vec<RelationSuggestion>>;
 }
@@ -134,6 +146,7 @@ impl HttpEntryStore {
         let capabilities = self.capabilities()?;
         let supported = match operation {
             "resolve" => capabilities.operations.resolve,
+            "lookup" => capabilities.operations.lookup,
             "ingest" => capabilities.operations.ingest,
             "suggest_relations" => capabilities.operations.suggest_relations,
             _ => false,
@@ -157,7 +170,10 @@ impl HttpEntryStore {
     }
 
     fn get<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T> {
-        let url = self.endpoint(segments)?;
+        self.get_url(self.endpoint(segments)?)
+    }
+
+    fn get_url<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
         decode_response(ureq::get(url.as_str()).timeout(REQUEST_TIMEOUT).call())
     }
 
@@ -177,6 +193,17 @@ impl EntryStore for HttpEntryStore {
     fn resolve(&self, store_id: &str) -> Result<EntryMeta> {
         self.ensure_operation("resolve")?;
         self.get(&["nrs-store", "v1", "entries", store_id])
+    }
+
+    fn lookup(&self, query: &str) -> Result<Option<LookupMatch>> {
+        self.ensure_operation("lookup")?;
+        let mut url = self.endpoint(&["nrs-store", "v1", "lookup"])?;
+        url.query_pairs_mut().append_pair("query", query);
+        match self.get_url(url) {
+            Ok(found) => Ok(Some(found)),
+            Err(Error::Remote { status: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn ingest(&self, query: &str) -> Result<String> {
@@ -248,6 +275,9 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Operations {
     pub resolve: bool,
+    /// Added in 0.2; absent from older stores.
+    #[serde(default)]
+    pub lookup: bool,
     pub ingest: bool,
     pub suggest_relations: bool,
 }
@@ -378,6 +408,50 @@ mod tests {
         let metadata = client.resolve(&store_id).unwrap();
         assert_eq!(metadata.title, "Fixture Anime");
         assert_eq!(metadata.store_id, store_id);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_maps_not_found_to_none() {
+        let capabilities = r#"{"store":"musiclib","protocol_version":"0.2","operations":{"resolve":true,"lookup":true,"ingest":false,"suggest_relations":true},"jobs":{"streaming":false}}"#;
+        let responses = [
+            MockResponse::ok("GET /nrs-store/v1/capabilities HTTP/1.1", capabilities),
+            MockResponse::ok(
+                "GET /nrs-store/v1/lookup?query=https%3A%2F%2Fexample.com%2Fa%3Fb%3Dc HTTP/1.1",
+                r#"{"store_id":"42","extra":{"source":"x"}}"#,
+            ),
+            MockResponse::ok("GET /nrs-store/v1/capabilities HTTP/1.1", capabilities),
+            MockResponse {
+                request_line: "GET /nrs-store/v1/lookup?query=unknown HTTP/1.1",
+                status: "404 Not Found",
+                body: r#"{"code":"not_found","message":"no such resource"}"#,
+            },
+        ];
+        let (base_url, server) = mock_server(responses);
+        let client = HttpEntryStore::new(&base_url).unwrap();
+
+        let found = client.lookup("https://example.com/a?b=c").unwrap().unwrap();
+        assert_eq!(found.store_id, "42");
+        assert_eq!(found.extra["source"], "x");
+        assert_eq!(client.lookup("unknown").unwrap(), None);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_is_unsupported_on_a_0_1_store() {
+        let responses = [MockResponse::ok(
+            "GET /nrs-store/v1/capabilities HTTP/1.1",
+            r#"{"store":"anime","protocol_version":"0.1","operations":{"resolve":true,"ingest":true,"suggest_relations":false},"jobs":{"streaming":false}}"#,
+        )];
+        let (base_url, server) = mock_server(responses);
+        let client = HttpEntryStore::new(&base_url).unwrap();
+
+        assert!(matches!(
+            client.lookup("x"),
+            Err(Error::Unsupported("lookup"))
+        ));
 
         server.join().unwrap();
     }
