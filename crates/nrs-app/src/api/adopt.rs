@@ -153,6 +153,7 @@ fn summary_of(meta: EntryMeta) -> EntrySummary {
         release_date: meta.release_date,
         canonical_url: meta.canonical_url,
         urls: meta.urls,
+        edition_group: meta.edition_group,
     }
 }
 
@@ -188,9 +189,13 @@ struct StoreHit {
     summary: EntrySummary,
     /// The NRS entry already bound to it.
     entry_id: Option<String>,
+    /// Further results in its edition group, folded into this one.
+    other_editions: usize,
 }
 
-/// Both stores' `search`, each best first, anime first.
+/// Both stores' `search`, each best first, anime first. Editions of one
+/// work (`edition_group`) are one result: the edition NRS has, else the
+/// best-ranked.
 pub(crate) async fn stores_search(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StoreSearchQuery>,
@@ -229,10 +234,32 @@ pub(crate) async fn stores_search(
                 store: store_name,
                 summary,
                 entry_id: entry_id.map(|id| id.0),
+                other_editions: 0,
             })
         })
-        .collect::<Result<_, ApiErr>>()?;
-    Ok(Json(StoreSearchResponse { results, errors }))
+        .collect::<Result<Vec<_>, ApiErr>>()?;
+    let mut folded: Vec<StoreHit> = Vec::new();
+    for hit in results {
+        let same_work = |shown: &&mut StoreHit| {
+            shown.store == hit.store
+                && hit.summary.edition_group.is_some()
+                && shown.summary.edition_group == hit.summary.edition_group
+        };
+        match folded.iter_mut().find(same_work) {
+            Some(shown) => {
+                let others = shown.other_editions + 1;
+                if shown.entry_id.is_none() && hit.entry_id.is_some() {
+                    *shown = hit;
+                }
+                shown.other_editions = others;
+            }
+            None => folded.push(hit),
+        }
+    }
+    Ok(Json(StoreSearchResponse {
+        results: folded,
+        errors,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -426,17 +453,96 @@ pub(crate) struct RelatedResponse {
     suggestions: Vec<RelatedSuggestion>,
 }
 
+/// One store suggestion for one work: its editions (`edition_group`, e.g.
+/// an album's pressings across providers) fold into one, so a track
+/// suggests its album once.
 #[derive(Serialize)]
 struct RelatedSuggestion {
     kind: String,
     direction: Direction,
     evidence: String,
     store: StoreName,
+    /// The edition to relate: one NRS records the relation with, else one
+    /// NRS has, else the one the store knows by the most URLs.
     target: EntrySummary,
     /// The NRS entry already bound to the target.
     target_entry_id: Option<String>,
-    /// Whether NRS already records this relation.
+    /// Whether NRS already records this relation, with any edition.
     relation_exists: bool,
+    /// Every edition suggested, `target` first.
+    editions: Vec<RelatedEdition>,
+}
+
+#[derive(Serialize)]
+struct RelatedEdition {
+    target: EntrySummary,
+    target_entry_id: Option<String>,
+}
+
+/// A suggestion with what NRS has of it.
+struct Known {
+    suggestion: Suggestion,
+    target_entry: Option<EntryId>,
+    relation_exists: bool,
+}
+
+/// `known` folded by work (see `RelatedSuggestion`), in first-seen order.
+fn fold_editions(known: Vec<Known>) -> Vec<RelatedSuggestion> {
+    let mut groups: Vec<(String, Vec<Known>)> = Vec::new();
+    for item in known {
+        let target = &item.suggestion.target;
+        let work = match &target.edition_group {
+            Some(group) => format!("group {group}"),
+            None => format!("entry {}", target.store_id),
+        };
+        let key = format!(
+            "{} {:?} {work}",
+            item.suggestion.kind_name, item.suggestion.direction
+        );
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(item),
+            None => groups.push((key, vec![item])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, mut members)| {
+            let rank = |k: &Known| {
+                (
+                    k.relation_exists,
+                    k.target_entry.is_some(),
+                    k.suggestion.target.urls.len(),
+                )
+            };
+            let mut best = 0;
+            for (i, member) in members.iter().enumerate() {
+                if rank(member) > rank(&members[best]) {
+                    best = i;
+                }
+            }
+            let chosen = members.remove(best);
+            let relation_exists =
+                chosen.relation_exists || members.iter().any(|m| m.relation_exists);
+            let edition = |k: &Known| RelatedEdition {
+                target: k.suggestion.target.clone(),
+                target_entry_id: k.target_entry.as_ref().map(|id| id.0.clone()),
+            };
+            let editions = std::iter::once(&chosen)
+                .chain(&members)
+                .map(edition)
+                .collect();
+            RelatedSuggestion {
+                kind: chosen.suggestion.kind_name,
+                direction: chosen.suggestion.direction,
+                evidence: chosen.suggestion.evidence,
+                store: chosen.suggestion.store,
+                target: chosen.suggestion.target,
+                target_entry_id: chosen.target_entry.map(|id| id.0),
+                relation_exists,
+                editions,
+            }
+        })
+        .collect()
 }
 
 pub(crate) async fn entry_related(
@@ -448,7 +554,7 @@ pub(crate) async fn entry_related(
     let relations = store
         .relations_for_entry(&id)
         .map_err(|error| store_error("load relations", error))?;
-    let suggestions = suggestions
+    let known = suggestions
         .into_iter()
         .map(|suggestion| {
             let target_entry = bound_entry(
@@ -466,18 +572,16 @@ pub(crate) async fn entry_related(
                     &ends(&id, target, suggestion.direction),
                 )
             });
-            Ok(RelatedSuggestion {
-                kind: suggestion.kind_name,
-                direction: suggestion.direction,
-                evidence: suggestion.evidence,
-                store: suggestion.store,
-                target: suggestion.target,
-                target_entry_id: target_entry.map(|id| id.0),
+            Ok(Known {
+                suggestion,
+                target_entry,
                 relation_exists,
             })
         })
         .collect::<Result<_, ApiErr>>()?;
-    Ok(Json(RelatedResponse { suggestions }))
+    Ok(Json(RelatedResponse {
+        suggestions: fold_editions(known),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -579,6 +683,7 @@ mod tests {
     const TRACK_URL: &str = "https://musicbrainz.org/recording/t";
     const TRACK_ALT_URL: &str = "https://youtu.be/t";
     const ALBUM_URL: &str = "https://musicbrainz.org/release/a";
+    const ALBUM_EDITION_URL: &str = "https://www.discogs.com/release/b";
 
     fn track() -> Value {
         json!({"store_id": "1", "title": "Track", "kind": "track", "subtitle": "Artist",
@@ -587,7 +692,14 @@ mod tests {
 
     fn album() -> Value {
         json!({"store_id": "2", "title": "Album", "kind": "release",
-               "canonical_url": ALBUM_URL, "urls": [ALBUM_URL]})
+               "canonical_url": ALBUM_URL, "urls": [ALBUM_URL], "edition_group": "rg:9"})
+    }
+
+    /// Another edition of `album`.
+    fn album_edition() -> Value {
+        json!({"store_id": "3", "title": "Album (Limited)", "kind": "release",
+               "canonical_url": ALBUM_EDITION_URL, "urls": [ALBUM_EDITION_URL],
+               "edition_group": "rg:9"})
     }
 
     /// A musiclib stand-in: track 1 on album 2.
@@ -625,6 +737,7 @@ mod tests {
                     match q["query"].as_str() {
                         TRACK_URL | TRACK_ALT_URL => Ok(Json(json!({"store_id": "1"}))),
                         ALBUM_URL => Ok(Json(json!({"store_id": "2"}))),
+                        ALBUM_EDITION_URL => Ok(Json(json!({"store_id": "3"}))),
                         _ => Err((
                             StatusCode::NOT_FOUND,
                             Json(json!({"code": "not_found", "message": "no"})),
@@ -635,7 +748,11 @@ mod tests {
             .route(
                 "/nrs-store/v1/entries/{id}",
                 get(|Path(id): Path<String>| async move {
-                    let mut meta = if id == "1" { track() } else { album() };
+                    let mut meta = match id.as_str() {
+                        "1" => track(),
+                        "2" => album(),
+                        _ => album_edition(),
+                    };
                     meta["extra"] = json!({});
                     Json(meta)
                 }),
@@ -646,11 +763,14 @@ mod tests {
                     |Path(id): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
                         let both = q.get("directions").map(String::as_str) == Some("both");
                         let suggestions = match (id.as_str(), both) {
-                            ("1", true) => {
-                                vec![json!({"kind": "contains", "direction": "incoming",
-                                "target_store_id": "2", "target": album(),
-                                "confidence": 1.0, "evidence": "tracklist track 1"})]
-                            }
+                            ("1", true) => vec![
+                                json!({"kind": "contains", "direction": "incoming",
+                                    "target_store_id": "2", "target": album(),
+                                    "confidence": 1.0, "evidence": "tracklist track 1"}),
+                                json!({"kind": "contains", "direction": "incoming",
+                                    "target_store_id": "3", "target": album_edition(),
+                                    "confidence": 1.0, "evidence": "tracklist track 1"}),
+                            ],
                             ("2", _) => vec![json!({"kind": "contains", "direction": "outgoing",
                                 "target_store_id": "1", "target": track(),
                                 "confidence": 1.0, "evidence": "tracklist track 1"})],
@@ -784,10 +904,12 @@ mod tests {
             .await
             .unwrap()
             .0;
+        // Both editions of the album are one suggestion.
         assert_eq!(related.suggestions.len(), 1);
         let suggestion = &related.suggestions[0];
         assert_eq!(suggestion.direction, Direction::Incoming);
         assert_eq!(suggestion.target.title, "Album");
+        assert_eq!(suggestion.editions.len(), 2);
         assert_eq!(suggestion.target_entry_id, None);
         assert!(!suggestion.relation_exists);
 
@@ -820,6 +942,47 @@ mod tests {
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].kind, RelKind::Contains);
         assert_eq!(relations[0].from, EntryId(album_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn related_prefers_the_edition_nrs_has() {
+        let mut store = nrs_store::Store::open_in_memory().unwrap();
+        let track = store.add_entry("url", TRACK_URL, Some("Track")).unwrap();
+        let limited = store
+            .add_entry("url", ALBUM_EDITION_URL, Some("Album (Limited)"))
+            .unwrap();
+        let state = state_with(store).await;
+
+        let related = entry_related(State(state.clone()), Path(track.0.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(related.suggestions.len(), 1);
+        let suggestion = &related.suggestions[0];
+        assert_eq!(suggestion.target.store_id, "3");
+        assert_eq!(
+            suggestion.target_entry_id.as_deref(),
+            Some(limited.0.as_str())
+        );
+        assert_eq!(suggestion.editions[1].target.store_id, "2");
+
+        let added = entry_related_add(
+            State(state.clone()),
+            Path(track.0.clone()),
+            Json(RelatedAddRequest {
+                items: vec![RelatedPick {
+                    store_id: "3".into(),
+                    kind: "contains".into(),
+                    direction: Direction::Incoming,
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!((added.entries_added, added.relations_added), (0, 1));
+        let related = entry_related(State(state), Path(track.0)).await.unwrap().0;
+        assert!(related.suggestions[0].relation_exists);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -476,6 +476,8 @@ h2 { font-size: 1.25rem; margin-bottom: .25rem; }
 .related-what { min-width: 0; display: flex; align-items: baseline; gap: .4rem; }
 .related-phrase { color: var(--bone-500); font-size: .7rem; white-space: nowrap; }
 .related-details { grid-column: 2 / -1; color: var(--bone-700); font-size: .66rem; overflow-wrap: anywhere; }
+.related-editions { margin-left: .6rem; color: var(--bone-500); }
+select.related-editions { max-width: 100%; padding: .1rem .3rem; border: 1px solid var(--ink-600); border-radius: .25rem; background: var(--ink-850); font-size: .66rem; }
 .related-actions { display: flex; justify-content: flex-end; align-items: center; gap: 1rem; padding: .6rem .85rem; }
 
 .store-hits { margin-top: 2rem; }

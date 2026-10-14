@@ -791,7 +791,8 @@ function candidateRow(candidate, index) {
 
 /** A store search result: "in NRS" when bound, else an add button. */
 function storeHitRow(hit, index) {
-  const subtitle = hit.subtitle ? `<span class="hit-subtitle">${escapeHtml(hit.subtitle)}</span>` : "";
+  const editions = hit.other_editions ? ` · +${hit.other_editions} edition${hit.other_editions === 1 ? "" : "s"}` : "";
+  const subtitle = hit.subtitle || editions ? `<span class="hit-subtitle">${escapeHtml((hit.subtitle || "") + editions)}</span>` : "";
   let host = hit.store;
   try {
     if (hit.canonical_url) host = new URL(hit.canonical_url).hostname.replace(/^www\./, "");
@@ -1056,8 +1057,12 @@ async function bindRelated(data) {
     event.preventDefault();
     const items = boxes()
       .filter((box) => box.checked)
-      .map((box) => open[Number(box.value)])
-      .map((suggestion) => ({ store_id: suggestion.target.store_id, kind: suggestion.kind, direction: suggestion.direction }));
+      .map((box) => {
+        const suggestion = open[Number(box.value)];
+        const edition = form.querySelector(`select[name="edition-${box.value}"]`);
+        const storeId = edition instanceof HTMLSelectElement ? edition.value : suggestion.target.store_id;
+        return { store_id: storeId, kind: suggestion.kind, direction: suggestion.direction };
+      });
     if (!items.length) return;
     const button = form.querySelector('button[type="submit"]');
     if (button instanceof HTMLButtonElement) button.disabled = true;
@@ -1073,6 +1078,16 @@ async function bindRelated(data) {
   });
 }
 
+/** An edition in a picker: its title, where it's from, and its date. */
+function editionLabel(edition) {
+  let host = "";
+  try {
+    host = new URL(edition.canonical_url).hostname.replace(/^www\./, "");
+  } catch {}
+  const parts = [edition.title, host, edition.release_date?.slice(0, 10), `${edition.urls?.length || 0} links`];
+  return parts.filter(Boolean).join(" · ");
+}
+
 function relatedPhrase(suggestion) {
   if (suggestion.kind === "contains") return suggestion.direction === "incoming" ? "on" : "contains";
   return suggestion.direction === "incoming" ? `${suggestion.kind} of` : suggestion.kind;
@@ -1084,11 +1099,21 @@ function relatedRow(suggestion, index) {
     ? `<a class="relation-title" href="${pathForEntry(suggestion.target_entry_id)}" data-link>${escapeHtml(target.title)}</a>`
     : `<span class="relation-title">${escapeHtml(target.title)}</span>`;
   const details = [suggestion.evidence, target.subtitle, target.release_date?.slice(0, 10)].filter(Boolean);
+  const editions = suggestion.editions || [];
+  // Several editions of one work: NRS's one is already chosen, else pick.
+  let editionPicker = "";
+  if (editions.length > 1 && suggestion.target_entry_id) {
+    editionPicker = `<span class="related-editions">${editions.length} editions</span>`;
+  } else if (editions.length > 1) {
+    editionPicker = `<select class="related-editions" name="edition-${index}" aria-label="edition to add">
+      ${editions.map(({ target: edition }) => `<option value="${escapeHtml(edition.store_id)}">${escapeHtml(editionLabel(edition))}</option>`).join("")}
+    </select>`;
+  }
   return `<label class="relation-row related-row">
     <input type="checkbox" name="pick" value="${index}" ${suggestion.direction === "incoming" ? "checked" : ""}>
     <span class="related-what"><span class="related-phrase">${escapeHtml(relatedPhrase(suggestion))}</span>${title}</span>
     <span class="relation-kind">${storeKindTag(target.kind)} ${suggestion.target_entry_id ? "in NRS" : "new entry"}</span>
-    <span class="related-details">${escapeHtml(details.join(" · "))}</span>
+    <span class="related-details">${escapeHtml(details.join(" · "))}${editionPicker}</span>
   </label>`;
 }
 
