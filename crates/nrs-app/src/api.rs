@@ -2,7 +2,9 @@
 
 mod adopt;
 
-pub(crate) use adopt::{entry_adopt, entry_related, entry_related_add, stores_search};
+pub(crate) use adopt::{
+    entry_adopt, entry_related, entry_related_add, store_discover, stores_search,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,5 +1,6 @@
 //! Adopting type-store entries into NRS without pasting URLs: searching
-//! what both stores already hold (`stores_search`), binding one result
+//! what both stores already hold (`stores_search`), what their providers
+//! know (`store_discover`, e.g. a season of anime), binding one result
 //! (`entry_adopt`), and the relations a store suggests around an entry,
 //! with the entries at their other ends (`entry_related`,
 //! `entry_related_add`).
@@ -15,7 +16,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use nrs_core::{EntryId, RelKind};
 use nrs_entry_store::{
-    Direction, Directions, EntryMeta, EntryStore as _, EntrySummary, HttpEntryStore,
+    Candidate, Direction, Directions, EntryMeta, EntryStore as _, EntrySummary, HttpEntryStore,
 };
 use serde::{Deserialize, Serialize};
 
@@ -232,6 +233,73 @@ pub(crate) async fn stores_search(
         })
         .collect::<Result<_, ApiErr>>()?;
     Ok(Json(StoreSearchResponse { results, errors }))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DiscoverQuery {
+    q: Option<String>,
+    season: Option<String>,
+    kind: Option<String>,
+    page: Option<u32>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DiscoverResponse {
+    candidates: Vec<DiscoverHit>,
+    next_page: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct DiscoverHit {
+    #[serde(flatten)]
+    candidate: Candidate,
+    /// The NRS entry already bound to it.
+    entry_id: Option<String>,
+}
+
+/// One page of a store's `discover`: `q` or `season`. A candidate is added
+/// through `entry_ingest` with its `query`.
+pub(crate) async fn store_discover(
+    State(state): State<Arc<AppState>>,
+    Path(store_name): Path<StoreName>,
+    Query(query): Query<DiscoverQuery>,
+) -> ApiResult<DiscoverResponse> {
+    drop(locked_store(&state)?);
+    let filter = match (query.q, query.season) {
+        (Some(q), None) if !q.trim().is_empty() => ("q", q.trim().to_string()),
+        (None, Some(season)) => ("season", season),
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "give exactly one of q and season",
+            ))
+        }
+    };
+    let client = store_name.client(&state);
+    let (kind, page) = (query.kind, query.page.unwrap_or(1));
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let found = blocking("discover store records", move || {
+        client.discover((filter.0, &filter.1), kind.as_deref(), limit, page)
+    })
+    .await?;
+    let store = locked_store(&state)?;
+    let candidates = found
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            let urls = candidate.canonical_url.iter().chain(&candidate.urls);
+            let entry_id = bound_entry(&store, urls.chain(std::iter::once(&candidate.query)))?;
+            Ok(DiscoverHit {
+                candidate,
+                entry_id: entry_id.map(|id| id.0),
+            })
+        })
+        .collect::<Result<_, ApiErr>>()?;
+    Ok(Json(DiscoverResponse {
+        candidates,
+        next_page: found.next_page,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -530,13 +598,26 @@ mod tests {
                 get(|| async {
                     Json(json!({"store": "musiclib", "protocol_version": "0.3",
                         "operations": {"resolve": true, "lookup": true, "search": true,
-                                       "ingest": false, "suggest_relations": true},
+                                       "discover": true, "ingest": false,
+                                       "suggest_relations": true},
+                        "discover": {"filters": ["q"]},
                         "jobs": {"streaming": false}}))
                 }),
             )
             .route(
                 "/nrs-store/v1/search",
                 get(|| async { Json(json!({"results": [track()]})) }),
+            )
+            .route(
+                "/nrs-store/v1/discover",
+                get(|| async {
+                    Json(json!({"candidates": [
+                        {"query": TRACK_ALT_URL, "store_id": "1", "title": "Track",
+                         "kind": "track", "urls": [TRACK_ALT_URL]},
+                        {"query": "https://example.com/new", "store_id": null,
+                         "title": "New", "kind": "track"},
+                    ], "next_page": 2}))
+                }),
             )
             .route(
                 "/nrs-store/v1/lookup",
@@ -565,9 +646,11 @@ mod tests {
                     |Path(id): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
                         let both = q.get("directions").map(String::as_str) == Some("both");
                         let suggestions = match (id.as_str(), both) {
-                            ("1", true) => vec![json!({"kind": "contains", "direction": "incoming",
+                            ("1", true) => {
+                                vec![json!({"kind": "contains", "direction": "incoming",
                                 "target_store_id": "2", "target": album(),
-                                "confidence": 1.0, "evidence": "tracklist track 1"})],
+                                "confidence": 1.0, "evidence": "tracklist track 1"})]
+                            }
                             ("2", _) => vec![json!({"kind": "contains", "direction": "outgoing",
                                 "target_store_id": "1", "target": track(),
                                 "confidence": 1.0, "evidence": "tracklist track 1"})],
@@ -608,7 +691,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn search_marks_entries_bound_under_any_store_url() {
         let mut store = nrs_store::Store::open_in_memory().unwrap();
-        let bound = store.add_entry("url", TRACK_ALT_URL, Some("Track")).unwrap();
+        let bound = store
+            .add_entry("url", TRACK_ALT_URL, Some("Track"))
+            .unwrap();
         let state = state_with(store).await;
 
         let response = stores_search(State(state), search_query("track"))
@@ -617,10 +702,52 @@ mod tests {
             .0;
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].store, StoreName::Music);
-        assert_eq!(response.results[0].entry_id.as_deref(), Some(bound.0.as_str()));
+        assert_eq!(
+            response.results[0].entry_id.as_deref(),
+            Some(bound.0.as_str())
+        );
         // The unreachable anime store is reported, not fatal.
         assert_eq!(response.errors.len(), 1);
         assert!(response.errors[0].starts_with("anime store:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discover_marks_bound_candidates() {
+        let mut store = nrs_store::Store::open_in_memory().unwrap();
+        let bound = store
+            .add_entry("url", TRACK_ALT_URL, Some("Track"))
+            .unwrap();
+        let state = state_with(store).await;
+        let discover = |q: Option<&str>, season: Option<&str>| {
+            store_discover(
+                State(state.clone()),
+                Path(StoreName::Music),
+                Query(DiscoverQuery {
+                    q: q.map(String::from),
+                    season: season.map(String::from),
+                    kind: None,
+                    page: None,
+                    limit: None,
+                }),
+            )
+        };
+
+        let page = discover(Some("track"), None).await.unwrap().0;
+        assert_eq!(page.next_page, Some(2));
+        assert_eq!(
+            page.candidates[0].entry_id.as_deref(),
+            Some(bound.0.as_str())
+        );
+        assert_eq!(page.candidates[1].entry_id, None);
+
+        for (q, season) in [
+            (None, None),
+            (Some("a"), Some("2026-fall")),
+            (Some(" "), None),
+        ] {
+            let result = discover(q, season).await;
+            assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -644,7 +771,11 @@ mod tests {
                 Some(EntryId(track_id.clone()))
             );
             assert_eq!(
-                store.entry_kinds().unwrap().get(&track_id).map(String::as_str),
+                store
+                    .entry_kinds()
+                    .unwrap()
+                    .get(&track_id)
+                    .map(String::as_str),
                 Some("track")
             );
         }

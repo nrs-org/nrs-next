@@ -213,6 +213,7 @@ async fn main() {
         .route("/entries/ingest", post(api::entry_ingest))
         .route("/entries/adopt", post(api::entry_adopt))
         .route("/stores/search", get(api::stores_search))
+        .route("/stores/{store}/discover", get(api::store_discover))
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
         .route("/entries/{entry_id}/impacts", post(api::impact_add))

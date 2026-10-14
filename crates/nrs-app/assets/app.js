@@ -237,7 +237,7 @@ app.addEventListener("toggle", (event) => {
 
 function setActiveNav() {
   const segment = location.pathname.split("/")[1];
-  const active = ["palette", "calibrate", "kfeat", "review", "entries"].includes(segment)
+  const active = ["palette", "calibrate", "kfeat", "review", "entries", "seasons"].includes(segment)
     ? segment
     : "scores";
   document.querySelectorAll(".rail nav a[data-nav]").forEach((anchor) => {
@@ -608,6 +608,11 @@ async function renderEntries() {
       <div class="entry-list store-hit-list"></div>
       <p class="dim store-hit-errors" hidden></p>
     </section>
+    <section class="store-hits discover-hits" hidden>
+      <h2>On AniList <span class="count"></span></h2>
+      <p class="muted entry-subtitle">Anime and manga the anime store hasn't fetched yet. Adding one fetches it, then makes it an NRS entry.</p>
+      <div class="entry-list discover-list"></div>
+    </section>
   `;
   const ingest = app.querySelector(".ingest-form");
   const input = app.querySelector(".search");
@@ -660,13 +665,22 @@ async function renderEntries() {
   const hitList = app.querySelector(".store-hit-list");
   const hitErrors = app.querySelector(".store-hit-errors");
   if (!(hits instanceof HTMLElement) || !(hitList instanceof HTMLElement) || !(hitErrors instanceof HTMLElement)) return;
+  const discoverHits = app.querySelector(".discover-hits");
+  const discoverList = app.querySelector(".discover-list");
+  if (!(discoverHits instanceof HTMLElement) || !(discoverList instanceof HTMLElement)) return;
   let storeSearch = null;
+  let discoverSearch = null;
   let hitData = [];
-  pageTeardown = () => storeSearch?.abort();
+  let discoverData = [];
+  pageTeardown = () => {
+    storeSearch?.abort();
+    discoverSearch?.abort();
+  };
   // Separate from getJson, which would abort the entry list's request.
   async function loadStoreHits() {
     const q = input.value.trim();
     storeSearch?.abort();
+    loadDiscover(q);
     if (q.length < 2) {
       hits.hidden = true;
       return;
@@ -686,12 +700,55 @@ async function renderEntries() {
       hitErrors.hidden = !body.errors.length;
       hitErrors.textContent = body.errors.join("; ");
       hits.hidden = false;
+      renderDiscover();
     } catch (error) {
       if (error?.name === "AbortError") return;
       hitList.innerHTML = `<p class="empty">${escapeHtml(error?.message || String(error))}</p>`;
       hits.hidden = false;
     }
   }
+  // AniList through the anime store's discover: slower, so it fills in
+  // on its own.
+  async function loadDiscover(q) {
+    discoverSearch?.abort();
+    discoverData = [];
+    if (q.length < 3) {
+      discoverHits.hidden = true;
+      return;
+    }
+    const controller = (discoverSearch = new AbortController());
+    try {
+      const response = await fetch(`/api/v1/stores/anime/discover?${new URLSearchParams({ q })}`, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `${response.status} ${response.statusText}`);
+      discoverData = body.candidates;
+      renderDiscover();
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      discoverList.innerHTML = `<p class="empty">${escapeHtml(error?.message || String(error))}</p>`;
+      discoverHits.hidden = false;
+    }
+  }
+  // Candidates the store search above doesn't already list.
+  function renderDiscover() {
+    const listed = new Set(hitData.filter((hit) => hit.store === "anime").map((hit) => hit.store_id));
+    const shown = discoverData.map((candidate, index) => [candidate, index]).filter(([candidate]) => !listed.has(candidate.store_id));
+    discoverHits.hidden = !discoverData.length;
+    discoverHits.querySelector("h2 .count").textContent = `${shown.filter(([candidate]) => !candidate.entry_id).length} not in NRS`;
+    discoverList.innerHTML = shown.length
+      ? shown.map(([candidate, index]) => candidateRow(candidate, index)).join("")
+      : `<p class="empty">Everything AniList found is listed above.</p>`;
+  }
+  discoverList.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("[data-ingest]") : null;
+    if (!(button instanceof HTMLButtonElement)) return;
+    const candidate = discoverData[Number(button.dataset.ingest)];
+    const id = await ingestCandidate(candidate, button);
+    if (id) navigate(pathForEntry(id));
+  });
   hitList.addEventListener("click", async (event) => {
     const button = event.target instanceof Element ? event.target.closest("[data-adopt]") : null;
     if (!(button instanceof HTMLButtonElement)) return;
@@ -707,6 +764,29 @@ async function renderEntries() {
   });
 
   await load();
+}
+
+/**
+ * Ingests a discover candidate through the anime or music store (which
+ * fetches it from its providers) into an NRS entry; the entry's id, or
+ * null after showing why not.
+ */
+async function ingestCandidate(candidate, button) {
+  button.disabled = true;
+  button.textContent = "adding…";
+  try {
+    return (await sendJson("/api/v1/entries/ingest", "POST", { query: candidate.query })).id;
+  } catch (reason) {
+    showToast(reason?.message || String(reason), "error");
+    button.disabled = false;
+    button.textContent = "add";
+    return null;
+  }
+}
+
+/** A discover candidate as an entries-page row (see `storeHitRow`). */
+function candidateRow(candidate, index) {
+  return storeHitRow({ ...candidate, store: "anilist" }, index).replace(`data-adopt="${index}"`, `data-ingest="${index}"`);
 }
 
 /** A store search result: "in NRS" when bound, else an add button. */
@@ -2221,6 +2301,120 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
   }
 }
 
+const seasonNames = ["winter", "spring", "summer", "fall"];
+
+function currentSeason(date = new Date()) {
+  return `${date.getFullYear()}-${seasonNames[Math.floor(date.getMonth() / 3)]}`;
+}
+
+function shiftSeason(season, by) {
+  const [year, name] = season.split("-");
+  const index = seasonNames.indexOf(name) + by;
+  return `${Number(year) + Math.floor(index / 4)}-${seasonNames[((index % 4) + 4) % 4]}`;
+}
+
+function seasonLabel(season) {
+  const [year, name] = season.split("-");
+  return `${name} ${year}`;
+}
+
+/**
+ * A season's anime from AniList (the anime store's discover), most
+ * popular first, each marked in NRS or addable in place.
+ */
+async function renderSeasons() {
+  currentEntryData = null;
+  const asked = new URLSearchParams(location.search).get("season") || "";
+  const season = /^\d{4}-(winter|spring|summer|fall)$/.test(asked) ? asked : currentSeason();
+  const hideKey = "nrs.seasons.hideAdopted";
+  let hideAdopted = false;
+  try {
+    hideAdopted = localStorage.getItem(hideKey) === "1";
+  } catch {}
+  document.title = `${seasonLabel(season)} — NRS`;
+  const link = (target, label) => `<a class="button" href="/seasons?season=${target}" data-link>${label}</a>`;
+  app.innerHTML = `
+    <h1>seasons</h1>
+    <p class="muted entry-subtitle">A season's anime on AniList, most popular first. Adding one fetches it into the anime store and makes it an NRS entry.</p>
+    <div class="toolbar season-bar">
+      ${link(shiftSeason(season, -1), `‹ ${seasonLabel(shiftSeason(season, -1))}`)}
+      <h2 class="season-name">${escapeHtml(seasonLabel(season))}</h2>
+      ${link(shiftSeason(season, 1), `${seasonLabel(shiftSeason(season, 1))} ›`)}
+      ${season === currentSeason() ? "" : link(currentSeason(), "now")}
+      <label class="season-toggle"><input type="checkbox" class="hide-adopted" ${hideAdopted ? "checked" : ""}> hide entries in NRS</label>
+    </div>
+    <p class="entry-count">…</p>
+    <div class="season-grid"><p class="loading">Loading ${escapeHtml(seasonLabel(season))}…</p></div>
+    <div class="section-actions"><button class="button season-more" type="button" hidden>load more</button></div>
+  `;
+  const grid = app.querySelector(".season-grid");
+  const count = app.querySelector(".entry-count");
+  const more = app.querySelector(".season-more");
+  const toggle = app.querySelector(".hide-adopted");
+  if (!(grid instanceof HTMLElement) || !(count instanceof HTMLElement) || !(more instanceof HTMLButtonElement) || !(toggle instanceof HTMLInputElement)) return;
+  const shows = [];
+  let nextPage = 1;
+
+  const paint = () => {
+    const visible = shows.map((show, index) => [show, index]).filter(([show]) => !(hideAdopted && show.entry_id));
+    const adopted = shows.filter((show) => show.entry_id).length;
+    count.textContent = `${shows.length}${nextPage ? "+" : ""} shows · ${adopted} in NRS`;
+    grid.innerHTML = visible.length
+      ? visible.map(([show, index]) => seasonCard(show, index)).join("")
+      : `<p class="empty">${shows.length ? "Every show loaded so far is in NRS." : "AniList lists nothing for this season."}</p>`;
+    more.hidden = !nextPage;
+  };
+  async function loadPage() {
+    more.disabled = true;
+    try {
+      const data = await getJson(`/api/v1/stores/anime/discover?${new URLSearchParams({ season, page: String(nextPage), limit: "50" })}`);
+      shows.push(...data.candidates);
+      nextPage = data.next_page;
+      paint();
+    } catch (error) {
+      renderError(error);
+    } finally {
+      more.disabled = false;
+    }
+  }
+  more.addEventListener("click", loadPage);
+  toggle.addEventListener("change", () => {
+    hideAdopted = toggle.checked;
+    try {
+      localStorage.setItem(hideKey, hideAdopted ? "1" : "0");
+    } catch {}
+    paint();
+  });
+  grid.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("[data-ingest]") : null;
+    if (!(button instanceof HTMLButtonElement)) return;
+    const show = shows[Number(button.dataset.ingest)];
+    const id = await ingestCandidate(show, button);
+    if (!id) return;
+    show.entry_id = id;
+    showToast(`Added ${show.title}`);
+    paint();
+  });
+  await loadPage();
+}
+
+function seasonCard(show, index) {
+  const cover = show.cover_url
+    ? `<img class="season-cover" src="${escapeHtml(show.cover_url)}" alt="" loading="lazy">`
+    : `<div class="season-cover"></div>`;
+  const action = show.entry_id
+    ? `<a class="link-button" href="${pathForEntry(show.entry_id)}" data-link>in NRS</a>`
+    : `<button class="button" type="button" data-ingest="${index}">add</button>`;
+  return `<article class="season-card${show.entry_id ? " adopted" : ""}">
+    ${cover}
+    <div class="season-copy">
+      <a class="season-title" href="${escapeHtml(show.canonical_url || show.query)}" target="_blank" rel="noopener">${escapeHtml(show.title)}</a>
+      ${show.subtitle ? `<p class="hit-subtitle">${escapeHtml(show.subtitle)}</p>` : ""}
+      <div class="season-action">${storeKindTag(show.kind)}${action}</div>
+    </div>
+  </article>`;
+}
+
 function route() {
   routeVersion++;
   pageTeardown?.();
@@ -2234,6 +2428,8 @@ function route() {
     renderEntry(decodeURIComponent(match[1]));
   } else if (/^\/entries\/?$/.test(location.pathname)) {
     renderEntries();
+  } else if (/^\/seasons\/?$/.test(location.pathname)) {
+    renderSeasons();
   } else if (/^\/palette\/?$/.test(location.pathname)) {
     renderPalette();
   } else if (/^\/calibrate\/?$/.test(location.pathname)) {
