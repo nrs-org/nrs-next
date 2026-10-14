@@ -33,9 +33,14 @@ Usage: strip_xml.py [SRC_DIR] [OUT_DIR]   (defaults: ../nrs-impl/nrs,
 from __future__ import annotations
 
 import csv
+import json
+import os
 import shutil
 import sqlite3
 import sys
+import time
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -44,7 +49,15 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BINDINGS = HERE / "bindings.tsv"
 MUSICLIB_DB = ROOT / "musiclib.db"
-ANIME_DB = ROOT.parent / "nrs-anime-store-go" / "anime.db"
+# The anime store is read over the Store Protocol, like the importer does.
+ANIME_STORE_URL = os.environ.get("NRS_ANIME_STORE_URL", "http://127.0.0.1:3738")
+# stores::is_anime_store_url
+ANIME_STORE_PREFIXES = (
+    "https://myanimelist.net/",
+    "https://anilist.co/",
+    "https://vndb.org/",
+    "https://kitsu.app/",
+)
 MUSIC_LENGTH_SLACK_S = 10
 EPISODE_LENGTH_SLACK_S = 60
 DEFAULT_EPISODE_S = 20 * 60
@@ -141,7 +154,7 @@ class StoreProgress:
 
     def __init__(self):
         self.music = sqlite3.connect(f"file:{MUSICLIB_DB}?mode=ro", uri=True)
-        self.anime = sqlite3.connect(f"file:{ANIME_DB}?mode=ro", uri=True)
+        self.anime: dict[str, tuple[int | None, int | None]] = {}
 
     def track_seconds(self, url: str) -> float | None:
         row = self.music.execute(
@@ -155,16 +168,21 @@ class StoreProgress:
         return row[0] / 1000 if row else None
 
     def anime_basis(self, url: str) -> tuple[int | None, int | None]:
-        parts = url.rstrip("/").split("/")
-        if "myanimelist.net" not in url or len(parts) < 5:
+        """The anime store's episode count and length for `url`, the way
+        `stores::load_anime` reads them: ingest the bind URL, then resolve."""
+        if not url.startswith(ANIME_STORE_PREFIXES):
             return None, None
-        row = self.anime.execute(
-            "SELECT json_extract(e.extra, '$.progress_basis.episode_count'), "
-            "json_extract(e.extra, '$.progress_basis.episode_duration_seconds') "
-            "FROM external_id x JOIN entry e ON e.id = x.entry_id WHERE x.provider_id = ?",
-            (f"mal:{parts[3]}:{parts[4]}",),
-        ).fetchone()
-        return (row[0], row[1]) if row else (None, None)
+        if url not in self.anime:
+            store_id = anime_store_ingest(url)
+            basis = (
+                anime_store_get(f"entries/{urllib.parse.quote(store_id, safe='')}")["extra"].get(
+                    "progress_basis", {}
+                )
+                if store_id
+                else {}
+            )
+            self.anime[url] = (basis.get("episode_count"), basis.get("episode_duration_seconds"))
+        return self.anime[url]
 
     @staticmethod
     def filled_episode_seconds(store_seconds: int | None) -> int:
@@ -172,6 +190,32 @@ class StoreProgress:
         if store_seconds and not 15 * 60 <= store_seconds < 30 * 60:
             return store_seconds
         return DEFAULT_EPISODE_S
+
+
+def anime_store_get(path: str) -> dict:
+    with urllib.request.urlopen(f"{ANIME_STORE_URL}/nrs-store/v1/{path}", timeout=30) as response:
+        return json.load(response)
+
+
+def anime_store_ingest(url: str, timeout_s: float = 300) -> str | None:
+    """The store ID `url` ingests to, or None when the store can't ingest it."""
+    request = urllib.request.Request(
+        f"{ANIME_STORE_URL}/nrs-store/v1/ingest",
+        data=json.dumps({"query": url}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        job_id = json.load(response)["job_id"]
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        job = anime_store_get(f"jobs/{job_id}")
+        if job["status"] == "succeeded":
+            return job["result"]["store_id"]
+        if job["status"] in ("failed", "canceled"):
+            print(f"anime store: {url}: {job.get('error')}", file=sys.stderr)
+            return None
+        time.sleep(0.25)
+    raise TimeoutError(f"anime store ingest of {url} did not finish in {timeout_s} s")
 
 
 def parse(path: Path) -> tuple[str, ET.Element]:
