@@ -353,6 +353,39 @@ fn music_length_ms(sources: &[Value], bound: &str) -> Option<i64> {
         .map(|(_, ms)| ms)
 }
 
+/// An anime-store entry URL in the shape `<bind url>`s pin
+/// (`https://myanimelist.net/anime/5114`, `https://vndb.org/v17`): no
+/// `www.`, slug, query or fragment. `None` when `url` isn't one.
+pub fn canonical_anime_url(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let mut parts = rest.split('/');
+    let host = parts.next()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let numeric = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+    match host {
+        "myanimelist.net" | "anilist.co" | "kitsu.app" => {
+            let kind = parts
+                .next()
+                .filter(|kind| matches!(*kind, "anime" | "manga"))?;
+            // Kitsu also addresses entries by slug.
+            let id = parts
+                .next()
+                .filter(|id| numeric(id) || (host == "kitsu.app" && !id.is_empty()))?;
+            Some(format!("https://{host}/{kind}/{id}"))
+        }
+        "vndb.org" => {
+            let id = parts
+                .next()
+                .filter(|id| id.strip_prefix('v').is_some_and(numeric))?;
+            Some(format!("https://vndb.org/{id}"))
+        }
+        _ => None,
+    }
+}
+
 /// URLs the anime store can ingest (anime, manga/novels, visual novels).
 fn is_anime_store_url(url: &str) -> bool {
     [
@@ -410,6 +443,36 @@ fn load_anime(
 mod tests {
     use super::*;
     use crate::xml::parse_str;
+
+    #[test]
+    fn canonical_anime_url_strips_to_the_bind_shape() {
+        let canonical = |url| canonical_anime_url(url);
+        assert_eq!(
+            canonical("https://myanimelist.net/anime/5114/Fullmetal_Alchemist__Brotherhood?q=1")
+                .as_deref(),
+            Some("https://myanimelist.net/anime/5114")
+        );
+        assert_eq!(
+            canonical("http://www.myanimelist.net/manga/2/").as_deref(),
+            Some("https://myanimelist.net/manga/2")
+        );
+        assert_eq!(
+            canonical("https://anilist.co/anime/1535/Death-Note/").as_deref(),
+            Some("https://anilist.co/anime/1535")
+        );
+        assert_eq!(
+            canonical("https://vndb.org/v17#main").as_deref(),
+            Some("https://vndb.org/v17")
+        );
+        assert_eq!(
+            canonical("https://kitsu.app/anime/death-note").as_deref(),
+            Some("https://kitsu.app/anime/death-note")
+        );
+        assert_eq!(canonical("https://myanimelist.net/people/1"), None);
+        assert_eq!(canonical("https://vndb.org/r17"), None);
+        assert_eq!(canonical("https://vgmdb.net/album/104418"), None);
+        assert_eq!(canonical("mal:5114"), None);
+    }
 
     fn doc(xml: &str) -> ParsedDocument {
         let doc = parse_str(xml, time::macros::date!(2020 - 01 - 01)).unwrap();

@@ -546,9 +546,9 @@ async function renderEntries() {
   document.title = "Entries — NRS";
   app.innerHTML = `
     <h1>entries</h1>
-    <p class="muted entry-subtitle">Paste a provider URL or ID to ingest it through the anime store, or pick an existing entry.</p>
+    <p class="muted entry-subtitle">Paste an entry URL to ingest it through the anime or music store, or pick an existing entry.</p>
     <form class="ingest-form">
-      ${textField({}, "query", "anime, manga, novel, or visual novel URL / provider ID", "", "text", 'placeholder="https://anilist.co/anime/1535 or mal:5114" required')}
+      ${textField({}, "query", "anime, manga, novel, visual novel, or music URL", "", "url", 'placeholder="https://myanimelist.net/anime/5114 or https://vgmdb.net/album/104418" required')}
       <button class="button primary" type="submit">ingest</button>
       <p class="form-error" hidden></p>
     </form>

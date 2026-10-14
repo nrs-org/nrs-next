@@ -18,7 +18,7 @@ pub use legacy::*;
 pub use snapshot::{build_snapshot, BuildExtras};
 pub use store::{import_extras, write_snapshot};
 pub use stores::{
-    apply_store_facts, load_store_facts, progress_basis, resolve_binds, ProgressBasis, StoreFacts,
-    StoreSources,
+    apply_store_facts, canonical_anime_url, load_store_facts, progress_basis, resolve_binds,
+    ProgressBasis, StoreFacts, StoreSources,
 };
 pub use xml::{parse_file, ImportError, ParsedDocument};

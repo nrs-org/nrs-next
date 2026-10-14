@@ -97,21 +97,44 @@ pub(super) async fn entry_ingest(
         ));
     }
     let query = request.query.trim().to_string();
-    if query.is_empty() {
+    if !(query.starts_with("https://") || query.starts_with("http://")) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "ingest query must not be empty",
+            "paste the entry's http(s) URL",
         ));
     }
-    let anime_store = state.anime_store.clone();
-    let (store_id, metadata) = tokio::task::spawn_blocking(move || {
-        let store_id = anime_store.ingest(&query)?;
-        let metadata = anime_store.resolve(&store_id)?;
-        Ok::<_, nrs_entry_store::Error>((store_id, metadata))
-    })
-    .await
-    .map_err(|error| store_error("run anime store ingest", error))?
-    .map_err(|error| store_error("ingest through anime store", error))?;
+    // Every ingested entry binds by URL (store "url"), like a `<bind url>`.
+    // Anime-store URLs go there, every other URL to musiclib.
+    let (bind_url, metadata) = match nrs_import::canonical_anime_url(&query) {
+        Some(bind_url) => {
+            let anime_store = state.anime_store.clone();
+            tokio::task::spawn_blocking(move || {
+                let store_id = anime_store.ingest(&bind_url)?;
+                let metadata = anime_store.resolve(&store_id)?;
+                Ok::<_, nrs_entry_store::Error>((bind_url, metadata))
+            })
+            .await
+            .map_err(|error| store_error("run anime store ingest", error))?
+            .map_err(|error| store_error("ingest through anime store", error))?
+        }
+        None => {
+            let music_store = state.music_store.clone();
+            tokio::task::spawn_blocking(move || {
+                let store_id = music_store.ingest(&query)?;
+                // The canonical identifier, when the store gives one.
+                let bind_url = music_store
+                    .lookup(&query)?
+                    .and_then(|found| found.extra["identifier"].as_str().map(String::from))
+                    .filter(|identifier| identifier.starts_with("http"))
+                    .unwrap_or(query);
+                let metadata = music_store.resolve(&store_id)?;
+                Ok::<_, nrs_entry_store::Error>((bind_url, metadata))
+            })
+            .await
+            .map_err(|error| store_error("run music store ingest", error))?
+            .map_err(|error| store_error("ingest through music store", error))?
+        }
+    };
 
     let store = state.store.as_ref().ok_or_else(|| {
         api_error(
@@ -123,12 +146,12 @@ pub(super) async fn entry_ingest(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
     let id = match store
-        .find_entry("anime", &store_id)
+        .find_entry("url", &bind_url)
         .map_err(|error| store_error("look up ingested entry", error))?
     {
         Some(id) => id,
         None => store
-            .add_entry("anime", &store_id, Some(&metadata.title))
+            .add_entry("url", &bind_url, Some(&metadata.title))
             .map_err(|error| store_error("add ingested entry", error))?,
     };
     Ok(Json(MutationResponse {
@@ -2317,6 +2340,7 @@ mod tests {
                 snapshot,
                 store: Some(std::sync::Mutex::new(crate::TrackedStore::new(store))),
                 anime_store: nrs_entry_store::HttpEntryStore::new("http://127.0.0.1:3738").unwrap(),
+                music_store: nrs_entry_store::HttpEntryStore::new("http://127.0.0.1:4600").unwrap(),
                 music_store_url: None,
                 anime_store_url: None,
                 scores_cache: Default::default(),

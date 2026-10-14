@@ -40,6 +40,8 @@ struct AppState {
     /// store, which the read-only XML-mode doesn't have.
     store: Option<Mutex<TrackedStore>>,
     anime_store: HttpEntryStore,
+    /// Where `entry_ingest` sends URLs the anime store doesn't take.
+    music_store: HttpEntryStore,
     /// Where progress defaults come from (`NRS_MUSIC_STORE_URL`,
     /// `NRS_ANIME_STORE_URL`); see `api::progress_basis`.
     music_store_url: Option<String>,
@@ -170,11 +172,23 @@ async fn main() {
         }
     };
     eprintln!("anime entry store: {anime_store_url}");
+    let music_store = match HttpEntryStore::new(&music_store_url()) {
+        // A musiclib ingest fetches every provider, then reconciles.
+        Ok(store) => store
+            .expecting_store("musiclib")
+            .with_job_timeout(std::time::Duration::from_secs(15 * 60)),
+        Err(error) => {
+            eprintln!("invalid NRS_MUSIC_STORE_URL: {error}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("music entry store: {}", music_store_url());
 
     let state = Arc::new(AppState {
         snapshot,
         store: store.map(|store| Mutex::new(TrackedStore::new(store))),
         anime_store,
+        music_store,
         music_store_url: Some(music_store_url()),
         anime_store_url: Some(anime_store_url),
         scores_cache: Default::default(),
