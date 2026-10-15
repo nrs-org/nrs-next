@@ -2875,10 +2875,10 @@ async function renderSeasons() {
       <label class="season-toggle"><input type="checkbox" class="hide-adopted" ${hideAdopted ? "checked" : ""}> hide entries in NRS</label>
     </div>
     <p class="entry-count">…</p>
-    <div class="season-grid"><p class="loading">Loading ${escapeHtml(seasonLabel(season))}…</p></div>
+    <div class="season-groups"><p class="loading">Loading ${escapeHtml(seasonLabel(season))}…</p></div>
     <div class="section-actions"><button class="button season-more" type="button" hidden>load more</button></div>
   `;
-  const grid = app.querySelector(".season-grid");
+  const grid = app.querySelector(".season-groups");
   const count = app.querySelector(".entry-count");
   const more = app.querySelector(".season-more");
   const toggle = app.querySelector(".hide-adopted");
@@ -2886,13 +2886,23 @@ async function renderSeasons() {
   const shows = [];
   let nextPage = 1;
 
+  // Two groups, popularity order kept within each: what's already in
+  // NRS, then what isn't (where "add" moves a show up).
   const paint = () => {
-    const visible = shows.map((show, index) => [show, index]).filter(([show]) => !(hideAdopted && show.entry_id));
-    const adopted = shows.filter((show) => show.entry_id).length;
-    count.textContent = `${shows.length}${nextPage ? "+" : ""} shows · ${adopted} in NRS`;
-    grid.innerHTML = visible.length
-      ? visible.map(([show, index]) => seasonCard(show, index)).join("")
-      : `<p class="empty">${shows.length ? "Every show loaded so far is in NRS." : "AniList lists nothing for this season."}</p>`;
+    const indexed = shows.map((show, index) => [show, index]);
+    const inNrs = indexed.filter(([show]) => show.entry_id);
+    const notInNrs = indexed.filter(([show]) => !show.entry_id);
+    count.textContent = `${shows.length}${nextPage ? "+" : ""} shows · ${inNrs.length} in NRS`;
+    const group = (title, items, empty) => `<section class="season-group">
+        <h3 class="subsection-title">${title} <span class="count">${items.length}</span></h3>
+        ${items.length ? `<div class="season-grid">${items.map(([show, index]) => seasonCard(show, index)).join("")}</div>` : `<p class="empty">${empty}</p>`}
+      </section>`;
+    grid.innerHTML = shows.length
+      ? [
+          hideAdopted ? "" : group("In NRS", inNrs, "None of these are in NRS yet."),
+          group("Not in NRS", notInNrs, "Every show loaded so far is in NRS."),
+        ].join("")
+      : `<p class="empty">AniList lists nothing for this season.</p>`;
     more.hidden = !nextPage;
   };
   async function loadPage() {
