@@ -43,6 +43,9 @@ pub struct StoreFacts {
     pub episodes: HashMap<String, f32>,
     /// Bind URL -> per-episode length in minutes (anime store).
     pub episode_minutes: HashMap<String, f32>,
+    /// Bind URL -> chapter and volume counts (anime store, manga/novels).
+    pub chapters: HashMap<String, f32>,
+    pub volumes: HashMap<String, f32>,
 }
 
 /// Minutes NRS counts per TV episode: OP/ED and previews excluded.
@@ -232,6 +235,8 @@ pub struct ProgressBasis {
     pub episodes: Option<f32>,
     pub episode_minutes: f32,
     pub store_episode_minutes: Option<f32>,
+    pub chapters: Option<f32>,
+    pub volumes: Option<f32>,
 }
 
 pub fn progress_basis(url: &str, sources: &StoreSources) -> Result<ProgressBasis, String> {
@@ -255,6 +260,8 @@ pub fn progress_basis(url: &str, sources: &StoreSources) -> Result<ProgressBasis
             .filter(|&minutes| !is_tv_episode(minutes))
             .unwrap_or(DEFAULT_EPISODE_MINUTES),
         store_episode_minutes,
+        chapters: facts.chapters.get(url).copied(),
+        volumes: facts.volumes.get(url).copied(),
     })
 }
 
@@ -424,6 +431,14 @@ fn load_anime(
                         facts
                             .episode_minutes
                             .insert(url.to_string(), seconds as f32 / 60.0);
+                    }
+                    // MAL counts a still-running series as 0.
+                    let count = |key: &str| basis[key].as_f64().filter(|&count| count > 0.0);
+                    if let Some(count) = count("chapter_count") {
+                        facts.chapters.insert(url.to_string(), count as f32);
+                    }
+                    if let Some(count) = count("volume_count") {
+                        facts.volumes.insert(url.to_string(), count as f32);
                     }
                     facts.titles.insert(url.to_string(), meta.title);
                     break;

@@ -1,10 +1,12 @@
 //! Versioned JSON API for the dependency-free browser client.
 
 mod adopt;
+mod progress;
 
 pub(crate) use adopt::{
     entry_adopt, entry_related, entry_related_add, store_discover, stores_search,
 };
+pub(crate) use progress::{progress_clear, progress_get, progress_list, progress_set, progress_step};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1391,6 +1393,8 @@ pub(super) struct ProgressBasisResponse {
     episodes: Option<f32>,
     episode_minutes: Option<f32>,
     store_episode_minutes: Option<f32>,
+    chapters: Option<f32>,
+    volumes: Option<f32>,
 }
 
 pub(super) async fn progress_basis(
@@ -1435,6 +1439,8 @@ pub(super) async fn progress_basis(
         episodes: basis.episodes,
         episode_minutes: Some(basis.episode_minutes),
         store_episode_minutes: basis.store_episode_minutes,
+        chapters: basis.chapters,
+        volumes: basis.volumes,
     }))
 }
 

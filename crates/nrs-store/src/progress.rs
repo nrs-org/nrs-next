@@ -116,7 +116,8 @@ impl Progress {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// What `set_progress` checks before writing.
+    pub fn validate(&self) -> Result<()> {
         let invalid = |message: &str| Err(StoreError::Invalid(message.into()));
         if !self.current.is_finite() || self.current < 0.0 {
             return invalid("progress must be a non-negative number");
