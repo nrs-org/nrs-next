@@ -2885,6 +2885,13 @@ async function renderSeasons() {
   if (!(grid instanceof HTMLElement) || !(count instanceof HTMLElement) || !(more instanceof HTMLButtonElement) || !(toggle instanceof HTMLInputElement)) return;
   const shows = [];
   let nextPage = 1;
+  // Progress by entry ID, for the in-NRS cards. A plain fetch: `getJson`
+  // would abort the season request it runs beside.
+  const progress = new Map();
+  const progressLoaded = fetch("/api/v1/progress")
+    .then((response) => (response.ok ? response.json() : { items: [] }))
+    .then(({ items }) => items.forEach((item) => progress.set(item.entry.id, item.progress)))
+    .catch(() => {});
 
   // Two groups, popularity order kept within each: what's already in
   // NRS, then what isn't (where "add" moves a show up).
@@ -2895,7 +2902,7 @@ async function renderSeasons() {
     count.textContent = `${shows.length}${nextPage ? "+" : ""} shows · ${inNrs.length} in NRS`;
     const group = (title, items, empty) => `<section class="season-group">
         <h3 class="subsection-title">${title} <span class="count">${items.length}</span></h3>
-        ${items.length ? `<div class="season-grid">${items.map(([show, index]) => seasonCard(show, index)).join("")}</div>` : `<p class="empty">${empty}</p>`}
+        ${items.length ? `<div class="season-grid">${items.map(([show, index]) => seasonCard(show, index, progress.get(show.entry_id))).join("")}</div>` : `<p class="empty">${empty}</p>`}
       </section>`;
     grid.innerHTML = shows.length
       ? [
@@ -2927,6 +2934,20 @@ async function renderSeasons() {
     paint();
   });
   grid.addEventListener("click", async (event) => {
+    const step = event.target instanceof Element ? event.target.closest("[data-season-step]") : null;
+    if (step instanceof HTMLButtonElement) {
+      const show = shows[Number(step.dataset.seasonStep)];
+      step.disabled = true;
+      try {
+        const next = (await sendJson(progressPath(show.entry_id, "/step"), "POST", { by: 1 })).progress;
+        progress.set(show.entry_id, next);
+        paint();
+      } catch (reason) {
+        showToast(reason?.message || String(reason), "error");
+        step.disabled = false;
+      }
+      return;
+    }
     const button = event.target instanceof Element ? event.target.closest("[data-ingest]") : null;
     if (!(button instanceof HTMLButtonElement)) return;
     const show = shows[Number(button.dataset.ingest)];
@@ -2936,10 +2957,23 @@ async function renderSeasons() {
     showToast(`Added ${show.title}`);
     paint();
   });
-  await loadPage();
+  await Promise.all([loadPage(), progressLoaded]);
+  paint();
 }
 
-function seasonCard(show, index) {
+// An in-NRS show's progress: where it stands, and +1 while it's open.
+function seasonProgress(progress, index) {
+  if (!progress) return `<p class="season-progress dim">not tracked</p>`;
+  const open = !["completed", "dropped"].includes(progress.status);
+  return `<div class="season-progress" data-status="${escapeHtml(progress.status)}">
+      <span class="season-progress-status">${escapeHtml(progressStatusLabel(progress.status, "anime"))}</span>
+      <span class="mono muted">${escapeHtml(progressCount(progress))}</span>
+      ${open ? `<button class="button" type="button" data-season-step="${index}" aria-label="one more episode">+1</button>` : ""}
+      ${progressBar(progress)}
+    </div>`;
+}
+
+function seasonCard(show, index, progress) {
   const cover = show.cover_url
     ? `<img class="season-cover" src="${escapeHtml(show.cover_url)}" alt="" loading="lazy">`
     : `<div class="season-cover"></div>`;
@@ -2951,6 +2985,7 @@ function seasonCard(show, index) {
     <div class="season-copy">
       <a class="season-title" href="${escapeHtml(show.canonical_url || show.query)}" target="_blank" rel="noopener">${escapeHtml(show.title)}</a>
       ${show.subtitle ? `<p class="hit-subtitle">${escapeHtml(show.subtitle)}</p>` : ""}
+      ${show.entry_id ? seasonProgress(progress, index) : ""}
       <div class="season-action">${storeKindTag(show.kind)}${action}</div>
     </div>
   </article>`;
