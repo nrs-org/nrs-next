@@ -292,7 +292,8 @@ pub(crate) struct StepInput {
     by: f32,
 }
 
-/// Moves the count by `by` (clamped to `[0, total]`). Stepping forward
+/// Moves the count by `by` (clamped to `[0, total]`; a total of 0 is
+/// unknown, like the stores' count for a show still airing). Stepping forward
 /// starts a planned or paused entry and dates its start; reaching the
 /// total is left for the client to confirm as a finish.
 pub(crate) async fn progress_step(
@@ -308,7 +309,7 @@ pub(crate) async fn progress_step(
         return Err(api_error(StatusCode::BAD_REQUEST, "bad step"));
     }
     let mut current = (progress.current + input.by).max(0.0);
-    if let Some(total) = progress.total {
+    if let Some(total) = progress.total.filter(|&total| total > 0.0) {
         current = current.min(total);
     }
     progress.current = current;

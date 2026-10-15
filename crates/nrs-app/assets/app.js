@@ -237,7 +237,7 @@ app.addEventListener("toggle", (event) => {
 
 function setActiveNav() {
   const segment = location.pathname.split("/")[1];
-  const active = ["palette", "calibrate", "kfeat", "review", "entries", "seasons"].includes(segment)
+  const active = ["palette", "calibrate", "kfeat", "review", "entries", "seasons", "progress"].includes(segment)
     ? segment
     : "scores";
   document.querySelectorAll(".rail nav a[data-nav]").forEach((anchor) => {
@@ -2175,6 +2175,316 @@ function openImpactEditor(impact = null, action) {
  * id; typing an exact raw id still works, since the text is used as is until
  * a result is picked.
  */
+// ---------------------------------------------------------------
+// Progress: where an entry stands (planned, watching, finished...).
+// ---------------------------------------------------------------
+
+const progressStatuses = ["active", "paused", "planned", "completed", "dropped"];
+
+const progressUnits = {
+  episode: ["episode", "ep"],
+  chapter: ["chapter", "ch"],
+  volume: ["volume", "vol"],
+  minute: ["minute", "min"],
+};
+
+function progressStatusLabel(status, kind) {
+  if (status !== "active") return status;
+  if (kind === "literature") return "reading";
+  if (kind === "game" || kind === "vn") return "playing";
+  if (kind === "album" || kind === "track") return "listening";
+  return "watching";
+}
+
+function defaultProgressUnit(kind) {
+  if (kind === "anime") return "episode";
+  if (kind === "literature") return "chapter";
+  return "minute";
+}
+
+// The store's total for `unit`, from `/progress-basis`.
+function basisTotal(basis, unit) {
+  const key = { episode: "episodes", chapter: "chapters", volume: "volumes", minute: "length_minutes" }[unit];
+  // A still-airing show or running series has a count of 0: unknown.
+  return basis?.[key] || null;
+}
+
+function formatCount(value) {
+  return Number.isInteger(value) ? String(value) : String(Math.round(value * 10) / 10);
+}
+
+function progressCount(progress) {
+  const unit = progressUnits[progress.unit]?.[1] || progress.unit;
+  const total = progress.total ? formatCount(progress.total) : "?";
+  return `${formatCount(progress.current)} / ${total} ${unit}`;
+}
+
+function progressBar(progress) {
+  if (!progress.total) return "";
+  const share = Math.min(1, progress.current / progress.total);
+  return `<div class="progress-bar" data-status="${escapeHtml(progress.status)}"><span style="width: ${(share * 100).toFixed(1)}%"></span></div>`;
+}
+
+function progressPath(entryId, suffix = "") {
+  return `/api/v1/entries/${encodeURIComponent(entryId)}/progress${suffix}`;
+}
+
+function todayIso() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+function progressPayload(progress, changes = {}) {
+  const { status, unit, current, total, started, finished, rewatch } = { ...progress, ...changes };
+  return { status, unit, current, total, started, finished, rewatch };
+}
+
+function progressPanelMarkup(data, progress) {
+  if (!progress) {
+    return `<h2>Progress</h2>
+      <p class="empty">Not tracked.</p>
+      <div class="section-actions progress-actions">
+        <button class="button primary" type="button" data-progress-start="active">start ${escapeHtml(progressStatusLabel("active", data.entry.kind))}</button>
+        <button class="button" type="button" data-progress-start="planned">plan</button>
+      </div>`;
+  }
+  const kind = data.entry.kind;
+  const open = !["completed", "dropped"].includes(progress.status);
+  const dates = [
+    progress.started ? `started ${escapeHtml(progress.started)}` : "",
+    progress.finished ? `finished ${escapeHtml(progress.finished)}` : "",
+    progress.rewatch ? `rewatch ×${progress.rewatch}` : "",
+  ].filter(Boolean).join(" · ");
+  return `<h2>Progress</h2>
+    <div class="progress-line">
+      <select class="progress-status" data-status="${escapeHtml(progress.status)}" aria-label="progress status">
+        ${progressStatuses.map((status) => `<option value="${status}" ${status === progress.status ? "selected" : ""}>${escapeHtml(progressStatusLabel(status, kind))}</option>`).join("")}
+      </select>
+      <div class="progress-counter">
+        ${open ? `<button class="icon-button" type="button" data-progress-step="-1" aria-label="one less">−</button>` : ""}
+        <span class="mono">${escapeHtml(progressCount(progress))}</span>
+        ${open ? `<button class="icon-button" type="button" data-progress-step="1" aria-label="one more">+</button>` : ""}
+      </div>
+    </div>
+    ${progressBar(progress)}
+    ${dates ? `<p class="muted progress-dates">${dates}</p>` : ""}
+    <div class="section-actions progress-actions">
+      ${progress.status !== "completed" ? `<button class="button primary" type="button" data-progress-finish="completed">finish</button>` : `<button class="button" type="button" data-progress-finish="completed">re-score</button>`}
+      ${progress.status !== "dropped" && progress.status !== "completed" ? `<button class="button" type="button" data-progress-finish="dropped">drop</button>` : ""}
+      <button class="button" type="button" data-progress-edit>edit</button>
+      <button class="button subtle" type="button" data-progress-clear>stop tracking</button>
+    </div>`;
+}
+
+async function bindProgress(data) {
+  const panel = app.querySelector("[data-progress]");
+  if (!(panel instanceof HTMLElement)) return;
+  const entryId = data.entry.id;
+  let progress;
+  try {
+    const response = await fetch(progressPath(entryId));
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HTTP ${response.status}`);
+    progress = (await response.json()).progress;
+  } catch (error) {
+    if (currentEntryData === data && panel.isConnected) panel.innerHTML = `<h2>Progress</h2><p class="error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`;
+    return;
+  }
+  if (currentEntryData !== data || !panel.isConnected) return;
+  panel.innerHTML = progressPanelMarkup(data, progress);
+
+  const repaint = (next) => {
+    progress = next;
+    panel.innerHTML = progressPanelMarkup(data, progress);
+    bindPanel();
+  };
+  const guard = (action) => async (event) => {
+    const button = event.currentTarget;
+    if (button instanceof HTMLButtonElement || button instanceof HTMLSelectElement) button.disabled = true;
+    try {
+      await action(event);
+    } catch (reason) {
+      showToast(reason?.message || String(reason), "error");
+      if (button instanceof HTMLButtonElement || button instanceof HTMLSelectElement) button.disabled = false;
+    }
+  };
+  const bindPanel = () => {
+    panel.querySelectorAll("[data-progress-start]").forEach((button) => button.addEventListener("click", guard(async () => {
+      const status = button.getAttribute("data-progress-start");
+      const unit = defaultProgressUnit(data.entry.kind);
+      const basis = await progressBasis(entryId);
+      const body = { status, unit, current: 0, total: basisTotal(basis, unit), started: status === "active" ? todayIso() : null, finished: null, rewatch: 0 };
+      repaint((await sendJson(progressPath(entryId), "PUT", body)).progress);
+    })));
+    panel.querySelectorAll("[data-progress-step]").forEach((button) => button.addEventListener("click", guard(async () => {
+      const by = Number(button.getAttribute("data-progress-step"));
+      const next = (await sendJson(progressPath(entryId, "/step"), "POST", { by })).progress;
+      repaint(next);
+      if (by > 0 && next.total != null && next.current >= next.total) openProgressFinish(data, next, "completed", panel);
+    })));
+    panel.querySelector(".progress-status")?.addEventListener("change", guard(async (event) => {
+      const select = event.currentTarget;
+      if (!(select instanceof HTMLSelectElement)) return;
+      if (select.value === "completed" || select.value === "dropped") {
+        const status = select.value;
+        select.value = progress.status;
+        select.disabled = false;
+        openProgressFinish(data, progress, status, panel);
+        return;
+      }
+      const changes = { status: select.value };
+      if (select.value === "active" && !progress.started) changes.started = todayIso();
+      repaint((await sendJson(progressPath(entryId), "PUT", progressPayload(progress, changes))).progress);
+    }));
+    panel.querySelectorAll("[data-progress-finish]").forEach((button) => button.addEventListener("click", () => {
+      openProgressFinish(data, progress, button.getAttribute("data-progress-finish"), panel);
+    }));
+    panel.querySelector("[data-progress-edit]")?.addEventListener("click", () => openProgressEditor(data, progress, panel, repaint));
+    panel.querySelector("[data-progress-clear]")?.addEventListener("click", guard(async () => {
+      if (!confirm("Stop tracking this entry? Its impacts are kept.")) return;
+      await sendJson(progressPath(entryId), "DELETE");
+      repaint(null);
+    }));
+  };
+  bindPanel();
+}
+
+function progressFields(progress) {
+  const unitChoices = Object.entries(progressUnits).map(([key, [label]]) => [key, label]);
+  return `<div class="form-grid">
+    ${selectField(progress, "status", "status", progressStatuses.map((status) => [status, status]))}
+    ${selectField(progress, "unit", "counted in", unitChoices)}
+    ${textField(progress, "current", "progress", "0", "number", 'step="any" min="0" required')}
+    ${textField(progress, "total", "total", "", "number", 'step="any" min="0" placeholder="unknown"')}
+    ${textField(progress, "started", "started", "", "date")}
+    ${textField(progress, "finished", "finished", "", "date")}
+    ${textField(progress, "rewatch", "earlier rewatches", "0", "number", 'step="1" min="0"')}
+  </div>`;
+}
+
+function numberOrNull(value) {
+  return value === undefined || String(value).trim() === "" ? null : Number(value);
+}
+
+function openProgressEditor(data, progress, host, repaint) {
+  showEditor(host, "Edit progress", progressFields(progress), async (payload) => {
+    const body = {
+      status: payload.status,
+      unit: payload.unit,
+      current: Number(payload.current),
+      total: numberOrNull(payload.total),
+      started: payload.started || null,
+      finished: payload.finished || null,
+      rewatch: Number(payload.rewatch || 0),
+    };
+    repaint((await sendJson(progressPath(data.entry.id), "PUT", body)).progress);
+  });
+}
+
+/**
+ * Finishing or dropping: confirms the count and asks for what the
+ * consumed impact needs (boredom, minutes per unit). The linked impact,
+ * if any, supplies the defaults; unchecking "score" just records it.
+ */
+async function openProgressFinish(data, progress, status, host) {
+  const entryId = data.entry.id;
+  const linked = data.impacts.find((impact) => impact.id === progress.consumed_impact);
+  const params = linked?.params || {};
+  let unitMinutes = "";
+  if (progress.unit === "episode") {
+    unitMinutes = params.episode_duration_minutes || (await progressBasis(entryId))?.episode_minutes || 20;
+  } else if (progress.unit !== "minute" && params.duration_minutes && progress.current) {
+    unitMinutes = Number(params.duration_minutes) / progress.current;
+  }
+  const current = status === "completed" && progress.total != null ? Math.max(progress.current, progress.total) : progress.current;
+  const unitLabel = progressUnits[progress.unit]?.[0] || progress.unit;
+  const fields = {
+    current: formatCount(current),
+    finished: progress.finished || todayIso(),
+    boredom: params.boredom ?? "1",
+    unit_minutes: unitMinutes === "" ? "" : formatCount(Number(unitMinutes)),
+  };
+  const lead = linked
+    ? "Updates this entry's consumed impact instead of adding another."
+    : "Adds a consumed impact from the count.";
+  const body = `
+    <p class="form-note editor-intro">${escapeHtml(lead)}${status === "dropped" ? " A dropped impact is added too." : ""}</p>
+    <div class="form-grid">
+      ${textField(fields, "current", `${unitLabel}s done`, "", "number", 'step="any" min="0" required')}
+      ${textField(fields, "finished", status === "dropped" ? "dropped on" : "finished on", "", "date")}
+      ${rangeField(fields, "boredom", "boredom (1 = never bored)", "1")}
+      ${progress.unit === "minute" ? "" : textField(fields, "unit_minutes", `minutes per ${unitLabel}`, "", "number", 'step="any" min="0"')}
+    </div>
+    <label class="form-check"><input type="checkbox" name="score" checked> score it (write the consumed impact)</label>`;
+  showEditor(host, status === "dropped" ? "Drop" : "Finish", body, async (payload) => {
+    const request = progressPayload(progress, {
+      status,
+      current: Number(payload.current),
+      finished: payload.finished || null,
+    });
+    if (status === "completed" && request.total == null) request.total = request.current;
+    if (payload.score) request.score = { boredom: Number(payload.boredom), unit_minutes: numberOrNull(payload.unit_minutes) };
+    await sendJson(progressPath(entryId), "PUT", request);
+    showToast(status === "dropped" ? "Dropped" : "Finished");
+    await refreshEntry(entryId);
+  });
+}
+
+async function renderProgress() {
+  currentEntryData = null;
+  document.title = "Progress — NRS";
+  const lead = `<h1>progress</h1><p class="muted">What's being watched, read, and played, and what's next.</p>`;
+  app.innerHTML = `${lead}<p class="loading">Loading progress…</p>`;
+  let items;
+  try {
+    items = (await getJson("/api/v1/progress")).items;
+  } catch (error) {
+    renderError(error);
+    return;
+  }
+  const row = ({ entry, progress }) => `<div class="progress-row" data-entry="${escapeHtml(entry.id)}">
+      <a href="${pathForEntry(entry.id)}" data-link>${escapeHtml(entry.title)}</a>
+      ${kindTag(entry.kind)}
+      <span class="mono muted">${escapeHtml(progressCount(progress))}</span>
+      ${["completed", "dropped"].includes(progress.status) ? "<span></span>" : `<button class="button" type="button" data-step aria-label="one more">+1</button>`}
+      ${progressBar(progress)}
+    </div>`;
+  const groups = [
+    ["active", "In progress", true],
+    ["paused", "Paused", true],
+    ["planned", "Planned", true],
+    ["completed", "Completed", false],
+    ["dropped", "Dropped", false],
+  ];
+  const groupMarkup = ([status, title, open]) => {
+    const rows = items.filter((item) => item.progress.status === status);
+    if (!rows.length) return "";
+    const list = `<div class="progress-list">${rows.map(row).join("")}</div>`;
+    return open
+      ? `<section class="page-section"><h2>${title} <span class="count">${rows.length}</span></h2>${list}</section>`
+      : `<details class="page-section progress-group"><summary><h2>${title} <span class="count">${rows.length}</span></h2></summary>${list}</details>`;
+  };
+  app.innerHTML = items.length
+    ? `${lead}<div class="progress-page">${groups.map(groupMarkup).join("")}</div>`
+    : `${lead}<p class="empty">Nothing tracked yet. Start tracking from an entry's page.</p>`;
+  app.querySelector(".progress-page")?.addEventListener("click", async (event) => {
+    const button = event.target instanceof Element ? event.target.closest("[data-step]") : null;
+    const rowElement = button?.closest(".progress-row");
+    const item = items.find(({ entry }) => entry.id === rowElement?.getAttribute("data-entry"));
+    if (!(button instanceof HTMLButtonElement) || !rowElement || !item) return;
+    button.disabled = true;
+    try {
+      item.progress = (await sendJson(progressPath(item.entry.id, "/step"), "POST", { by: 1 })).progress;
+      rowElement.outerHTML = row(item);
+      if (item.progress.total != null && item.progress.current >= item.progress.total) {
+        showToast(`${item.entry.title}: all done. Finish it from its page.`);
+      }
+    } catch (reason) {
+      showToast(reason?.message || String(reason), "error");
+      button.disabled = false;
+    }
+  });
+}
+
 function entryPickerField(name, label, id, title, placeholder = "search entries…") {
   return `<div class="form-field entry-picker" data-entry-picker>
     <span>${escapeHtml(label)}</span>
@@ -2415,6 +2725,10 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <h1>${escapeHtml(data.entry.title)}</h1>
         <p class="muted mono">${kindSelect(data)} ${escapeHtml(data.entry.store)}:${escapeHtml(data.entry.store_id)}</p>
       </header>
+      <section class="page-section progress-panel" data-progress>
+        <h2>Progress</h2>
+        <p class="loading">Loading progress…</p>
+      </section>
       <section class="page-section score-panel" data-score>
         <h2>Score</h2>
         <p class="loading">Scoring…</p>
@@ -2437,6 +2751,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
     bindTracklist(data);
     bindRelated(data);
     bindScore(data, openDisclosures);
+    bindProgress(data);
     app.querySelectorAll("details[data-disclosure]").forEach((element) => {
       if (!(element instanceof HTMLDetailsElement)) return;
       const key = element.getAttribute("data-disclosure");
@@ -2580,6 +2895,8 @@ function route() {
     renderEntries();
   } else if (/^\/seasons\/?$/.test(location.pathname)) {
     renderSeasons();
+  } else if (/^\/progress\/?$/.test(location.pathname)) {
+    renderProgress();
   } else if (/^\/palette\/?$/.test(location.pathname)) {
     renderPalette();
   } else if (/^\/calibrate\/?$/.test(location.pathname)) {
