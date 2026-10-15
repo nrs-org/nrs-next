@@ -52,6 +52,8 @@ struct AppState {
     scores_cache: api::ScoresCache,
     /// `KindHints` as of a store generation (see `api::kind_hints`).
     kind_hints: Mutex<Option<(u64, Arc<KindHints>)>>,
+    /// `EntryIndex` as of a store generation (see `api::entry_index`).
+    entry_index: Mutex<Option<(u64, Arc<api::EntryIndex>)>>,
 }
 
 /// The store plus a count of its writes. Every `Store` write takes
@@ -194,6 +196,7 @@ async fn main() {
         anime_store_url: Some(anime_store_url),
         scores_cache: Default::default(),
         kind_hints: Default::default(),
+        entry_index: Default::default(),
     });
     let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
     let api = Router::new()

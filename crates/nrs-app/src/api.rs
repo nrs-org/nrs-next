@@ -1155,8 +1155,104 @@ pub(super) struct EntriesResponse {
     database_total: usize,
     offset: usize,
     limit: usize,
+    /// Stores whose aliases couldn't be searched, with why.
+    errors: Vec<String>,
 }
 
+/// Every entry in display-name order, with the lowercased fields
+/// `entries_index` matches a query against.
+pub(crate) struct EntryIndex {
+    rows: Vec<IndexedEntry>,
+    /// Position in `rows` by entry ID.
+    by_id: HashMap<String, usize>,
+}
+
+struct IndexedEntry {
+    entry: Entry,
+    title: String,
+    id: String,
+    store_id: String,
+}
+
+impl EntryIndex {
+    fn new(mut entries: Vec<Entry>) -> Self {
+        entries.sort_by(|left, right| {
+            entry_display_name(left)
+                .cmp(entry_display_name(right))
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        let rows: Vec<IndexedEntry> = entries
+            .into_iter()
+            .map(|entry| IndexedEntry {
+                title: entry_display_name(&entry).to_lowercase(),
+                id: entry.id.0.to_lowercase(),
+                store_id: entry.store_id.to_lowercase(),
+                entry,
+            })
+            .collect();
+        let by_id = rows
+            .iter()
+            .enumerate()
+            .map(|(at, row)| (row.entry.id.0.clone(), at))
+            .collect();
+        Self { rows, by_id }
+    }
+}
+
+/// How well `needle` (lowercased, non-empty) matches `row`, lower is
+/// better: the whole title, ID, or bound URL; a title prefix; a title
+/// word prefix; a title substring; an ID substring, the provider ID
+/// ending a bound URL, or a fragment (with a `/`) of it.
+fn match_rank(row: &IndexedEntry, needle: &str) -> Option<u8> {
+    let title = row.title.as_str();
+    if title == needle || row.id == needle || row.store_id == needle {
+        Some(0)
+    } else if title.starts_with(needle) {
+        Some(1)
+    } else if title
+        .match_indices(needle)
+        .any(|(at, _)| !title[..at].ends_with(char::is_alphanumeric))
+    {
+        Some(2)
+    } else if title.contains(needle) {
+        Some(3)
+    } else if row.id.contains(needle)
+        || row.store_id.rsplit(['/', '=']).next() == Some(needle)
+        || (needle.contains('/') && row.store_id.contains(needle))
+    {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// Where store alias hits rank: after every `match_rank`.
+const ALIAS_RANK: u8 = 5;
+
+/// `EntryIndex` as of a store generation, like `kind_hints`.
+fn entry_index(
+    state: &AppState,
+    store: &TrackedStore,
+) -> Result<Arc<EntryIndex>, (StatusCode, Json<ApiError>)> {
+    let mut cache = state
+        .entry_index
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "entry index poisoned"))?;
+    if let Some((generation, index)) = cache.as_ref() {
+        if *generation == store.generation {
+            return Ok(index.clone());
+        }
+    }
+    let entries = store
+        .list_entries()
+        .map_err(|error| store_error("load entries", error))?;
+    let index = Arc::new(EntryIndex::new(entries));
+    *cache = Some((store.generation, index.clone()));
+    Ok(index)
+}
+
+/// Entries in display-name order, or with `q`, those matching it best
+/// first (see `match_rank`), then those the stores find by alias.
 pub(super) async fn entries_index(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EntriesQuery>,
@@ -1167,47 +1263,52 @@ pub(super) async fn entries_index(
             "entry API requires database mode",
         )
     })?;
-    let store = store
-        .lock()
-        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
-    let mut entries = store.list_entries().map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load entries: {error}"),
-        )
-    })?;
-    let hints = kind_hints(&state, &store)?;
-    drop(store);
-    let database_total = entries.len();
-
-    if let Some(needle) = query
-        .q
-        .as_deref()
-        .map(str::trim)
-        .filter(|needle| !needle.is_empty())
-    {
-        let needle = needle.to_lowercase();
-        entries.retain(|entry| {
-            entry.id.0.to_lowercase().contains(&needle)
-                || entry_display_name(entry).to_lowercase().contains(&needle)
-                || entry.store.to_lowercase().contains(&needle)
-                || entry.store_id.to_lowercase().contains(&needle)
-        });
-    }
-    entries.sort_by(|left, right| {
-        entry_display_name(left)
-            .cmp(entry_display_name(right))
-            .then_with(|| left.id.0.cmp(&right.id.0))
-    });
-
-    let total = entries.len();
-    let offset = query.offset.unwrap_or(0).min(total);
+    let (index, hints) = {
+        let store = store
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+        (entry_index(&state, &store)?, kind_hints(&state, &store)?)
+    };
+    let database_total = index.rows.len();
+    let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).clamp(1, 10_000);
-    let entries = entries
+
+    let mut errors = Vec::new();
+    let rows: Vec<&IndexedEntry> = match query.q.as_deref().map(str::trim) {
+        Some(q) if !q.is_empty() => {
+            let needle = q.to_lowercase();
+            // (rank, tiebreak) by position in `index.rows`; the tiebreak
+            // is display-name order, or the stores' order for alias hits.
+            let mut ranked: HashMap<usize, (u8, usize)> = index
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(at, row)| Some((at, (match_rank(row, &needle)?, at))))
+                .collect();
+            if q.chars().count() >= 2 {
+                let store_limit = offset.saturating_add(limit).clamp(1, 50);
+                let (found, store_errors) = adopt::searched_entries(&state, q, store_limit).await?;
+                errors = store_errors;
+                for (order, id) in found.iter().enumerate() {
+                    if let Some(&at) = index.by_id.get(&id.0) {
+                        ranked.entry(at).or_insert((ALIAS_RANK, order));
+                    }
+                }
+            }
+            let mut ranked: Vec<(usize, (u8, usize))> = ranked.into_iter().collect();
+            ranked.sort_unstable_by_key(|&(_, key)| key);
+            ranked.into_iter().map(|(at, _)| &index.rows[at]).collect()
+        }
+        _ => index.rows.iter().collect(),
+    };
+
+    let total = rows.len();
+    let offset = offset.min(total);
+    let entries = rows
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|entry| EntrySummary::new(&entry, &hints))
+        .map(|row| EntrySummary::new(&row.entry, &hints))
         .collect();
     Ok(Json(EntriesResponse {
         entries,
@@ -1215,6 +1316,7 @@ pub(super) async fn entries_index(
         database_total,
         offset,
         limit,
+        errors,
     }))
 }
 
@@ -2939,6 +3041,7 @@ mod tests {
                 anime_store_url: None,
                 scores_cache: Default::default(),
                 kind_hints: Default::default(),
+                entry_index: Default::default(),
             }),
             a.0,
             b.0,
@@ -3235,5 +3338,63 @@ mod tests {
             relation_presentation(RelKind::Remix, false),
             ("lineage", "Remix of")
         );
+    }
+
+    fn ranked(entries: &[(&str, &str, &str)], q: &str) -> Vec<String> {
+        let index = EntryIndex::new(
+            entries
+                .iter()
+                .map(|&(id, store_id, title)| Entry {
+                    id: EntryId(id.into()),
+                    store: "url".into(),
+                    store_id: store_id.into(),
+                    title_cache: Some(title.into()),
+                })
+                .collect(),
+        );
+        let needle = q.to_lowercase();
+        let mut hits: Vec<(u8, usize)> = index
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(at, row)| Some((match_rank(row, &needle)?, at)))
+            .collect();
+        hits.sort_unstable();
+        hits.into_iter()
+            .map(|(_, at)| index.rows[at].entry.id.0.clone())
+            .collect()
+    }
+
+    #[test]
+    fn entry_search_ranks_exact_then_prefix_then_word_then_substring() {
+        let entries = [
+            ("A-1", "https://myanimelist.net/anime/1", "Kekkon suru tte"),
+            ("A-2", "https://myanimelist.net/anime/2", "Konohana Kitan"),
+            ("A-3", "https://myanimelist.net/anime/3", "Kono"),
+            (
+                "A-4",
+                "https://myanimelist.net/anime/4",
+                "Shinchou Yuusha: Kono Yuusha",
+            ),
+        ];
+        assert_eq!(ranked(&entries, "kono"), ["A-3", "A-2", "A-4"]);
+        assert_eq!(ranked(&entries, "kon"), ["A-3", "A-2", "A-4", "A-1"]);
+    }
+
+    #[test]
+    fn entry_search_matches_ids_and_provider_ids_not_url_text() {
+        let entries = [
+            ("A-MAL-10278", "https://myanimelist.net/anime/10278", "Zzz"),
+            ("M-1", "https://youtu.be/07Fo-_-IOHE", "Yyy"),
+            ("M-2", "https://www.youtube.com/watch?v=NGDPr505aBQ", "Xxx"),
+        ];
+        // "anime" and "youtu" are only URL text.
+        assert!(ranked(&entries, "anime").is_empty());
+        assert!(ranked(&entries, "youtu").is_empty());
+        assert_eq!(ranked(&entries, "mal-10278"), ["A-MAL-10278"]);
+        assert_eq!(ranked(&entries, "07Fo-_-IOHE"), ["M-1"]);
+        assert_eq!(ranked(&entries, "NGDPr505aBQ"), ["M-2"]);
+        assert_eq!(ranked(&entries, "anime/10278"), ["A-MAL-10278"]);
+        assert_eq!(ranked(&entries, "https://youtu.be/07Fo-_-IOHE"), ["M-1"]);
     }
 }

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -193,6 +194,65 @@ struct StoreHit {
     other_editions: usize,
 }
 
+/// Both stores' `search` for `q`, each best first, anime first, plus the
+/// stores that couldn't be searched, with why.
+async fn search_both(
+    state: &Arc<AppState>,
+    q: &str,
+    limit: usize,
+) -> Result<(Vec<(StoreName, EntrySummary)>, Vec<String>), ApiErr> {
+    let search = |name: StoreName| {
+        let client = name.client(state);
+        let q = q.to_string();
+        tokio::task::spawn_blocking(move || (name, client.search(&q, None, limit)))
+    };
+    let (anime, music) = tokio::join!(search(StoreName::Anime), search(StoreName::Music));
+
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for joined in [anime, music] {
+        let (name, result) = joined.map_err(|error| store_error("search stores", error))?;
+        match result {
+            Ok(summaries) => found.extend(summaries.into_iter().map(|summary| (name, summary))),
+            Err(error) => errors.push(format!("{} store: {error}", name.name())),
+        }
+    }
+    Ok((found, errors))
+}
+
+/// How long `searched_entries` waits for the stores before answering
+/// without them: entry pickers search as you type.
+const ENTRY_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The NRS entries bound to what both stores' `search` finds for `q`
+/// (best first, anime first), so entry search matches the aliases the
+/// stores keep and NRS doesn't. Stores that couldn't be searched in
+/// time are reported, not fatal.
+pub(super) async fn searched_entries(
+    state: &Arc<AppState>,
+    q: &str,
+    limit: usize,
+) -> Result<(Vec<EntryId>, Vec<String>), ApiErr> {
+    let (found, errors) =
+        match tokio::time::timeout(ENTRY_SEARCH_TIMEOUT, search_both(state, q, limit)).await {
+            Ok(searched) => searched?,
+            Err(_) => (
+                Vec::new(),
+                vec![format!("stores: no answer within {ENTRY_SEARCH_TIMEOUT:?}")],
+            ),
+        };
+    let store = locked_store(state)?;
+    let mut entries = Vec::new();
+    for (_, summary) in &found {
+        if let Some(id) = bound_entry(&store, summary.canonical_url.iter().chain(&summary.urls))? {
+            if !entries.contains(&id) {
+                entries.push(id);
+            }
+        }
+    }
+    Ok((entries, errors))
+}
+
 /// Both stores' `search`, each best first, anime first. Editions of one
 /// work (`edition_group`) are one result: the edition NRS has, else the
 /// best-ranked.
@@ -209,22 +269,7 @@ pub(crate) async fn stores_search(
         }));
     }
     let limit = query.limit.unwrap_or(20).clamp(1, 50);
-    let search = |name: StoreName| {
-        let client = name.client(&state);
-        let q = q.clone();
-        tokio::task::spawn_blocking(move || (name, client.search(&q, None, limit)))
-    };
-    let (anime, music) = tokio::join!(search(StoreName::Anime), search(StoreName::Music));
-
-    let mut found = Vec::new();
-    let mut errors = Vec::new();
-    for joined in [anime, music] {
-        let (name, result) = joined.map_err(|error| store_error("search stores", error))?;
-        match result {
-            Ok(summaries) => found.extend(summaries.into_iter().map(|summary| (name, summary))),
-            Err(error) => errors.push(format!("{} store: {error}", name.name())),
-        }
-    }
+    let (found, errors) = search_both(&state, &q, limit).await?;
     let store = locked_store(&state)?;
     let results = found
         .into_iter()
@@ -798,6 +843,7 @@ mod tests {
             anime_store_url: None,
             scores_cache: Default::default(),
             kind_hints: Default::default(),
+            entry_index: Default::default(),
         })
     }
 
@@ -1003,5 +1049,34 @@ mod tests {
         )
         .await;
         assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entry_search_finds_entries_by_store_alias() {
+        let mut store = nrs_store::Store::open_in_memory().unwrap();
+        // Titled unlike anything typed: only the store's search finds it.
+        let aliased = store
+            .add_entry("url", TRACK_ALT_URL, Some("Toraku"))
+            .unwrap();
+        let titled = store.add_entry("none", "x", Some("Other alias")).unwrap();
+        let state = state_with(store).await;
+
+        let response = super::super::entries_index(
+            State(state),
+            Query(super::super::EntriesQuery {
+                q: Some("alias".into()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let ids: Vec<&str> = response.entries.iter().map(|e| e.id.as_str()).collect();
+        // A title match ranks above an alias hit.
+        assert_eq!(ids, [titled.0.as_str(), aliased.0.as_str()]);
+        assert_eq!(response.total, 2);
+        // The unreachable anime store is reported, not fatal.
+        assert_eq!(response.errors.len(), 1);
     }
 }
