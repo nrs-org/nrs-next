@@ -265,9 +265,28 @@ const SCHEMA_V10: &str = r#"
 ALTER TABLE entry ADD COLUMN kind TEXT;
 "#;
 
+const SCHEMA_V11: &str = r#"
+-- Where each entry stands for its viewer (see `progress.rs`): status, how
+-- far along in `unit`s, and the consumed/dropped impacts the app derived
+-- from it. Those two are not foreign keys: an impact deleted by hand or
+-- by a resync just reads back unlinked.
+CREATE TABLE IF NOT EXISTS progress (
+    entry           TEXT PRIMARY KEY REFERENCES entry(id),
+    status          TEXT NOT NULL,    -- planned | active | paused | completed | dropped
+    unit            TEXT NOT NULL,    -- episode | chapter | volume | minute
+    current         REAL NOT NULL DEFAULT 0,
+    total           REAL,             -- NULL = unknown
+    started         INTEGER,          -- days since 1970-01-01
+    finished        INTEGER,
+    rewatch         INTEGER NOT NULL DEFAULT 0,
+    consumed_impact TEXT,
+    dropped_impact  TEXT
+);
+"#;
+
 const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

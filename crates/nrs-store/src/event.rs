@@ -19,6 +19,7 @@ pub enum EventKind {
     SnapshotImport,
     SnapshotResync,
     PreferenceRecord,
+    ProgressSet,
 }
 
 impl EventKind {
@@ -40,6 +41,7 @@ impl EventKind {
             EventKind::SnapshotImport => "snapshot.import",
             EventKind::SnapshotResync => "snapshot.resync",
             EventKind::PreferenceRecord => "preference.record",
+            EventKind::ProgressSet => "progress.set",
         }
     }
 }

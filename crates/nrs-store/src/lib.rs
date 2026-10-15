@@ -9,6 +9,7 @@ mod event;
 mod events;
 mod import;
 mod preferences;
+mod progress;
 mod relkind;
 mod resync;
 mod review;
@@ -28,6 +29,7 @@ pub use event::EventKind;
 pub use events::EventRecord;
 pub use import::ImportExtras;
 pub use preferences::Preference;
+pub use progress::{Progress, ProgressStatus, ProgressUnit};
 pub use resync::{ReboundEntry, ResyncPlan, RetitledEntry, SharedBase, SharedChange};
 pub use review_queue::ReviewImpact;
 pub use split::{
