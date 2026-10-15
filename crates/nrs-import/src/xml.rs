@@ -74,6 +74,9 @@ pub struct ParsedEntry {
     /// auto-generated `Contains` relations toward each credited id).
     pub roles: Vec<ParsedRole>,
     pub music_var: Option<ParsedMusicVar>,
+    /// `<validatorSuppress rules="a;b"/>`: validation rules this entry is
+    /// exempt from.
+    pub suppress: Vec<String>,
 }
 
 /// `<musicvar>`: overrides to `roles::MusicVars`'s defaults. `None`
@@ -105,6 +108,9 @@ pub struct ParsedImpact {
     /// be audited without changing the core snapshot format.
     pub anchor_source: Option<String>,
     pub anchor_confidence: Option<f32>,
+    /// A `<validatorSuppress rules="..."/>` child: validation rules every
+    /// entry this impact targets is exempt from.
+    pub suppress: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -463,6 +469,7 @@ fn parse_entry(
         relations: Vec::new(),
         roles: Vec::new(),
         music_var: None,
+        suppress: Vec::new(),
     };
 
     for child in node.children() {
@@ -551,7 +558,8 @@ fn parse_entry(
                 });
             }
             "script" => engine.run_script(scope, child, warnings),
-            "queue" | "validatorSuppress" | "def" => {} // pure metadata / already-expanded macro decl
+            "validatorSuppress" => entry.suppress.extend(suppressed_rules(child)),
+            "queue" | "def" => {} // pure metadata / already-expanded macro decl
             _ => {
                 let kinds = parse_impact_kinds(child, tag, today, &context_prefix, warnings);
                 if kinds.is_empty() {
@@ -588,7 +596,24 @@ fn parsed_impact(
         source_comment: node.preceding_comment().map(String::from),
         anchor_source: node.attribute("anchorSource").map(String::from),
         anchor_confidence: parse_anchor_confidence(node, context, warnings),
+        suppress: node
+            .children()
+            .filter(|child| child.tag_name() == "validatorSuppress")
+            .flat_map(suppressed_rules)
+            .collect(),
     }
+}
+
+/// A `<validatorSuppress rules="a;b"/>`'s rule names; empty pieces (a
+/// stray leading `;`) are skipped.
+fn suppressed_rules(node: &XNode) -> Vec<String> {
+    node.attribute("rules")
+        .unwrap_or("")
+        .split(';')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn parse_source(node: &XNode, entry: &mut ParsedEntry) {

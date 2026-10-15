@@ -28,7 +28,7 @@ use nrs_core::{Atom, Entry, EntryId, Impact, ImpactId, RelKind, Relation, Snapsh
 use crate::crud::{append_event, to_json};
 use crate::error::Result;
 use crate::event::EventKind;
-use crate::import::ImportExtras;
+use crate::import::{ImportExtras, IMPORTED_WAIVER_REASON};
 use crate::relkind::{rel_kind_from_str, rel_kind_to_str};
 use crate::review::ReviewState;
 use crate::Store;
@@ -57,6 +57,9 @@ pub struct ResyncPlan {
     /// Shared impacts to create, extend, or fold together from the
     /// per-contributor rows older databases stored (schema < V8).
     pub shared_changes: Vec<SharedChange>,
+    /// `(entry, rule)` waivers the XML declares that the store lacks.
+    /// Only ever added: one removed by hand stays removed.
+    pub waivers_to_add: Vec<(EntryId, String)>,
 }
 
 /// One shared impact's change, keyed by the import's share key.
@@ -106,6 +109,7 @@ impl ResyncPlan {
             && self.impacts_to_remove.is_empty()
             && self.relations_to_add.is_empty()
             && self.relations_to_remove.is_empty()
+            && self.waivers_to_add.is_empty()
     }
 }
 
@@ -120,6 +124,7 @@ struct ResyncSummary {
     relations_removed: usize,
     relations_kept: usize,
     shared_changed: usize,
+    waivers_added: usize,
 }
 
 /// An atom as a comparable value: blend and time as their canonical
@@ -454,6 +459,26 @@ impl Store {
             }
         }
 
+        // --- waivers
+        let stored_waivers: BTreeSet<(String, String)> = self
+            .waivers()?
+            .into_iter()
+            .map(|waiver| (waiver.entry.0, waiver.rule))
+            .collect();
+        let removed = self.removed_waivers()?;
+        let added: BTreeSet<&str> = plan.entries_to_add.iter().map(|e| e.id.0.as_str()).collect();
+        for (entry, rules) in &extras.waivers {
+            if !stored_entries.contains_key(&entry.0) && !added.contains(entry.0.as_str()) {
+                continue;
+            }
+            for rule in rules {
+                let key = (entry.0.clone(), rule.clone());
+                if !stored_waivers.contains(&key) && !removed.contains(&key) {
+                    plan.waivers_to_add.push((entry.clone(), rule.clone()));
+                }
+            }
+        }
+
         Ok(plan)
     }
 
@@ -676,6 +701,21 @@ impl Store {
             )?;
         }
 
+        for (entry, rule) in &plan.waivers_to_add {
+            tx.execute(
+                "INSERT OR IGNORE INTO waiver (entry, rule, reason) VALUES (?1, ?2, ?3)",
+                params![entry.0, rule, IMPORTED_WAIVER_REASON],
+            )?;
+            append_event(
+                &tx,
+                EventKind::WaiverSet,
+                Some(&entry.0),
+                None,
+                Some(&serde_json::json!({ "rule": rule, "reason": IMPORTED_WAIVER_REASON }).to_string()),
+                note,
+            )?;
+        }
+
         let summary = serde_json::to_string(&ResyncSummary {
             entries_added: plan.entries_to_add.len(),
             entries_retitled: plan.entries_to_retitle.len(),
@@ -686,6 +726,7 @@ impl Store {
             relations_removed: plan.relations_to_remove.len(),
             relations_kept: plan.relations_kept.len(),
             shared_changed: plan.shared_changes.len(),
+            waivers_added: plan.waivers_to_add.len(),
         })?;
         append_event(
             &tx,
@@ -1119,6 +1160,35 @@ mod tests {
                 k_feat: Default::default(),
             },
         }
+    }
+
+    #[test]
+    fn waivers_are_added_once_and_stay_removed() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .import_snapshot(&snapshot(vec![], vec![]), &ImportExtras::default())
+            .unwrap();
+        let extras = ImportExtras {
+            waivers: BTreeMap::from([
+                (
+                    EntryId("A".into()),
+                    ["dah-lone-pads".to_string(), "dah-no-progress".to_string()].into(),
+                ),
+                (EntryId("unknown".into()), ["dah-lone-pads".to_string()].into()),
+            ]),
+            ..Default::default()
+        };
+        let snap = snapshot(vec![], vec![]);
+        let plan = store.plan_resync(&snap, &extras).unwrap();
+        assert_eq!(plan.waivers_to_add.len(), 2);
+        store.apply_resync(&plan, &extras, "test").unwrap();
+        assert_eq!(store.waivers().unwrap().len(), 2);
+
+        assert!(store.plan_resync(&snap, &extras).unwrap().is_empty());
+        store
+            .remove_waiver(&EntryId("A".into()), "dah-lone-pads")
+            .unwrap();
+        assert!(store.plan_resync(&snap, &extras).unwrap().is_empty());
     }
 
     fn impact_atoms(store: &Store, target: &str) -> Vec<(String, f32)> {

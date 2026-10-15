@@ -15,6 +15,10 @@
 //! computed the same way the stored ones were and don't show up as
 //! spurious changes. `--apply` first copies the database and its review
 //! sidecar next to it as `*.pre-resync-<unix time>`.
+//!
+//! `--waivers-only` narrows the plan to the `<validatorSuppress>` waivers
+//! the store lacks, for a database whose content has moved on from the
+//! XML.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +36,7 @@ struct Args {
     today: Option<time::Date>,
     apply: bool,
     verbose: bool,
+    waivers_only: bool,
     music_store: Option<String>,
     anime_store: Option<String>,
 }
@@ -39,9 +44,9 @@ struct Args {
 fn parse_args() -> Args {
     let usage =
         "usage: resync <path to .xml> <path to .db> [--today YYYY-MM-DD] [--apply] [--verbose] \
-         [--music-store URL] [--anime-store URL]";
+         [--waivers-only] [--music-store URL] [--anime-store URL]";
     let mut positional = Vec::new();
-    let (mut today, mut apply, mut verbose) = (None, false, false);
+    let (mut today, mut apply, mut verbose, mut waivers_only) = (None, false, false, false);
     let mut music_store = std::env::var("NRS_MUSIC_STORE_URL").ok();
     let mut anime_store = std::env::var("NRS_ANIME_STORE_URL").ok();
     let mut args = std::env::args().skip(1);
@@ -49,6 +54,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--apply" => apply = true,
             "--verbose" => verbose = true,
+            "--waivers-only" => waivers_only = true,
             "--music-store" => {
                 music_store = Some(args.next().unwrap_or_else(|| {
                     eprintln!("{usage}");
@@ -85,6 +91,7 @@ fn parse_args() -> Args {
         today,
         apply,
         verbose,
+        waivers_only,
         music_store,
         anime_store,
     }
@@ -136,9 +143,15 @@ fn main() {
     );
 
     let extras = nrs_import::import_extras(&extras);
-    let plan = store
+    let mut plan = store
         .plan_resync(&snapshot, &extras)
         .unwrap_or_else(|e| fail("failed to plan resync", e));
+    if args.waivers_only {
+        plan = ResyncPlan {
+            waivers_to_add: plan.waivers_to_add,
+            ..ResyncPlan::default()
+        };
+    }
     report(&plan, &snapshot, &extras, args.verbose);
 
     if plan.is_empty() {
@@ -295,6 +308,13 @@ fn report(plan: &ResyncPlan, snapshot: &Snapshot, extras: &nrs_store::ImportExtr
     println!("relations kept: {}", plan.relations_kept.len());
     for (id, r) in &plan.relations_kept {
         println!("  = {id} {}", relation(r));
+    }
+
+    println!("waivers to add: {}", plan.waivers_to_add.len());
+    if verbose {
+        for (entry, rule) in &plan.waivers_to_add {
+            println!("  + {} {rule}", name(entry));
+        }
     }
 
     let mut deltas: Vec<_> = by_target.into_iter().collect();

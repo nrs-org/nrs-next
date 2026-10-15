@@ -29,5 +29,6 @@ pub fn import_extras(extras: &BuildExtras) -> ImportExtras {
             .collect(),
         impact_share: extras.impact_share.clone(),
         shared_base: extras.shared_base.clone(),
+        waivers: extras.waivers.clone(),
     }
 }

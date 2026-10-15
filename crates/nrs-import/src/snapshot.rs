@@ -482,6 +482,29 @@ pub struct BuildExtras {
     pub impact_share: BTreeMap<ImpactId, (String, f32)>,
     /// Shared key -> the unscaled base atoms each share was scaled from.
     pub shared_base: BTreeMap<String, Vec<Atom>>,
+    /// `<validatorSuppress>`: the rules each entry is exempt from. An
+    /// impact's suppression exempts every known entry it targets.
+    pub waivers: BTreeMap<EntryId, BTreeSet<String>>,
+}
+
+impl BuildExtras {
+    fn waive<'a>(&mut self, entry: &str, rules: impl IntoIterator<Item = &'a String>) {
+        let mut rules = rules.into_iter().peekable();
+        if rules.peek().is_some() {
+            self.waivers
+                .entry(EntryId(entry.to_string()))
+                .or_default()
+                .extend(rules.cloned());
+        }
+    }
+
+    fn waive_impact(&mut self, impact: &ParsedImpact, known_ids: &BTreeSet<&str>) {
+        for (contributor, _) in &impact.contributors {
+            if known_ids.contains(contributor.as_str()) {
+                self.waive(contributor, &impact.suppress);
+            }
+        }
+    }
 }
 
 /// Whether `kind`'s anchor was a default guess rather than a confident
@@ -534,8 +557,10 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, BuildExtras, Vec<Strin
             },
         });
 
+        extras.waive(&parsed.id, &parsed.suppress);
         let context = format!("entry {}", parsed.id);
         for impact in &parsed.impacts {
+            extras.waive_impact(impact, &known_ids);
             push_impact(
                 impact,
                 SourceId(parsed.id.clone()),
@@ -638,6 +663,7 @@ pub fn build_snapshot(doc: &ParsedDocument) -> (Snapshot, BuildExtras, Vec<Strin
     }
 
     for impact in &doc.shared_impacts {
+        extras.waive_impact(impact, &known_ids);
         // A document-level impact has no enclosing entry to be its
         // source. Its largest contributor stands in, so every share of
         // the one event keeps the same source (a franchise containing

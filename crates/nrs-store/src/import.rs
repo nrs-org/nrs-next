@@ -47,7 +47,13 @@ pub struct ImportExtras {
     /// computed them before splitting, so expansion reproduces the
     /// snapshot's per-contributor values bit for bit.
     pub shared_base: BTreeMap<String, Vec<nrs_core::Atom>>,
+    /// `<validatorSuppress rules="...">`: the rules each entry is exempt
+    /// from (an impact's suppression exempts every entry it targets).
+    pub waivers: BTreeMap<EntryId, BTreeSet<String>>,
 }
+
+/// The `reason` an imported waiver is stored with.
+pub(crate) const IMPORTED_WAIVER_REASON: &str = "<validatorSuppress> in the XML";
 
 /// Where a shared impact lives when it isn't scored directly: the entry
 /// that declared it (its atoms' source) if that is an entry, else its
@@ -265,6 +271,18 @@ impl Store {
                 None
             };
             insert_relation(&tx, relation, dah_params.as_deref())?;
+        }
+
+        for (entry, rules) in &extras.waivers {
+            if !known.contains(&entry.0) {
+                continue;
+            }
+            for rule in rules {
+                tx.execute(
+                    "INSERT OR IGNORE INTO waiver (entry, rule, reason) VALUES (?1, ?2, ?3)",
+                    params![entry.0, rule, IMPORTED_WAIVER_REASON],
+                )?;
+            }
         }
 
         for anchor in &snap.palette.anchors {

@@ -18,6 +18,7 @@ mod schema;
 mod shared;
 mod snapshot;
 mod split;
+mod waiver;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,7 @@ pub use preferences::Preference;
 pub use progress::{Progress, ProgressStatus, ProgressUnit};
 pub use resync::{ReboundEntry, ResyncPlan, RetitledEntry, SharedBase, SharedChange};
 pub use review_queue::ReviewImpact;
+pub use waiver::Waiver;
 pub use split::{
     flatten as flatten_split, infer as infer_split, remove_member as remove_split_member,
     validate as validate_split, SplitNode, SplitRule,

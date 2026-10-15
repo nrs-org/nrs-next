@@ -20,6 +20,8 @@ pub enum EventKind {
     SnapshotResync,
     PreferenceRecord,
     ProgressSet,
+    WaiverSet,
+    WaiverRemove,
 }
 
 impl EventKind {
@@ -42,6 +44,8 @@ impl EventKind {
             EventKind::SnapshotResync => "snapshot.resync",
             EventKind::PreferenceRecord => "preference.record",
             EventKind::ProgressSet => "progress.set",
+            EventKind::WaiverSet => "waiver.set",
+            EventKind::WaiverRemove => "waiver.remove",
         }
     }
 }

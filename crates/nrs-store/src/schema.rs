@@ -307,9 +307,22 @@ ALTER TABLE progress ADD COLUMN unit_minutes REAL;
 ALTER TABLE progress ADD COLUMN scored INTEGER NOT NULL DEFAULT 1;
 "#;
 
+const SCHEMA_V14: &str = r#"
+-- Validation rules an entry is exempt from, and why (the legacy
+-- `<validatorSuppress rules="...">`, see `waiver.rs`). `rule` is a rule
+-- name like `dah-no-writing-impact`; nothing checks it against a list,
+-- so a waiver for a retired rule just reads back unused.
+CREATE TABLE IF NOT EXISTS waiver (
+    entry  TEXT NOT NULL REFERENCES entry(id),
+    rule   TEXT NOT NULL,
+    reason TEXT,
+    PRIMARY KEY (entry, rule)
+);
+"#;
+
 const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V12_BACKFILL,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V12_BACKFILL, SCHEMA_V14,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

@@ -508,3 +508,38 @@ fn shared_impacts_and_relation_contributors_reach_the_snapshot() {
     assert_eq!(remix_weight("A-1"), Some(Transform::Scalar(0.2 * 0.5)));
     assert_eq!(remix_weight("B-1"), Some(Transform::Scalar(0.2 * 0.25)));
 }
+
+#[test]
+fn validator_suppressions_become_entry_waivers() {
+    let doc = parse_str(
+        r#"<document>
+            <entry id="A-MAL-1" title="One">
+                <validatorSuppress rules=";dah-no-anime-altsrc;dah-visualless-entry" />
+                <pads length="1" emotions="MP">
+                    <validatorSuppress rules="dah-lone-pads" />
+                    <contributor id="A-MAL-1" factor="0.5" />
+                    <contributor id="A-MAL-2" factor="0.5" />
+                </pads>
+            </entry>
+            <entry id="A-MAL-2" title="Two" />
+        </document>"#,
+        date!(2026 - 07 - 31),
+    )
+    .expect("parse");
+    let (snapshot, extras, _) = build_snapshot(&doc);
+    let rules = |id: &str| -> Vec<&str> {
+        extras.waivers[&EntryId(id.into())]
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    assert_eq!(
+        rules("A-MAL-1"),
+        ["dah-lone-pads", "dah-no-anime-altsrc", "dah-visualless-entry"]
+    );
+    assert_eq!(rules("A-MAL-2"), ["dah-lone-pads"]);
+
+    let mut store = Store::open_in_memory().unwrap();
+    write_snapshot(&mut store, &snapshot, &extras).unwrap();
+    assert_eq!(store.waivers().unwrap().len(), 4);
+}
