@@ -1,12 +1,13 @@
 //! Where an entry stands for its viewer: planned, being watched/read,
 //! finished or dropped, and how far along (the `progress` table, V11).
 //!
-//! Progress is tracking, not scoring: nothing here produces atoms. The
-//! consumed/dropped impacts a finished or dropped entry is scored by are
-//! ordinary impacts the app writes and links back here
-//! (`consumed_impact`, `dropped_impact`), so it can update them instead
-//! of adding duplicates. A link to an impact that no longer exists
-//! (deleted by hand, removed by a resync) reads back as `None`.
+//! Nothing here produces atoms. While `scored`, the app keeps the
+//! entry's consumed impact (and, when dropped, its dropped impact) in
+//! step with the row, from `current`, `boredom` and `unit_minutes`, and
+//! links them back here (`consumed_impact`, `dropped_impact`) so it
+//! updates them instead of adding duplicates. A link to an impact that no
+//! longer exists (deleted by hand, removed by a resync) reads back as
+//! `None`.
 
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,20 @@ pub struct Progress {
     pub rewatch: u32,
     pub consumed_impact: Option<ImpactId>,
     pub dropped_impact: Option<ImpactId>,
+    /// In `[0, 1]`; `None` scores as 1 (never bored).
+    #[serde(default)]
+    pub boredom: Option<f32>,
+    /// Minutes one `unit` counts for; `None` when unknown (a chapter's).
+    #[serde(default)]
+    pub unit_minutes: Option<f32>,
+    /// Whether the linked impacts follow this row. Off once they've been
+    /// changed by hand in a way the row can't describe.
+    #[serde(default = "scored_default")]
+    pub scored: bool,
+}
+
+fn scored_default() -> bool {
+    true
 }
 
 impl Progress {
@@ -113,6 +128,9 @@ impl Progress {
             rewatch: 0,
             consumed_impact: None,
             dropped_impact: None,
+            boredom: None,
+            unit_minutes: Some(1.0).filter(|_| unit == ProgressUnit::Minute),
+            scored: true,
         }
     }
 
@@ -128,6 +146,18 @@ impl Progress {
         {
             return invalid("total must be a non-negative number");
         }
+        if self
+            .boredom
+            .is_some_and(|boredom| !(0.0..=1.0).contains(&boredom))
+        {
+            return invalid("boredom must be between 0 and 1");
+        }
+        if self
+            .unit_minutes
+            .is_some_and(|minutes| !minutes.is_finite() || minutes <= 0.0)
+        {
+            return invalid("minutes per unit must be positive");
+        }
         if let (Some(started), Some(finished)) = (self.started, self.finished) {
             if finished < started {
                 return invalid("finished before it started");
@@ -139,7 +169,8 @@ impl Progress {
 
 /// Linked impacts are joined in so a dangling link reads as `None`.
 const SELECT: &str = "SELECT p.entry, p.status, p.unit, p.current, p.total, p.started, \
-                             p.finished, p.rewatch, ci.id, di.id \
+                             p.finished, p.rewatch, ci.id, di.id, p.boredom, \
+                             p.unit_minutes, p.scored \
                         FROM progress p \
                         LEFT JOIN impact ci ON ci.id = p.consumed_impact \
                         LEFT JOIN impact di ON di.id = p.dropped_impact";
@@ -159,6 +190,9 @@ fn read_row(row: &Row) -> rusqlite::Result<(Progress, String, String)> {
         rewatch: row.get(7)?,
         consumed_impact: row.get::<_, Option<String>>(8)?.map(ImpactId),
         dropped_impact: row.get::<_, Option<String>>(9)?.map(ImpactId),
+        boredom: row.get(10)?,
+        unit_minutes: row.get(11)?,
+        scored: row.get(12)?,
     };
     Ok((progress, status, unit))
 }
@@ -216,8 +250,8 @@ impl Store {
         tx.execute(
             "INSERT OR REPLACE INTO progress \
                (entry, status, unit, current, total, started, finished, rewatch, \
-                consumed_impact, dropped_impact) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                consumed_impact, dropped_impact, boredom, unit_minutes, scored) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 progress.entry.0,
                 progress.status.as_str(),
@@ -229,6 +263,9 @@ impl Store {
                 progress.rewatch,
                 progress.consumed_impact.as_ref().map(|id| &id.0),
                 progress.dropped_impact.as_ref().map(|id| &id.0),
+                progress.boredom,
+                progress.unit_minutes,
+                progress.scored,
             ],
         )?;
         append_event(
@@ -319,6 +356,10 @@ impl Store {
             progress.current = current;
             progress.total = Some(current);
             progress.consumed_impact = Some(ImpactId(id));
+            progress.boredom = number("boredom");
+            if unit == ProgressUnit::Episode {
+                progress.unit_minutes = number("episode_duration_minutes");
+            }
             planned.push(progress);
         }
         for (target, id) in dropped {
@@ -481,6 +522,10 @@ mod tests {
         assert_eq!(plan[0].status, ProgressStatus::Completed);
         assert_eq!((plan[0].current, plan[0].total), (12.0, Some(12.0)));
         assert_eq!(plan[0].consumed_impact, Some(watched_impact));
+        assert_eq!(
+            (plan[0].boredom, plan[0].unit_minutes),
+            (Some(1.0), Some(20.0))
+        );
         assert_eq!(plan[1].entry, dropped);
         assert_eq!(plan[1].status, ProgressStatus::Dropped);
         assert_eq!((plan[1].current, plan[1].total), (3.0, None));
@@ -490,5 +535,36 @@ mod tests {
             (plan[2].unit, plan[2].current),
             (ProgressUnit::Minute, 600.0)
         );
+        assert_eq!(plan[2].unit_minutes, Some(1.0));
+        assert!(plan.iter().all(|progress| progress.scored));
+    }
+
+    #[test]
+    fn v12_takes_boredom_and_episode_length_from_the_linked_impact() {
+        let mut store = Store::open_in_memory().unwrap();
+        let entry = store.add_entry("url", "a", None).unwrap();
+        let consumed = impact(
+            &mut store,
+            &entry,
+            "anime_consumed",
+            r#"{"boredom":"0.7","episodes":"12","episode_duration_minutes":"24"}"#,
+        );
+        store
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO progress (entry, status, unit, current, consumed_impact, boredom, unit_minutes) \
+                 VALUES ('{}', 'completed', 'episode', 12, '{}', NULL, NULL); \
+                 {}",
+                entry.0,
+                consumed.0,
+                crate::schema::SCHEMA_V12_BACKFILL,
+            ))
+            .unwrap();
+        let progress = store.progress(&entry).unwrap().unwrap();
+        assert_eq!(
+            (progress.boredom, progress.unit_minutes),
+            (Some(0.7), Some(24.0))
+        );
+        assert!(progress.scored);
     }
 }

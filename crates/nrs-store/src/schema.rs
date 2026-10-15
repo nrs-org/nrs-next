@@ -284,9 +284,32 @@ CREATE TABLE IF NOT EXISTS progress (
 );
 "#;
 
+/// V13: fills V12's new columns, as its own step so a test can re-run it.
+pub(crate) const SCHEMA_V12_BACKFILL: &str = r#"
+UPDATE progress SET
+    boredom = (SELECT CAST(json_extract(i.dah_params, '$.boredom') AS REAL)
+                 FROM impact i WHERE i.id = progress.consumed_impact),
+    unit_minutes = CASE unit
+        WHEN 'minute' THEN 1.0
+        ELSE (SELECT CAST(json_extract(i.dah_params, '$.episode_duration_minutes') AS REAL)
+                FROM impact i
+               WHERE i.id = progress.consumed_impact AND i.dah_kind = 'anime_consumed')
+    END;
+"#;
+
+const SCHEMA_V12: &str = r#"
+-- Progress keeps its impacts in step (see `progress.rs`), so it holds what
+-- they're computed from: boredom (NULL = 1), minutes per counted unit
+-- (NULL = unknown), and whether syncing is on. V13
+-- (`SCHEMA_V12_BACKFILL`) fills existing rows from their linked impact.
+ALTER TABLE progress ADD COLUMN boredom REAL;
+ALTER TABLE progress ADD COLUMN unit_minutes REAL;
+ALTER TABLE progress ADD COLUMN scored INTEGER NOT NULL DEFAULT 1;
+"#;
+
 const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V12_BACKFILL,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

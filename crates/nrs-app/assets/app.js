@@ -2235,8 +2235,29 @@ function todayIso() {
 }
 
 function progressPayload(progress, changes = {}) {
-  const { status, unit, current, total, started, finished, rewatch } = { ...progress, ...changes };
-  return { status, unit, current, total, started, finished, rewatch };
+  const { status, unit, current, total, started, finished, rewatch, boredom, unit_minutes, scored } = { ...progress, ...changes };
+  return { status, unit, current, total, started, finished, rewatch, boredom, unit_minutes, scored };
+}
+
+// What one unit is worth when nothing says otherwise: the store's episode
+// length (20 for TV, as the importer counts it), a minute for minutes.
+async function defaultUnitMinutes(entryId, unit) {
+  if (unit === "minute") return 1;
+  if (unit === "episode") return (await progressBasis(entryId))?.episode_minutes || 20;
+  return null;
+}
+
+function progressScoreMarkup(progress) {
+  const unit = progressUnits[progress.unit]?.[1] || progress.unit;
+  if (!progress.scored) {
+    return `<p class="muted progress-score">Not scored from progress: its impacts were changed by hand and are left as they are. <button class="link-button" type="button" data-progress-rescore>score from progress</button></p>`;
+  }
+  if (progress.unit_minutes == null) {
+    return `<p class="muted progress-score">Scored once minutes per ${escapeHtml(unit)} are set. <button class="link-button" type="button" data-progress-edit>set them</button></p>`;
+  }
+  const parts = [`boredom ${formatCount(progress.boredom ?? 1)}`];
+  if (progress.unit !== "minute") parts.push(`${formatCount(progress.unit_minutes)} min/${escapeHtml(unit)}`);
+  return `<p class="muted progress-score">Scored as you go · ${parts.join(" · ")}</p>`;
 }
 
 function progressPanelMarkup(data, progress) {
@@ -2252,7 +2273,7 @@ function progressPanelMarkup(data, progress) {
   const open = !["completed", "dropped"].includes(progress.status);
   const dates = [
     progress.started ? `started ${escapeHtml(progress.started)}` : "",
-    progress.finished ? `finished ${escapeHtml(progress.finished)}` : "",
+    progress.finished ? `${progress.status === "dropped" ? "dropped" : "finished"} ${escapeHtml(progress.finished)}` : "",
     progress.rewatch ? `rewatch ×${progress.rewatch}` : "",
   ].filter(Boolean).join(" · ");
   return `<h2>Progress</h2>
@@ -2268,14 +2289,19 @@ function progressPanelMarkup(data, progress) {
     </div>
     ${progressBar(progress)}
     ${dates ? `<p class="muted progress-dates">${dates}</p>` : ""}
+    ${progressScoreMarkup(progress)}
     <div class="section-actions progress-actions">
-      ${progress.status !== "completed" ? `<button class="button primary" type="button" data-progress-finish="completed">finish</button>` : `<button class="button" type="button" data-progress-finish="completed">re-score</button>`}
-      ${progress.status !== "dropped" && progress.status !== "completed" ? `<button class="button" type="button" data-progress-finish="dropped">drop</button>` : ""}
+      ${open ? `<button class="button primary" type="button" data-progress-finish="completed">finish</button>` : ""}
+      ${open ? `<button class="button" type="button" data-progress-finish="dropped">drop</button>` : ""}
       <button class="button" type="button" data-progress-edit>edit</button>
       <button class="button subtle" type="button" data-progress-clear>stop tracking</button>
     </div>`;
 }
 
+/**
+ * The entry's progress panel. Every write syncs the entry's impacts on the
+ * server, so the whole entry repaints after one (score and impacts move).
+ */
 async function bindProgress(data) {
   const panel = app.querySelector("[data-progress]");
   if (!(panel instanceof HTMLElement)) return;
@@ -2292,10 +2318,9 @@ async function bindProgress(data) {
   if (currentEntryData !== data || !panel.isConnected) return;
   panel.innerHTML = progressPanelMarkup(data, progress);
 
-  const repaint = (next) => {
-    progress = next;
-    panel.innerHTML = progressPanelMarkup(data, progress);
-    bindPanel();
+  const put = async (body) => {
+    await sendJson(progressPath(entryId), "PUT", body);
+    await refreshEntry(entryId);
   };
   const guard = (action) => async (event) => {
     const button = event.currentTarget;
@@ -2307,94 +2332,128 @@ async function bindProgress(data) {
       if (button instanceof HTMLButtonElement || button instanceof HTMLSelectElement) button.disabled = false;
     }
   };
-  const bindPanel = () => {
-    panel.querySelectorAll("[data-progress-start]").forEach((button) => button.addEventListener("click", guard(async () => {
-      const status = button.getAttribute("data-progress-start");
-      const unit = defaultProgressUnit(data.entry.kind);
-      const basis = await progressBasis(entryId);
-      const body = { status, unit, current: 0, total: basisTotal(basis, unit), started: status === "active" ? todayIso() : null, finished: null, rewatch: 0 };
-      repaint((await sendJson(progressPath(entryId), "PUT", body)).progress);
-    })));
-    panel.querySelectorAll("[data-progress-step]").forEach((button) => button.addEventListener("click", guard(async () => {
-      const by = Number(button.getAttribute("data-progress-step"));
-      const next = (await sendJson(progressPath(entryId, "/step"), "POST", { by })).progress;
-      repaint(next);
-      if (by > 0 && next.total != null && next.current >= next.total) openProgressFinish(data, next, "completed", panel);
-    })));
-    panel.querySelector(".progress-status")?.addEventListener("change", guard(async (event) => {
-      const select = event.currentTarget;
-      if (!(select instanceof HTMLSelectElement)) return;
-      if (select.value === "completed" || select.value === "dropped") {
-        const status = select.value;
-        select.value = progress.status;
-        select.disabled = false;
-        openProgressFinish(data, progress, status, panel);
-        return;
-      }
-      const changes = { status: select.value };
-      if (select.value === "active" && !progress.started) changes.started = todayIso();
-      repaint((await sendJson(progressPath(entryId), "PUT", progressPayload(progress, changes))).progress);
-    }));
-    panel.querySelectorAll("[data-progress-finish]").forEach((button) => button.addEventListener("click", () => {
-      openProgressFinish(data, progress, button.getAttribute("data-progress-finish"), panel);
-    }));
-    panel.querySelector("[data-progress-edit]")?.addEventListener("click", () => openProgressEditor(data, progress, panel, repaint));
-    panel.querySelector("[data-progress-clear]")?.addEventListener("click", guard(async () => {
-      if (!confirm("Stop tracking this entry? Its impacts are kept.")) return;
-      await sendJson(progressPath(entryId), "DELETE");
-      repaint(null);
-    }));
+  panel.querySelectorAll("[data-progress-start]").forEach((button) => button.addEventListener("click", guard(async () => {
+    const status = button.getAttribute("data-progress-start");
+    const unit = defaultProgressUnit(data.entry.kind);
+    const basis = await progressBasis(entryId);
+    await put({
+      status,
+      unit,
+      current: 0,
+      total: basisTotal(basis, unit),
+      started: status === "active" ? todayIso() : null,
+      finished: null,
+      rewatch: 0,
+      boredom: null,
+      unit_minutes: await defaultUnitMinutes(entryId, unit),
+      scored: true,
+    });
+  })));
+  panel.querySelectorAll("[data-progress-step]").forEach((button) => button.addEventListener("click", guard(async () => {
+    const by = Number(button.getAttribute("data-progress-step"));
+    const next = (await sendJson(progressPath(entryId, "/step"), "POST", { by })).progress;
+    await refreshEntry(entryId);
+    const host = app.querySelector("[data-progress]");
+    if (by > 0 && next.total && next.current >= next.total && host instanceof HTMLElement && currentEntryData) {
+      openProgressFinish(currentEntryData, next, "completed", host);
+    }
+  })));
+  panel.querySelector(".progress-status")?.addEventListener("change", guard(async (event) => {
+    const select = event.currentTarget;
+    if (!(select instanceof HTMLSelectElement)) return;
+    if (select.value === "completed" || select.value === "dropped") {
+      const status = select.value;
+      select.value = progress.status;
+      select.disabled = false;
+      openProgressFinish(data, progress, status, panel);
+      return;
+    }
+    const changes = { status: select.value };
+    if (select.value === "active" && !progress.started) changes.started = todayIso();
+    await put(progressPayload(progress, changes));
+  }));
+  panel.querySelectorAll("[data-progress-finish]").forEach((button) => button.addEventListener("click", () => {
+    openProgressFinish(data, progress, button.getAttribute("data-progress-finish"), panel);
+  }));
+  panel.querySelectorAll("[data-progress-edit]").forEach((button) => button.addEventListener("click", () => openProgressEditor(data, progress, panel)));
+  panel.querySelector("[data-progress-rescore]")?.addEventListener("click", guard(async () => {
+    const unitMinutes = progress.unit_minutes ?? await defaultUnitMinutes(entryId, progress.unit);
+    await put(progressPayload(progress, { scored: true, unit_minutes: unitMinutes }));
+    showToast("Scored from progress again");
+  }));
+  panel.querySelector("[data-progress-clear]")?.addEventListener("click", guard(async () => {
+    if (!confirm("Stop tracking this entry? Its impacts are kept.")) return;
+    await sendJson(progressPath(entryId), "DELETE");
+    await refreshEntry(entryId);
+  }));
+}
+
+// The fields an impact is computed from: boredom, minutes per unit, and
+// whether the impacts follow the row at all.
+function progressScoreFields(progress, fields) {
+  const unitLabel = progressUnits[progress.unit]?.[0] || progress.unit;
+  return `
+    ${rangeField(fields, "boredom", "boredom (1 = never bored)", "1")}
+    ${progress.unit === "minute" ? "" : textField(fields, "unit_minutes", `minutes per ${unitLabel}`, "", "number", 'step="any" min="0"')}`;
+}
+
+function scoredCheckbox(checked) {
+  return `<label class="form-check"><input type="checkbox" name="scored" ${checked ? "checked" : ""}> score from progress (the consumed impact follows these numbers)</label>`;
+}
+
+function scoreValues(progress, payload) {
+  return {
+    boredom: payload.boredom === undefined ? progress.boredom : Number(payload.boredom),
+    unit_minutes: progress.unit === "minute" ? 1 : numberOrNull(payload.unit_minutes),
+    scored: Boolean(payload.scored),
   };
-  bindPanel();
 }
 
 function progressFields(progress) {
   const unitChoices = Object.entries(progressUnits).map(([key, [label]]) => [key, label]);
+  const fields = { ...progress, boredom: formatCount(progress.boredom ?? 1), unit_minutes: progress.unit_minutes == null ? "" : formatCount(progress.unit_minutes) };
   return `<div class="form-grid">
-    ${selectField(progress, "status", "status", progressStatuses.map((status) => [status, status]))}
-    ${selectField(progress, "unit", "counted in", unitChoices)}
-    ${textField(progress, "current", "progress", "0", "number", 'step="any" min="0" required')}
-    ${textField(progress, "total", "total", "", "number", 'step="any" min="0" placeholder="unknown"')}
-    ${textField(progress, "started", "started", "", "date")}
-    ${textField(progress, "finished", "finished", "", "date")}
-    ${textField(progress, "rewatch", "earlier rewatches", "0", "number", 'step="1" min="0"')}
-  </div>`;
+    ${selectField(fields, "status", "status", progressStatuses.map((status) => [status, status]))}
+    ${selectField(fields, "unit", "counted in", unitChoices)}
+    ${textField(fields, "current", "progress", "0", "number", 'step="any" min="0" required')}
+    ${textField(fields, "total", "total", "", "number", 'step="any" min="0" placeholder="unknown"')}
+    ${textField(fields, "started", "started", "", "date")}
+    ${textField(fields, "finished", "finished", "", "date")}
+    ${textField(fields, "rewatch", "earlier rewatches", "0", "number", 'step="1" min="0"')}
+    ${progressScoreFields(progress, fields)}
+  </div>
+  ${scoredCheckbox(progress.scored)}`;
 }
 
 function numberOrNull(value) {
   return value === undefined || String(value).trim() === "" ? null : Number(value);
 }
 
-function openProgressEditor(data, progress, host, repaint) {
+function openProgressEditor(data, progress, host) {
   showEditor(host, "Edit progress", progressFields(progress), async (payload) => {
+    const unit = payload.unit;
     const body = {
       status: payload.status,
-      unit: payload.unit,
+      unit,
       current: Number(payload.current),
       total: numberOrNull(payload.total),
       started: payload.started || null,
       finished: payload.finished || null,
       rewatch: Number(payload.rewatch || 0),
+      ...scoreValues({ ...progress, unit }, payload),
     };
-    repaint((await sendJson(progressPath(data.entry.id), "PUT", body)).progress);
+    await sendJson(progressPath(data.entry.id), "PUT", body);
+    await refreshEntry(data.entry.id);
   });
 }
 
 /**
- * Finishing or dropping: confirms the count and asks for what the
- * consumed impact needs (boredom, minutes per unit). The linked impact,
- * if any, supplies the defaults; unchecking "score" just records it.
+ * Finishing or dropping: confirms the count and the date, with the
+ * scoring values to check one last time.
  */
 async function openProgressFinish(data, progress, status, host) {
   const entryId = data.entry.id;
-  const linked = data.impacts.find((impact) => impact.id === progress.consumed_impact);
-  const params = linked?.params || {};
-  let unitMinutes = "";
-  if (progress.unit === "episode") {
-    unitMinutes = params.episode_duration_minutes || (await progressBasis(entryId))?.episode_minutes || 20;
-  } else if (progress.unit !== "minute" && params.duration_minutes && progress.current) {
-    unitMinutes = Number(params.duration_minutes) / progress.current;
-  }
+  const unitMinutes = progress.unit_minutes ?? await defaultUnitMinutes(entryId, progress.unit);
   // The count so far, not the total: a total can be a still-airing
   // show's planned count, and counting unwatched episodes inflates the score.
   const current = progress.current;
@@ -2402,29 +2461,25 @@ async function openProgressFinish(data, progress, status, host) {
   const fields = {
     current: formatCount(current),
     finished: progress.finished || todayIso(),
-    boredom: params.boredom ?? "1",
-    unit_minutes: unitMinutes === "" ? "" : formatCount(Number(unitMinutes)),
+    boredom: formatCount(progress.boredom ?? 1),
+    unit_minutes: unitMinutes == null ? "" : formatCount(unitMinutes),
   };
-  const lead = linked
-    ? "Updates this entry's consumed impact instead of adding another."
-    : "Adds a consumed impact from the count.";
   const body = `
-    <p class="form-note editor-intro">${escapeHtml(lead)}${status === "dropped" ? " A dropped impact is added too." : ""}</p>
+    ${status === "dropped" ? `<p class="form-note editor-intro">A dropped impact is added while it stays dropped.</p>` : ""}
     <div class="form-grid">
       ${textField(fields, "current", `${unitLabel}s done`, "", "number", 'step="any" min="0" required')}
       ${textField(fields, "finished", status === "dropped" ? "dropped on" : "finished on", "", "date")}
-      ${rangeField(fields, "boredom", "boredom (1 = never bored)", "1")}
-      ${progress.unit === "minute" ? "" : textField(fields, "unit_minutes", `minutes per ${unitLabel}`, "", "number", 'step="any" min="0"')}
+      ${progressScoreFields(progress, fields)}
     </div>
-    <label class="form-check"><input type="checkbox" name="score" checked> score it (write the consumed impact)</label>`;
+    ${scoredCheckbox(progress.scored)}`;
   const editor = showEditor(host, status === "dropped" ? "Drop" : "Finish", body, async (payload) => {
     const request = progressPayload(progress, {
       status,
       current: Number(payload.current),
       finished: payload.finished || null,
+      ...scoreValues(progress, payload),
     });
     if (status === "completed" && request.total == null) request.total = request.current;
-    if (payload.score) request.score = { boredom: Number(payload.boredom), unit_minutes: numberOrNull(payload.unit_minutes) };
     await sendJson(progressPath(entryId), "PUT", request);
     showToast(status === "dropped" ? "Dropped" : "Finished");
     await refreshEntry(entryId);

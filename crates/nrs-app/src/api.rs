@@ -2117,6 +2117,7 @@ pub(super) async fn impact_edit(
     store
         .set_impact_dah(&id, &kind, &dah_params_json(&fields), factor)
         .map_err(|error| store_error("save impact metadata", error))?;
+    progress::impact_edited(&mut store, &entry_id, &impact_id)?;
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(impact_id),
@@ -2139,9 +2140,11 @@ pub(super) async fn impact_delete(
     // A shared impact goes as a whole, from any member's page; dropping a
     // single share is an edit of the share list.
     scoped_impact(&store, &entry_id, &impact_id)?;
+    let linked = progress::linked_row(&store, &entry_id, &impact_id)?;
     store
         .delete_impact(&ImpactId(impact_id.clone()))
         .map_err(|error| store_error("delete impact", error))?;
+    progress::impact_detached(&mut store, linked)?;
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(impact_id),
@@ -2220,6 +2223,8 @@ pub(super) async fn impact_make_shared(
     store
         .make_impact_shared(&ImpactId(impact_id.clone()))
         .map_err(|error| store_error("share impact", error))?;
+    let linked = progress::linked_row(&store, &entry_id, &impact_id)?;
+    progress::impact_detached(&mut store, linked)?;
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(impact_id),

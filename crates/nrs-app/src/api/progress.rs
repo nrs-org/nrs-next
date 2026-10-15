@@ -1,11 +1,14 @@
 //! Watch/read progress (`nrs_store::Progress`): one entry's status and
 //! count, and the list of everything tracked.
 //!
-//! Finishing or dropping an entry can also score it: a `PUT` with
-//! `score` writes the consumed impact from the count (`anime_consumed`
-//! by episode, else `consumed` by minutes) and, for a drop, a `dropped`
-//! impact, and links both to the row so the next finish updates them
-//! rather than adding more. Without `score` no impact is touched.
+//! A scored row and its impacts are kept in step both ways. Every write to
+//! the row (a step, an edit, a finish) rewrites the consumed impact from
+//! the count, `boredom` and `unit_minutes` (`anime_consumed` by episode,
+//! else `consumed` by minutes), and keeps a `dropped` impact exactly while
+//! the status is dropped (`sync_impacts`). Editing the linked consumed
+//! impact in the kind form writes its values back to the row
+//! (`impact_edited`); deleting, raw-editing or sharing it turns syncing
+//! off (`impact_detached`), so a hand change isn't overwritten.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,6 +63,9 @@ pub(crate) struct ProgressView {
     rewatch: u32,
     consumed_impact: Option<String>,
     dropped_impact: Option<String>,
+    boredom: Option<f32>,
+    unit_minutes: Option<f32>,
+    scored: bool,
 }
 
 impl From<&Progress> for ProgressView {
@@ -74,6 +80,9 @@ impl From<&Progress> for ProgressView {
             rewatch: progress.rewatch,
             consumed_impact: progress.consumed_impact.as_ref().map(|id| id.0.clone()),
             dropped_impact: progress.dropped_impact.as_ref().map(|id| id.0.clone()),
+            boredom: progress.boredom,
+            unit_minutes: progress.unit_minutes,
+            scored: progress.scored,
         }
     }
 }
@@ -120,6 +129,15 @@ fn write(store: &mut TrackedStore, progress: &Progress) -> Result<(), ApiErr> {
     store.set_progress(progress, None).map_err(invalid)
 }
 
+/// Validates, brings the impacts in line, then saves the row (whose links
+/// the sync may have changed). Validating first means a rejected row
+/// leaves no impacts behind.
+fn save(store: &mut TrackedStore, progress: &mut Progress) -> Result<(), ApiErr> {
+    progress.validate().map_err(invalid)?;
+    sync_impacts(store, progress)?;
+    write(store, progress)
+}
+
 pub(crate) async fn progress_get(
     State(state): State<Arc<AppState>>,
     Path(entry_id): Path<String>,
@@ -128,12 +146,8 @@ pub(crate) async fn progress_get(
     respond(load(&store, &EntryId(entry_id))?.as_ref())
 }
 
-/// What to score a finish or a drop with.
-#[derive(Deserialize)]
-pub(crate) struct ScoreInput {
-    boredom: f32,
-    /// Minutes per counted unit; ignored for `minute`.
-    unit_minutes: Option<f32>,
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -146,7 +160,11 @@ pub(crate) struct ProgressInput {
     finished: Option<String>,
     #[serde(default)]
     rewatch: u32,
-    score: Option<ScoreInput>,
+    boredom: Option<f32>,
+    /// Ignored for `minute`, which is 1.
+    unit_minutes: Option<f32>,
+    #[serde(default = "yes")]
+    scored: bool,
 }
 
 fn optional_day(value: Option<&str>) -> Result<Option<i32>, ApiErr> {
@@ -176,68 +194,70 @@ pub(crate) async fn progress_set(
         rewatch: input.rewatch,
         consumed_impact: before.as_ref().and_then(|p| p.consumed_impact.clone()),
         dropped_impact: before.as_ref().and_then(|p| p.dropped_impact.clone()),
+        boredom: input.boredom,
+        unit_minutes: match input.unit {
+            ProgressUnit::Minute => Some(1.0),
+            _ => input.unit_minutes,
+        },
+        scored: input.scored,
     };
-    // Checked before scoring, so a rejected row leaves no impacts behind.
-    progress.validate().map_err(invalid)?;
-    if let Some(score) = &input.score {
-        score_progress(&mut store, &mut progress, score)?;
-    }
-    write(&mut store, &progress)?;
+    save(&mut store, &mut progress)?;
     respond(Some(&progress))
 }
 
-/// Writes (or rewrites) the impacts `progress` is scored by; see the
-/// module docs.
-fn score_progress(
-    store: &mut TrackedStore,
-    progress: &mut Progress,
-    score: &ScoreInput,
-) -> Result<(), ApiErr> {
-    let bad = |message: &str| Err(api_error(StatusCode::BAD_REQUEST, message));
-    if !matches!(
-        progress.status,
-        ProgressStatus::Completed | ProgressStatus::Dropped
-    ) {
-        return bad("only a completed or dropped entry is scored");
+/// The consumed impact `progress` should have, as kind form fields:
+/// `None` with nothing consumed yet, or minutes per unit unknown.
+fn consumed_fields(progress: &Progress) -> Option<HashMap<String, String>> {
+    let minutes = progress.unit_minutes?;
+    if progress.current <= 0.0 {
+        return None;
     }
-    if !(0.0..=1.0).contains(&score.boredom) {
-        return bad("boredom must be between 0 and 1");
+    let boredom = progress.boredom.unwrap_or(1.0);
+    let mut fields = HashMap::from([("boredom".to_string(), boredom.to_string())]);
+    if progress.unit == ProgressUnit::Episode {
+        fields.insert("kind".into(), "anime_consumed".into());
+        fields.insert("episodes".into(), progress.current.to_string());
+        fields.insert("episode_duration_minutes".into(), minutes.to_string());
+    } else {
+        fields.insert("kind".into(), "consumed".into());
+        fields.insert(
+            "duration_minutes".into(),
+            (progress.current * minutes).to_string(),
+        );
     }
-    let unit_minutes = match progress.unit {
-        ProgressUnit::Minute => 1.0,
-        _ => match score.unit_minutes {
-            Some(minutes) if minutes.is_finite() && minutes > 0.0 => minutes,
-            _ => return bad("minutes per unit are needed to score this progress"),
-        },
-    };
+    Some(fields)
+}
+
+/// Makes the linked impacts match `progress` (see the module docs).
+/// Nothing is touched while it isn't `scored`.
+fn sync_impacts(store: &mut TrackedStore, progress: &mut Progress) -> Result<(), ApiErr> {
+    if !progress.scored {
+        return Ok(());
+    }
     let entry_id = progress.entry.0.clone();
-    if progress.current > 0.0 {
-        let mut fields = HashMap::from([("boredom".to_string(), score.boredom.to_string())]);
-        if progress.unit == ProgressUnit::Episode {
-            fields.insert("kind".into(), "anime_consumed".into());
-            fields.insert("episodes".into(), progress.current.to_string());
-            fields.insert("episode_duration_minutes".into(), unit_minutes.to_string());
-        } else {
-            fields.insert("kind".into(), "consumed".into());
-            fields.insert(
-                "duration_minutes".into(),
-                (progress.current * unit_minutes).to_string(),
-            );
+    match (consumed_fields(progress), progress.consumed_impact.clone()) {
+        (Some(fields), existing) => {
+            progress.consumed_impact =
+                Some(upsert_impact(store, &entry_id, existing.as_ref(), fields)?);
         }
-        progress.consumed_impact = Some(upsert_impact(
-            store,
-            &entry_id,
-            progress.consumed_impact.as_ref(),
-            fields,
-        )?);
+        // Back to nothing consumed. (Unknown minutes per unit keep what's
+        // there: the count alone can't say what it's worth.)
+        (None, Some(id)) if progress.current <= 0.0 => {
+            store
+                .delete_impact(&id)
+                .map_err(|error| store_error("delete consumed impact", error))?;
+            progress.consumed_impact = None;
+        }
+        (None, _) => {}
     }
-    match (progress.status, progress.dropped_impact.clone()) {
-        (ProgressStatus::Dropped, None) => {
+    let dropped = progress.status == ProgressStatus::Dropped;
+    match (dropped, progress.dropped_impact.clone()) {
+        (true, None) => {
             let fields = HashMap::from([("kind".to_string(), "dropped".to_string())]);
             progress.dropped_impact = Some(upsert_impact(store, &entry_id, None, fields)?);
         }
-        // Picked back up and finished: the drop no longer holds.
-        (ProgressStatus::Completed, Some(id)) => {
+        // Picked back up: the drop no longer holds.
+        (false, Some(id)) => {
             store
                 .delete_impact(&id)
                 .map_err(|error| store_error("delete dropped impact", error))?;
@@ -246,6 +266,39 @@ fn score_progress(
         _ => {}
     }
     Ok(())
+}
+
+/// A stored kind parameter as a number (they're kept as form strings).
+fn param(params: &serde_json::Value, key: &str) -> Option<f32> {
+    match &params[key] {
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        value => value.as_f64().map(|value| value as f32),
+    }
+}
+
+/// Whether `impact` already says what `fields` would write, so a status
+/// change or a step that doesn't move the count adds no impact event.
+fn same_values(impact: &nrs_store::ReviewImpact, fields: &HashMap<String, String>) -> bool {
+    if impact.dah_kind.as_deref() != fields.get("kind").map(String::as_str) {
+        return false;
+    }
+    let Some(stored) = impact
+        .dah_params
+        .as_deref()
+        .and_then(|params| serde_json::from_str::<serde_json::Value>(params).ok())
+    else {
+        return false;
+    };
+    fields
+        .iter()
+        .filter(|(key, _)| *key != "kind")
+        .all(|(key, value)| {
+            let wanted = value.parse::<f32>().ok();
+            match (param(&stored, key), wanted) {
+                (Some(stored), Some(wanted)) => (stored - wanted).abs() < 1e-4,
+                _ => false,
+            }
+        })
 }
 
 /// Rewrites `existing` (keeping its note) or adds a new impact from the
@@ -258,6 +311,9 @@ fn upsert_impact(
 ) -> Result<ImpactId, ApiErr> {
     if let Some(id) = existing {
         let impact = scoped_impact(store, entry_id, &id.0)?;
+        if same_values(&impact, &fields) {
+            return Ok(id.clone());
+        }
         if !impact.members.is_empty() {
             return Err(api_error(
                 StatusCode::CONFLICT,
@@ -287,15 +343,100 @@ fn upsert_impact(
     Ok(id)
 }
 
+/// The scored progress row whose impacts include `impact_id`, if any.
+/// Look it up before deleting the impact: afterwards the link reads as
+/// `None`.
+pub(super) fn linked_row(
+    store: &TrackedStore,
+    entry_id: &str,
+    impact_id: &str,
+) -> Result<Option<Progress>, ApiErr> {
+    Ok(load(store, &EntryId(entry_id.into()))?.filter(|progress| {
+        progress.scored
+            && [&progress.consumed_impact, &progress.dropped_impact]
+                .into_iter()
+                .flatten()
+                .any(|id| id.0 == impact_id)
+    }))
+}
+
+/// A linked impact was changed in a way the row can't follow (deleted,
+/// raw-edited, shared): stop syncing, so the next step doesn't undo it.
+pub(super) fn impact_detached(
+    store: &mut TrackedStore,
+    row: Option<Progress>,
+) -> Result<(), ApiErr> {
+    let Some(mut progress) = row else {
+        return Ok(());
+    };
+    progress.scored = false;
+    write(store, &progress)
+}
+
+/// The linked impact `impact_id` was just saved through the kind form:
+/// carry its values back to the row, or stop syncing if they no longer
+/// describe it (changed to another kind). Edits to the linked dropped
+/// impact are left alone.
+pub(super) fn impact_edited(
+    store: &mut TrackedStore,
+    entry_id: &str,
+    impact_id: &str,
+) -> Result<(), ApiErr> {
+    let Some(mut progress) = linked_row(store, entry_id, impact_id)? else {
+        return Ok(());
+    };
+    if progress.consumed_impact.as_ref().map(|id| id.0.as_str()) != Some(impact_id) {
+        return Ok(());
+    }
+    let impact = scoped_impact(store, entry_id, impact_id)?;
+    let params: serde_json::Value = impact
+        .dah_params
+        .as_deref()
+        .and_then(|params| serde_json::from_str(params).ok())
+        .unwrap_or_default();
+    let kind = impact.dah_kind.as_deref();
+    let follows = match (kind, progress.unit) {
+        (Some("anime_consumed"), ProgressUnit::Episode) => {
+            match (
+                param(&params, "episodes"),
+                param(&params, "episode_duration_minutes"),
+            ) {
+                (Some(episodes), Some(minutes)) if minutes > 0.0 => {
+                    progress.current = episodes;
+                    progress.unit_minutes = Some(minutes);
+                    true
+                }
+                _ => false,
+            }
+        }
+        (Some("consumed"), unit) if unit != ProgressUnit::Episode => {
+            match (param(&params, "duration_minutes"), progress.unit_minutes) {
+                (Some(duration), Some(minutes)) => {
+                    progress.current = duration / minutes;
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if follows {
+        progress.boredom = param(&params, "boredom").or(progress.boredom);
+    } else {
+        progress.scored = false;
+    }
+    write(store, &progress)
+}
+
 #[derive(Deserialize)]
 pub(crate) struct StepInput {
     by: f32,
 }
 
 /// Moves the count by `by` (clamped to `[0, total]`; a total of 0 is
-/// unknown, like the stores' count for a show still airing). Stepping forward
-/// starts a planned or paused entry and dates its start; reaching the
-/// total is left for the client to confirm as a finish.
+/// unknown, like the stores' count for a show still airing). Stepping
+/// forward starts a planned or paused entry and dates its start; reaching
+/// the total is left for the client to confirm as a finish.
 pub(crate) async fn progress_step(
     State(state): State<Arc<AppState>>,
     Path(entry_id): Path<String>,
@@ -322,7 +463,7 @@ pub(crate) async fn progress_step(
         }
         progress.started.get_or_insert_with(today);
     }
-    write(&mut store, &progress)?;
+    save(&mut store, &mut progress)?;
     respond(Some(&progress))
 }
 
@@ -408,6 +549,60 @@ pub(crate) async fn progress_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(unit: ProgressUnit, current: f32, unit_minutes: Option<f32>) -> Progress {
+        let mut progress = Progress::new(EntryId("e".into()), ProgressStatus::Active, unit);
+        progress.current = current;
+        progress.unit_minutes = unit_minutes;
+        progress
+    }
+
+    #[test]
+    fn consumed_fields_follow_the_unit() {
+        let episodes = consumed_fields(&row(ProgressUnit::Episode, 3.0, Some(20.0))).unwrap();
+        assert_eq!(episodes["kind"], "anime_consumed");
+        assert_eq!(
+            (episodes["episodes"].as_str(), episodes["boredom"].as_str()),
+            ("3", "1")
+        );
+        let chapters = consumed_fields(&row(ProgressUnit::Chapter, 10.0, Some(6.0))).unwrap();
+        assert_eq!(
+            (
+                chapters["kind"].as_str(),
+                chapters["duration_minutes"].as_str()
+            ),
+            ("consumed", "60")
+        );
+        // Nothing watched, or no idea what a chapter is worth: no impact.
+        assert!(consumed_fields(&row(ProgressUnit::Episode, 0.0, Some(20.0))).is_none());
+        assert!(consumed_fields(&row(ProgressUnit::Chapter, 10.0, None)).is_none());
+    }
+
+    #[test]
+    fn same_values_compares_stored_numbers_not_strings() {
+        let fields = consumed_fields(&row(ProgressUnit::Episode, 3.0, Some(20.0))).unwrap();
+        let mut impact = nrs_store::ReviewImpact {
+            id: ImpactId("i".into()),
+            target: EntryId("e".into()),
+            atoms: Vec::new(),
+            note: None,
+            source_comment: None,
+            needs_review: false,
+            dah_kind: Some("anime_consumed".into()),
+            dah_params: Some(
+                r#"{"boredom":"1.0","episodes":"3","episode_duration_minutes":"20","source":"e"}"#
+                    .into(),
+            ),
+            dah_factor: Some(1.0),
+            members: Vec::new(),
+            split: None,
+            split_stored: false,
+        };
+        assert!(same_values(&impact, &fields));
+        impact.dah_params =
+            Some(r#"{"boredom":"1","episodes":"2","episode_duration_minutes":"20"}"#.into());
+        assert!(!same_values(&impact, &fields));
+    }
 
     #[test]
     fn days_round_trip_through_iso_dates() {
