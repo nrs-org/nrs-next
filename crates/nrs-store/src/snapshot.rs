@@ -195,6 +195,7 @@ impl Store {
             k_feat: k_feat.clone(),
             time: stored.time,
             calibration,
+            sign: stored.sign,
         })
     }
 }

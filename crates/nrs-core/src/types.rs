@@ -266,13 +266,31 @@ impl Default for TimeParams {
     }
 }
 
+/// How positive and negative mass on one entry combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum SignMode {
+    /// Positive and negative atoms pool as two separate measures and the
+    /// value is `V(mu+) - V(mu-)`: a negative is an independent bad
+    /// experience and costs its standalone value, however much positive
+    /// mass sits beside it.
+    #[default]
+    Split,
+    /// One signed measure: opposite masses cancel in embedded units, so a
+    /// negative costs only what a positive of its size would add there.
+    Signed,
+}
+
 /// `Theta` - the fitted knobs (INFRA.md §4.2): the pooling-exponent
-/// matrix, the time decorrelation, and the public-scale calibration.
+/// matrix, the time decorrelation, the public-scale calibration, and
+/// how signs combine.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Params {
     pub k_feat: KFeatMatrix,
     pub time: TimeParams,
     pub calibration: Isotonic,
+    pub sign: SignMode,
 }
 
 /// `score`'s output: public scale `S_e` per entry.
@@ -284,7 +302,9 @@ pub struct Scores {
 /// One anchor's share of an entry's value. `embedded` is the resolved
 /// signed embedded mass `e`, `mass` its value-unit form
 /// `sgn(e) |e|^w`, and `contribution` its Euler share of the value
-/// (`mass * dV/dmass`; the shares sum to the value).
+/// (`mass * dV/dmass`; the shares sum to the value). Under
+/// `SignMode::Split` each field is the anchor's positive part minus its
+/// negative part.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Contribution {
     pub anchor: AnchorId,

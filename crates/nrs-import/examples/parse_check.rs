@@ -59,6 +59,7 @@ fn main() {
         k_feat: snapshot.palette.k_feat.clone(),
         time: Default::default(),
         calibration: nrs_core::Isotonic::default(),
+        sign: Default::default(),
     };
     let scores = nrs_core::score(&snapshot, &params);
     let non_finite = scores.values.values().filter(|v| !v.is_finite()).count();

@@ -251,6 +251,11 @@ function renderError(error) {
 }
 
 const SCORE_PAGE_SIZE = 100;
+/** How negatives combine (`nrs_core::SignMode`). */
+const signModes = {
+  split: "split: a negative costs its full value",
+  signed: "signed: a negative cancels against positives",
+};
 
 function deltaMarkup(delta) {
   if (delta == null) return `<span class="dim">new</span>`;
@@ -301,15 +306,18 @@ async function renderScores() {
     q: params.get("q") || "",
     shared: params.get("shared") || "",
     length: params.get("length") || "",
+    sign: params.get("sign") || "",
     cmp_gen: params.get("cmp_gen") || "",
     cmp_shared: params.get("cmp_shared") || "",
     cmp_length: params.get("cmp_length") || "",
+    cmp_sign: params.get("cmp_sign") || "",
   };
-  const comparing = Boolean(view.cmp_gen || view.cmp_shared || view.cmp_length);
+  const comparing = Boolean(view.cmp_gen || view.cmp_shared || view.cmp_length || view.cmp_sign);
   const compareLabel = [
     view.cmp_gen ? `version ${view.cmp_gen}` : "",
     view.cmp_shared ? `λ ${view.cmp_shared}` : "",
     view.cmp_length ? `L ${view.cmp_length} days` : "",
+    view.cmp_sign ? `${view.cmp_sign} negatives` : "",
   ].filter(Boolean).join(" · ");
   const columns = [
     ["rank", "#", "value"],
@@ -325,6 +333,7 @@ async function renderScores() {
     <form class="score-controls">
       ${textField(view, "shared", "time: shared λ (1 = ignore dates)", "", "number", 'min="0" max="1" step="0.05"')}
       ${textField(view, "length", "time: length L (days)", "", "number", 'min="1" step="1"')}
+      ${selectField(view, "sign", "negatives", [["", "default"], ...Object.entries(signModes)])}
       <button class="button primary" type="submit">rerun</button>
       <button class="button" type="button" data-save-time>save as default</button>
     </form>
@@ -379,7 +388,7 @@ async function renderScores() {
 
   const syncView = () => {
     history.replaceState(null, "", pageUrl());
-    const { cmp_gen, cmp_shared, cmp_length, ...exported } = view;
+    const { cmp_gen, cmp_shared, cmp_length, cmp_sign, ...exported } = view;
     csv.href = `/api/v1/scores.csv?${new URLSearchParams(Object.entries(exported).filter(([, value]) => value !== ""))}`;
     app.querySelectorAll(".sort-button").forEach((button) => {
       const active = button.getAttribute("data-sort") === view.sort;
@@ -406,12 +415,14 @@ async function renderScores() {
       if (page.offset === 0) {
         paintFilters(page);
         noteGeneration(page);
-        effective = page.time;
-        stored = page.stored_time;
+        effective = { ...page.time, sign: page.sign };
+        stored = { ...page.stored_time, sign: page.stored_sign };
         const sharedInput = controls.elements.namedItem("shared");
         const lengthInput = controls.elements.namedItem("length");
+        const signInput = controls.elements.namedItem("sign");
         if (sharedInput instanceof HTMLInputElement) sharedInput.placeholder = String(stored.shared);
         if (lengthInput instanceof HTMLInputElement) lengthInput.placeholder = String(stored.length_days);
+        if (signInput instanceof HTMLSelectElement) signInput.options[0].textContent = `default (${stored.sign})`;
       }
       count.textContent = total === page.database_total ? `${total} entries` : `${total} of ${page.database_total} entries`;
       sentinel.innerHTML = loaded < total ? `<p class="loading">Loading more…</p>` : total ? "" : `<p class="empty">No matching entries.</p>`;
@@ -440,7 +451,8 @@ async function renderScores() {
     warnings.hidden = !page.warnings.length;
     warnings.textContent = page.warnings.join(" · ");
   }
-  // The time settings the current ranking used, and the stored defaults.
+  // The time and sign settings the current ranking used, and the stored
+  // defaults.
   let effective = null;
   let stored = null;
   // The last ranking version this tab saw, so an edit made elsewhere
@@ -528,28 +540,30 @@ async function renderScores() {
     if (previousGeneration !== null) navigate(pageUrl({ cmp_gen: previousGeneration }));
   });
 
-  const timeInputs = () => {
+  const settingInputs = () => {
     const form = new FormData(controls);
-    return { shared: String(form.get("shared") || "").trim(), length: String(form.get("length") || "").trim() };
+    return { shared: String(form.get("shared") || "").trim(), length: String(form.get("length") || "").trim(), sign: String(form.get("sign") || "") };
   };
   controls.addEventListener("submit", (event) => {
     event.preventDefault();
-    const { shared, length } = timeInputs();
+    const { shared, length, sign } = settingInputs();
     const before = effective;
-    const next = { shared: shared === "" ? stored?.shared : Number(shared), length: length === "" ? stored?.length_days : Number(length) };
-    const changed = before && (next.shared !== before.shared || next.length !== before.length_days);
+    const next = { shared: shared === "" ? stored?.shared : Number(shared), length: length === "" ? stored?.length_days : Number(length), sign: sign || stored?.sign };
+    const changed = before && (next.shared !== before.shared || next.length !== before.length_days || next.sign !== before.sign);
     // Compare against the run being replaced, so Δ answers "what did
     // this change do?".
-    navigate(pageUrl({ shared, length, cmp_gen: "", ...(changed ? { cmp_shared: String(before.shared), cmp_length: String(before.length_days) } : { cmp_shared: "", cmp_length: "" }) }));
+    navigate(pageUrl({ shared, length, sign, cmp_gen: "", ...(changed ? { cmp_shared: String(before.shared), cmp_length: String(before.length_days), cmp_sign: before.sign } : { cmp_shared: "", cmp_length: "", cmp_sign: "" }) }));
   });
   app.querySelector("[data-save-time]")?.addEventListener("click", async () => {
     if (!effective) return;
-    const { shared, length } = timeInputs();
+    const { shared, length, sign } = settingInputs();
     const payload = { shared: shared === "" ? effective.shared : Number(shared), length_days: length === "" ? effective.length_days : Number(length) };
+    const nextSign = sign || effective.sign;
     try {
       await sendJson("/api/v1/calibration/time", "PUT", payload);
-      showToast(`time saved: λ ${payload.shared} · L ${payload.length_days} days`);
-      navigate(pageUrl({ shared: "", length: "" }));
+      if (nextSign !== stored?.sign) await sendJson("/api/v1/calibration/sign", "PUT", { sign: nextSign });
+      showToast(`saved: λ ${payload.shared} · L ${payload.length_days} days · ${nextSign} negatives`);
+      navigate(pageUrl({ shared: "", length: "", sign: "" }));
     } catch (error) {
       showToast(error?.message || String(error), "error");
     }
@@ -1203,6 +1217,7 @@ function scorePanelMarkup(score, openDisclosures) {
         ${rank(score.rank, score.total, "overall")}
         ${rank(score.kind_rank, score.kind_total, score.kind)}
         <div><dt>time</dt><dd>λ ${score.time.shared.toFixed(2)}<small> · L ${Math.round(score.time.length_days)}d</small></dd></div>
+        <div><dt>negatives</dt><dd title="${escapeHtml(signModes[score.sign] || "")}">${escapeHtml(score.sign)}</dd></div>
       </dl>
     </div>
     ${score.anchors.length ? anchorStrip(score.anchors) : `<p class="empty">No scored mass yet.</p>`}

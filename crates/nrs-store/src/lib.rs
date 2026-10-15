@@ -54,6 +54,8 @@ pub(crate) const DEFAULT_MEDIUM: &str = "default";
 pub(crate) struct StoredParams {
     #[serde(default)]
     pub time: nrs_core::TimeParams,
+    #[serde(default)]
+    pub sign: nrs_core::SignMode,
 }
 
 pub struct Store {

@@ -14,7 +14,9 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use nrs_core::{Entry, EntryId, ImpactId, RelKind, SourceId, TimeParams, TimeSupport, Transform};
+use nrs_core::{
+    Entry, EntryId, ImpactId, RelKind, SignMode, SourceId, TimeParams, TimeSupport, Transform,
+};
 use nrs_entry_store::EntryStore as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -180,6 +182,9 @@ pub(super) struct ScoresQuery {
     /// view: the shared fraction `λ` and the length `L` in days.
     shared: Option<f32>,
     length: Option<f32>,
+    /// How negatives combine, overriding the stored `SignMode` for this
+    /// view.
+    sign: Option<SignMode>,
     /// Another ranking to report rank changes against (`delta`): an
     /// earlier store generation (the one the client last saw, so an edit
     /// shows what it moved) and/or other time settings. Omitted parts
@@ -188,14 +193,16 @@ pub(super) struct ScoresQuery {
     cmp_gen: Option<u64>,
     cmp_shared: Option<f32>,
     cmp_length: Option<f32>,
+    cmp_sign: Option<SignMode>,
 }
 
-/// Which ranking: a store generation under some time settings.
+/// Which ranking: a store generation under some time and sign settings.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct ScoresKey {
     generation: u64,
     shared_bits: u32,
     length_bits: u32,
+    sign: SignMode,
 }
 
 impl ScoresKey {
@@ -234,8 +241,10 @@ pub(super) struct ScoresCache(std::sync::Mutex<Vec<(ScoresKey, Arc<Vec<Scored>>)
 
 const SCORES_CACHE_SIZE: usize = 4;
 
-/// The store generation and stored time settings right now.
-fn current(state: &AppState) -> Result<(u64, TimeParams), (StatusCode, Json<ApiError>)> {
+/// The store generation and stored time and sign settings right now.
+fn current(
+    state: &AppState,
+) -> Result<(u64, TimeParams, SignMode), (StatusCode, Json<ApiError>)> {
     match &state.store {
         Some(store) => {
             let store = store
@@ -244,9 +253,9 @@ fn current(state: &AppState) -> Result<(u64, TimeParams), (StatusCode, Json<ApiE
             let (_, params) = store
                 .load_snapshot()
                 .map_err(|error| store_error("load params", error))?;
-            Ok((store.generation, params.time))
+            Ok((store.generation, params.time, params.sign))
         }
-        None => Ok((0, TimeParams::default())),
+        None => Ok((0, TimeParams::default(), SignMode::default())),
     }
 }
 
@@ -262,7 +271,7 @@ fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode,
         return Ok(Some(hit));
     }
     let rank = |snapshot: &nrs_core::Snapshot, k_feat, hints: KindHints| -> Vec<Scored> {
-        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat, key.time())
+        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat, key.time(), key.sign)
             .into_iter()
             .enumerate()
             .map(|(index, row)| Scored {
@@ -324,6 +333,8 @@ struct ScoresView {
     generation: u64,
     time: TimeParams,
     stored_time: TimeParams,
+    sign: SignMode,
+    stored_sign: SignMode,
     ranking: Arc<Vec<Scored>>,
     previous_rank: Option<HashMap<String, usize>>,
     filter: ScoreFilter,
@@ -342,12 +353,14 @@ pub(super) struct KindCount {
 
 impl ScoresView {
     fn new(state: &AppState, query: &ScoresQuery) -> Result<Self, (StatusCode, Json<ApiError>)> {
-        let (generation, stored_time) = current(state)?;
+        let (generation, stored_time, stored_sign) = current(state)?;
         let time = time_override(stored_time, query.shared, query.length);
+        let sign = query.sign.unwrap_or(stored_sign);
         let key = ScoresKey {
             generation,
             shared_bits: time.shared.to_bits(),
             length_bits: time.length_days.to_bits(),
+            sign,
         };
         let ranking = scored(state, key)?.ok_or_else(|| {
             api_error(
@@ -355,14 +368,17 @@ impl ScoresView {
                 "the store changed while scoring; retry",
             )
         })?;
-        let comparing =
-            query.cmp_gen.is_some() || query.cmp_shared.is_some() || query.cmp_length.is_some();
+        let comparing = query.cmp_gen.is_some()
+            || query.cmp_shared.is_some()
+            || query.cmp_length.is_some()
+            || query.cmp_sign.is_some();
         let previous_rank = if comparing {
             let cmp_time = time_override(time, query.cmp_shared, query.cmp_length);
             let cmp_key = ScoresKey {
                 generation: query.cmp_gen.unwrap_or(generation),
                 shared_bits: cmp_time.shared.to_bits(),
                 length_bits: cmp_time.length_days.to_bits(),
+                sign: query.cmp_sign.unwrap_or(sign),
             };
             scored(state, cmp_key)?.map(|previous| {
                 previous
@@ -378,6 +394,8 @@ impl ScoresView {
             generation,
             time,
             stored_time,
+            sign,
+            stored_sign,
             ranking,
             previous_rank,
             filter,
@@ -523,9 +541,12 @@ pub(super) struct ScoresPage {
     /// Whether the comparison was honoured (an earlier generation's
     /// ranking may have left the cache).
     comparing: bool,
-    /// The time settings this ranking used, and the stored defaults.
+    /// The time and sign settings this ranking used, and the stored
+    /// defaults.
     time: TimeParams,
     stored_time: TimeParams,
+    sign: SignMode,
+    stored_sign: SignMode,
     /// Rows matching `q`.
     total: usize,
     database_total: usize,
@@ -572,6 +593,8 @@ pub(super) async fn scores(
         comparing: view.previous_rank.is_some(),
         time: view.time,
         stored_time: view.stored_time,
+        sign: view.sign,
+        stored_sign: view.stored_sign,
         total,
         database_total: view.ranking.len(),
         offset,
@@ -903,6 +926,31 @@ pub(super) async fn time_set(
             length_days: update.length_days,
         })
         .map_err(|error| store_error("save time settings", error))?;
+    Ok(Json(MutationResponse { ok: true, id: None }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SignUpdate {
+    sign: SignMode,
+}
+
+/// Stores how negatives combine by default.
+pub(super) async fn sign_set(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<SignUpdate>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign settings require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    store
+        .set_sign_mode(update.sign)
+        .map_err(|error| store_error("save sign setting", error))?;
     Ok(Json(MutationResponse { ok: true, id: None }))
 }
 
@@ -1695,6 +1743,7 @@ pub(super) struct ScoreBreakdown {
     kind_rank: Option<usize>,
     kind_total: usize,
     time: TimeParams,
+    sign: SignMode,
     /// Largest contribution first; they sum to `value`.
     anchors: Vec<AnchorPart>,
     own: Vec<ImpactPart>,
@@ -1777,11 +1826,12 @@ pub(super) async fn entry_score(
             "entry API requires database mode",
         )
     })?;
-    let (generation, time) = current(&state)?;
+    let (generation, time, sign) = current(&state)?;
     let key = ScoresKey {
         generation,
         shared_bits: time.shared.to_bits(),
         length_bits: time.length_days.to_bits(),
+        sign,
     };
     let ranking = scored(&state, key)?;
 
@@ -1801,7 +1851,7 @@ pub(super) async fn entry_score(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "entry not found"))?;
     let explanation = nrs_core::explain(
         &snapshot,
-        &super::params(k_feat, time),
+        &super::params(k_feat, time, sign),
         EntryId(entry_id.clone()),
     );
 
@@ -1881,6 +1931,7 @@ pub(super) async fn entry_score(
             .map(|index| index + 1),
         kind_total: of_kind().count(),
         time,
+        sign,
         anchors,
         own: impact_parts(&own_sources, &kinds),
         borrowed,
@@ -2845,6 +2896,37 @@ mod tests {
             (b.as_str(), 2, 1)
         );
         assert_eq!(row.filtered_delta, Some(0));
+
+        // The sign mode overrides per view like time, and saving it
+        // changes the default.
+        let signs = page(ScoresQuery {
+            sign: Some(SignMode::Signed),
+            cmp_sign: Some(SignMode::Split),
+            ..Default::default()
+        })
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert_eq!(
+            (signs.sign, signs.stored_sign),
+            (SignMode::Signed, SignMode::Split)
+        );
+        assert!(signs.comparing);
+        sign_set(
+            State(state.clone()),
+            Json(SignUpdate {
+                sign: SignMode::Signed,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let saved = page(ScoresQuery::default()).await.ok().unwrap().0;
+        assert_eq!(
+            (saved.sign, saved.stored_sign),
+            (SignMode::Signed, SignMode::Signed)
+        );
     }
 
     #[tokio::test]

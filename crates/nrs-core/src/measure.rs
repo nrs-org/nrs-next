@@ -6,14 +6,50 @@
 //! as `e = sgnpow(m, 1/w_a)` (`w_a = K(a, a)`), and embedded masses add.
 //! This is the `l_(1/w)` pooling of repeated value on one anchor, kept
 //! linear so that grouping never changes the answer: splitting an impact
-//! into pieces with the same features, or cancelling a positive against
-//! a negative, lands on the same `e` however the pieces are grouped. No
-//! impact or source identity survives into the measure.
+//! into pieces with the same features lands on the same `e` however the
+//! pieces are grouped. No impact or source identity survives into the
+//! measure.
+//!
+//! A measure holds one `Part` of the atoms: under `SignMode::Split` the
+//! positive and negative shares build separate measures (the negative one
+//! with magnitudes flipped positive); under `SignMode::Signed` one measure
+//! holds both, and opposite masses cancel in embedded units.
 
 use std::collections::BTreeMap;
 
 use crate::pool::Kernel;
-use crate::types::{AnchorId, Atom, EntryId, ImpactId, Snapshot, TimeSupport};
+use crate::types::{AnchorId, Atom, EntryId, ImpactId, SignMode, Snapshot, TimeSupport};
+
+/// Which atom shares one measure holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// Every share, signed.
+    All,
+    /// Positive shares only.
+    Positive,
+    /// Negative shares only, flipped positive.
+    Negative,
+}
+
+impl Part {
+    /// The measures a sign mode scores, each with the sign its value
+    /// carries in the entry's total.
+    pub(crate) fn of(mode: SignMode) -> &'static [(Part, f64)] {
+        match mode {
+            SignMode::Signed => &[(Part::All, 1.0)],
+            SignMode::Split => &[(Part::Positive, 1.0), (Part::Negative, -1.0)],
+        }
+    }
+
+    /// `share` as this part holds it, or `None` if it belongs elsewhere.
+    fn take(self, share: f64) -> Option<f64> {
+        match self {
+            Part::All => Some(share),
+            Part::Positive => (share > 0.0).then_some(share),
+            Part::Negative => (share < 0.0).then_some(-share),
+        }
+    }
+}
 
 /// Embedded mass `e` spread evenly over days `[from, to)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,11 +109,13 @@ fn atom_mass(atom: &Atom) -> f32 {
     atom.magnitude * life(&atom.time)
 }
 
-/// One atom's embedded pieces: per blend anchor, its share's embedded
-/// mass `e` and, for a dated atom, the days `[from, to)` it spreads over.
+/// One atom's embedded pieces in `part`: per blend anchor, its share's
+/// embedded mass `e` and, for a dated atom, the days `[from, to)` it
+/// spreads over.
 fn atom_embeds<'a>(
     atom: &'a Atom,
     kernel: &'a Kernel,
+    part: Part,
 ) -> impl Iterator<Item = (&'a AnchorId, f64, Option<(f64, f64)>)> + 'a {
     let mass = f64::from(atom_mass(atom));
     atom.blend.iter().filter_map(move |(anchor, frac)| {
@@ -85,6 +123,7 @@ fn atom_embeds<'a>(
         if share == 0.0 {
             return None;
         }
+        let share = part.take(share)?;
         let e = sgnpow(share, 1.0 / kernel.exponent_of(anchor));
         let days = match atom.time {
             TimeSupport::Interval { from, to } => {
@@ -97,11 +136,15 @@ fn atom_embeds<'a>(
     })
 }
 
-/// Build every entry's own embedded measure from its impacts' atoms,
-/// before any relation is applied. An atom's mass splits across its
-/// blend anchors in proportion to the blend weights, and each share
+/// Build every entry's own embedded measure of `part` from its impacts'
+/// atoms, before any relation is applied. An atom's mass splits across
+/// its blend anchors in proportion to the blend weights, and each share
 /// embeds with its own anchor's exponent.
-pub(crate) fn build_measures(snap: &Snapshot, kernel: &Kernel) -> BTreeMap<EntryId, Measure> {
+pub(crate) fn build_measures(
+    snap: &Snapshot,
+    kernel: &Kernel,
+    part: Part,
+) -> BTreeMap<EntryId, Measure> {
     let mut measures: BTreeMap<EntryId, Measure> = BTreeMap::new();
     for entry in &snap.entries {
         measures.entry(entry.id.clone()).or_default();
@@ -109,7 +152,7 @@ pub(crate) fn build_measures(snap: &Snapshot, kernel: &Kernel) -> BTreeMap<Entry
     for impact in &snap.impacts {
         let measure = measures.entry(impact.target.clone()).or_default();
         for atom in &impact.atoms {
-            for (anchor, e, days) in atom_embeds(atom, kernel) {
+            for (anchor, e, days) in atom_embeds(atom, kernel, part) {
                 match days {
                     Some((from, to)) => measure.add_span(anchor, Span { from, to, e }),
                     None => *measure.undated.entry(anchor.clone()).or_insert(0.0) += e,
@@ -125,11 +168,12 @@ pub(crate) fn build_measures(snap: &Snapshot, kernel: &Kernel) -> BTreeMap<Entry
 pub(crate) fn impact_embeds(
     snap: &Snapshot,
     kernel: &Kernel,
+    part: Part,
 ) -> BTreeMap<(EntryId, AnchorId), BTreeMap<ImpactId, f64>> {
     let mut out: BTreeMap<(EntryId, AnchorId), BTreeMap<ImpactId, f64>> = BTreeMap::new();
     for impact in &snap.impacts {
         for atom in &impact.atoms {
-            for (anchor, e, _) in atom_embeds(atom, kernel) {
+            for (anchor, e, _) in atom_embeds(atom, kernel, part) {
                 *out.entry((impact.target.clone(), anchor.clone()))
                     .or_default()
                     .entry(impact.id.clone())

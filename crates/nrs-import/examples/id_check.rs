@@ -8,6 +8,7 @@ fn main() {
         k_feat: snap.palette.k_feat.clone(),
         time: Default::default(),
         calibration: nrs_core::Isotonic::default(),
+        sign: Default::default(),
     };
     let scores = nrs_core::score(&snap, &params);
 

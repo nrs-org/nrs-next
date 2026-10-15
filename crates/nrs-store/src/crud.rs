@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use nrs_core::{
     Anchor, AnchorId, Atom, Entry, EntryId, Impact, ImpactId, Isotonic, RelKind, Relation,
-    TimeParams, Transform,
+    SignMode, TimeParams, Transform,
 };
 
 use crate::error::{Result, StoreError};
@@ -574,6 +574,17 @@ impl Store {
                 "time params need shared in [0, 1] and length_days > 0, got {time:?}"
             )));
         }
+        self.update_stored_params(|stored| stored.time = *time)
+    }
+
+    /// Sets how positive and negative mass combine (`nrs_core::SignMode`).
+    pub fn set_sign_mode(&mut self, sign: SignMode) -> Result<()> {
+        self.update_stored_params(|stored| stored.sign = sign)
+    }
+
+    /// Rewrites the `params` row through `change`, logging the before and
+    /// after JSON as one `ParamSet` event.
+    fn update_stored_params(&mut self, change: impl FnOnce(&mut StoredParams)) -> Result<()> {
         let tx = self.conn.transaction()?;
         let before: Option<String> = tx
             .query_row("SELECT json FROM params WHERE id = 1", [], |row| row.get(0))
@@ -582,7 +593,7 @@ impl Store {
             Some(json) => serde_json::from_str(json)?,
             None => StoredParams::default(),
         };
-        stored.time = *time;
+        change(&mut stored);
         let after = serde_json::to_string(&stored)?;
         tx.execute(
             "INSERT INTO params (id, json) VALUES (1, ?1) \

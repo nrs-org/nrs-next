@@ -47,6 +47,7 @@ fn main() {
         k_feat: snap.palette.k_feat.clone(),
         time: Default::default(),
         calibration: Isotonic::default(),
+        sign: Default::default(),
     };
 
     let title = |id: &nrs_core::EntryId| -> String {

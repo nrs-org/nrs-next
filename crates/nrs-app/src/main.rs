@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use axum::routing::{get, post, put};
 use axum::Router;
 use nrs_core::{
-    AnchorId, Atom, Entry, EntryId, Isotonic, KFeatMatrix, Params, RelKind, Snapshot, SourceId,
-    TimeParams,
+    AnchorId, Atom, Entry, EntryId, Isotonic, KFeatMatrix, Params, RelKind, SignMode, Snapshot,
+    SourceId, TimeParams,
 };
 use nrs_entry_store::HttpEntryStore;
 use nrs_store::Store;
@@ -208,6 +208,7 @@ async fn main() {
             get(api::kfeat_get).put(api::kfeat_set),
         )
         .route("/calibration/time", put(api::time_set))
+        .route("/calibration/sign", put(api::sign_set))
         .route("/review", get(api::review_queue))
         .route("/entries", get(api::entries_index))
         .route("/entries/ingest", post(api::entry_ingest))
@@ -305,11 +306,12 @@ fn music_store_url() -> String {
         .unwrap_or_else(|_| nrs_import::stores::DEFAULT_MUSIC_STORE_URL.into())
 }
 
-fn params(k_feat: KFeatMatrix, time: TimeParams) -> Params {
+fn params(k_feat: KFeatMatrix, time: TimeParams, sign: SignMode) -> Params {
     Params {
         k_feat,
         time,
         calibration: Isotonic::default(),
+        sign,
     }
 }
 
@@ -326,8 +328,9 @@ fn rows(
     dir: SortDir,
     k_feat: KFeatMatrix,
     time: TimeParams,
+    sign: SignMode,
 ) -> Vec<Row<'_>> {
-    let p = params(k_feat, time);
+    let p = params(k_feat, time, sign);
     let scores = nrs_core::score(snapshot, &p);
 
     let mut rows: Vec<Row> = snapshot
@@ -1230,6 +1233,7 @@ mod tests {
             SortDir::Desc,
             KFeatMatrix::default(),
             TimeParams::default(),
+            SignMode::default(),
         );
         assert_eq!(r[0].id.0, "a");
         assert_eq!(r[1].id.0, "b");
@@ -1244,6 +1248,7 @@ mod tests {
             SortDir::Asc,
             KFeatMatrix::default(),
             TimeParams::default(),
+            SignMode::default(),
         );
         assert_eq!(r[0].title, "Apple");
         assert_eq!(r[1].title, "Zebra");
@@ -1258,6 +1263,7 @@ mod tests {
             SortDir::Desc,
             KFeatMatrix::default(),
             TimeParams::default(),
+            SignMode::default(),
         );
         for row in &r {
             assert!(row.value.is_finite());

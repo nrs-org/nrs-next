@@ -333,3 +333,20 @@ fn time_params_default_and_round_trip() {
     };
     assert!(store.set_time_params(&bad).is_err());
 }
+
+#[test]
+fn sign_mode_defaults_to_split_and_keeps_time() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (_, params) = store.load_snapshot().unwrap();
+    assert_eq!(params.sign, nrs_core::SignMode::Split);
+
+    let time = nrs_core::TimeParams {
+        shared: 0.9,
+        length_days: 90.0,
+    };
+    store.set_time_params(&time).unwrap();
+    store.set_sign_mode(nrs_core::SignMode::Signed).unwrap();
+    let (_, params) = store.load_snapshot().unwrap();
+    assert_eq!(params.sign, nrs_core::SignMode::Signed);
+    assert_eq!(params.time, time);
+}

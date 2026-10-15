@@ -26,6 +26,7 @@ fn params() -> Params {
         k_feat: k_feat(),
         time: Default::default(),
         calibration: Isotonic::default(), // identity, so S_e == V_e
+        sign: SignMode::Split,
     }
 }
 
@@ -223,10 +224,69 @@ fn borrow_only_entry_scales_embedded_mass() {
     assert!(close(value_of(&snap, "dst"), expect));
 }
 
-/// Signed-pow keeps grouping consistent: a sub-entry whose impacts cancel
-/// contributes nothing to its container.
+/// Under `SignMode::Signed`, signed-pow keeps grouping consistent: a
+/// sub-entry whose impacts cancel contributes nothing to its container.
 #[test]
-fn cancelling_sub_entry_contributes_nothing() {
+fn signed_cancelling_sub_entry_contributes_nothing() {
+    let snap = snapshot(
+        &["b", "a"],
+        vec![
+            impact("p", "b", vec![moment("hype", 1.0)]),
+            impact("n", "b", vec![moment("hype", -1.0)]),
+            impact("own", "a", vec![moment("hype", 1.0)]),
+        ],
+        vec![rel(RelKind::Contains, "a", "b", 1.0)],
+    );
+    let signed = Params {
+        sign: SignMode::Signed,
+        ..params()
+    };
+    let value = |id: &str| score(&snap, &signed).values[&EntryId(id.into())];
+    assert!(close(value("b"), 0.0));
+    assert!(close(value("a"), 1.0));
+}
+
+/// Under `SignMode::Split` a negative is an independent bad experience:
+/// it costs its standalone value beside any amount of positive mass, on
+/// its own anchor or another.
+#[test]
+fn split_negative_costs_its_standalone_value() {
+    for (pos, neg) in [("hype", "hype"), ("hype", "cozy"), ("hype", "music")] {
+        let snap = snapshot(
+            &["e"],
+            vec![
+                impact("p", "e", vec![moment(pos, 10.0)]),
+                impact("n", "e", vec![moment(neg, -3.0)]),
+            ],
+            vec![],
+        );
+        let v = value_of(&snap, "e");
+        assert!(close(v, 7.0), "{pos}/{neg}: {v}");
+    }
+}
+
+/// Positives pool among themselves and negatives subtract afterwards, so
+/// a negative does not undo the positive of its size: `3 (+) 7 - 3 < 7`.
+#[test]
+fn split_pools_positives_before_subtracting() {
+    let snap = snapshot(
+        &["e"],
+        vec![
+            impact("a", "e", vec![moment("hype", 3.0)]),
+            impact("b", "e", vec![moment("hype", 7.0)]),
+            impact("n", "e", vec![moment("hype", -3.0)]),
+        ],
+        vec![],
+    );
+    let p = 1.0 / W_HYPE;
+    let expect = (3.0f32.powf(p) + 7.0f32.powf(p)).powf(W_HYPE) - 3.0;
+    assert!(close(value_of(&snap, "e"), expect));
+}
+
+/// A container borrows a sub-entry's negatives into its own negative
+/// measure: they pool with its other negatives, not against its positives.
+#[test]
+fn split_borrowed_negatives_pool_with_negatives() {
     let snap = snapshot(
         &["b", "a"],
         vec![
@@ -237,7 +297,7 @@ fn cancelling_sub_entry_contributes_nothing() {
         vec![rel(RelKind::Contains, "a", "b", 1.0)],
     );
     assert!(close(value_of(&snap, "b"), 0.0));
-    assert!(close(value_of(&snap, "a"), 1.0));
+    assert!(close(value_of(&snap, "a"), 2.0f32.powf(W_HYPE) - 1.0));
 }
 
 /// Anchors in one group pool at the group exponent; additive anchors add.
@@ -311,6 +371,37 @@ fn explain_sources_sum_to_each_anchor() {
     assert!(from("ic").is_empty(), "c is unrelated");
     let total: f32 = ex.sources.iter().map(|s| s.contribution).sum();
     assert!(close(total, ex.value));
+}
+
+/// Under `SignMode::Split`, `explain` nets each anchor's and impact's
+/// positive part against its negative one, and everything still sums to
+/// the value.
+#[test]
+fn split_explain_nets_signs_and_sums() {
+    let snap = snapshot(
+        &["a", "b"],
+        vec![
+            impact("mixed", "a", vec![moment("hype", 4.0), moment("hype", -1.0)]),
+            impact("bad", "a", vec![moment("cozy", -2.0)]),
+            impact("good", "a", vec![moment("cozy", 3.0), moment("music", 1.0)]),
+            impact("ib", "b", vec![moment("hype", -2.0), moment("music", 2.0)]),
+        ],
+        vec![rel(RelKind::Contains, "a", "b", 0.5)],
+    );
+    let ex = explain(&snap, &params(), EntryId("a".into()));
+    assert!(close(ex.value, value_of(&snap, "a")));
+    let sum: f32 = ex.contributions.iter().map(|c| c.contribution).sum();
+    assert!(close(sum, ex.value), "{sum} vs {}", ex.value);
+    for c in &ex.contributions {
+        let of_anchor: Vec<_> = ex.sources.iter().filter(|s| s.anchor == c.anchor).collect();
+        let embedded: f32 = of_anchor.iter().map(|s| s.embedded).sum();
+        let contribution: f32 = of_anchor.iter().map(|s| s.contribution).sum();
+        assert!(close(embedded, c.embedded), "{:?}: {embedded} vs {}", c.anchor, c.embedded);
+        assert!(close(contribution, c.contribution), "{:?}", c.anchor);
+    }
+    let rows = |impact: &str| ex.sources.iter().filter(|s| s.impact.0 == impact).count();
+    assert_eq!(rows("mixed"), 1, "one netted hype row");
+    assert!(ex.sources.iter().filter(|s| s.impact.0 == "bad").all(|s| s.contribution < 0.0));
 }
 
 /// An entry with no mass scores zero and has no contributions.
