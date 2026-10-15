@@ -397,7 +397,7 @@ pub fn canonical_anime_url(url: &str) -> Option<String> {
 }
 
 /// URLs the anime store can ingest (anime, manga/novels, visual novels).
-fn is_anime_store_url(url: &str) -> bool {
+pub fn is_anime_store_url(url: &str) -> bool {
     [
         "https://myanimelist.net/",
         "https://anilist.co/",

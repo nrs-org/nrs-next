@@ -219,6 +219,8 @@ async fn main() {
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
         .route("/entries/{entry_id}/profile", post(api::profile_fill))
+        .route("/entries/{entry_id}/media", get(api::entry_media))
+        .route("/visual-grades", get(api::visual_grades))
         .route(
             "/entries/{entry_id}/waivers/{rule}",
             put(api::waiver_set).delete(api::waiver_remove),

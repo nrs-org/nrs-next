@@ -57,6 +57,17 @@ const impactKinds = [
   ["music_consumed_progress", "Music consumed progress", "profile"],
 ];
 
+// DAH_standards visual types: [visual_kind factor, label].
+const visualKinds = [
+  ["1.0", "Anime / RPG 3D game"],
+  ["0.8", "Animated short / MV / VN / manga"],
+  ["0.7", "Anime PV / animated gacha art"],
+  ["0.6", "Gacha card art, static"],
+  ["0.5", "Light novel visual / semi-animated MV"],
+  ["0.3", "Static music video"],
+  ["0.25", "Album art / anime promo art"],
+];
+
 const relationKinds = [
   ["contains", "Contains"],
   ["remix", "Remix"],
@@ -1501,9 +1512,318 @@ function impactKindFields(kind, fields) {
   if (kind === "osu_song") return `${rangeField(fields, "personal", "personal impact")}${rangeField(fields, "community", "community impact", "0.3")}`;
   if (kind === "consumed") return `${rangeField(fields, "boredom", "boredom")}${durationField(fields, "duration_minutes", "duration", "180")}`;
   if (kind === "anime_consumed") return `${rangeField(fields, "boredom", "boredom")}${textField(fields, "episodes", "episodes", "", "number", 'min="0" step="0.01" placeholder="12"')}${durationField(fields, "episode_duration_minutes", "duration per episode", "")}`;
-  if (kind === "visual") return `${selectField(fields, "visual_kind", "visual kind", [["1.0", "Anime / RPG 3D game (1.0)"], ["0.8", "Animated short / MV / VN / manga (0.8)"], ["0.7", "Anime PV / animated gacha art (0.7)"], ["0.6", "Gacha card art, static (0.6)"], ["0.5", "Light novel visual / semi-animated MV (0.5)"], ["0.3", "Static music video (0.3)"], ["0.25", "Album art / anime promo art (0.25)"]], "1.0")}${rangeField(fields, "base", "quality")}${rangeField(fields, "unique", "uniqueness")}`;
+  if (kind === "visual") return `${selectField(fields, "visual_kind", "visual kind", visualKinds.map(([value, label]) => [value, `${label} (${value})`]), "1.0")}${rangeField(fields, "base", "quality")}${rangeField(fields, "unique", "uniqueness")}${textField(fields, "media_url", "MV / artwork link", "", "url", 'placeholder="https://youtu.be/…"')}`;
   if (kind === "writing") return `${rangeField(fields, "character_complexity", "character complexity")}${rangeField(fields, "story_quality", "story quality")}${rangeField(fields, "pacing", "pacing")}${rangeField(fields, "originality", "originality")}`;
   return `<p class="error full">Unknown impact kind.</p>`;
+}
+
+// ---------------------------------------------------------------
+// Visual panel: the entry's artwork next to a grader for its visual
+// impacts, with the kind's other visual grades as a ladder to grade
+// against.
+// ---------------------------------------------------------------
+
+/** Media per entry id, so a repaint after a save doesn't refetch it. */
+const mediaCache = new Map();
+/** Visual grades per entry kind; dropped after a visual is saved. */
+const visualGradeCache = new Map();
+
+/**
+ * A side panel's GET: unlike `getJson` it doesn't cancel the page's
+ * other requests, so several panels can load at once.
+ */
+async function panelJson(path) {
+  const response = await fetch(path, { headers: { Accept: "application/json" } });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `${response.status} ${response.statusText}`);
+  return body;
+}
+
+/** `nrs_import::visual`: the magnitude of a visual impact. */
+function visualScore(visualKind, base, unique) {
+  return ((base * (unique + 2)) / 3) * visualKind * 2;
+}
+
+function visualPanelMarkup(data) {
+  const slot = data.checks.profile.find((item) => item.kind === "visual");
+  const visuals = data.impacts.filter((impact) => impact.kind === "visual");
+  if (!slot && !visuals.length) return "";
+  return `<section class="page-section visual-panel" data-visual>
+    <h2>Visual <span class="count">${visuals.length}</span></h2>
+    <div class="visual-grid">
+      <div class="visual-stage"><p class="loading">Looking for artwork…</p></div>
+      <div class="visual-grader"></div>
+    </div>
+  </section>`;
+}
+
+/** The YouTube video id in a watch, short-link, shorts or embed URL. */
+function youtubeId(url) {
+  const match = /^https?:\/\/(?:www\.|m\.|music\.)?(?:youtu\.be\/|youtube(?:-nocookie)?\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/.exec(url.trim());
+  return match ? match[1] : null;
+}
+
+/** A link as a stage item: a video, an image, or just something to open. */
+function linkItem(url, label) {
+  const youtube = youtubeId(url);
+  if (youtube) return { type: "video", key: `yt:${youtube}`, thumb: `https://i.ytimg.com/vi/${youtube}/hqdefault.jpg`, label, youtube };
+  if (/\.(jpe?g|png|webp|gif|avif)(\?|$)/i.test(url)) return { type: "image", key: url, thumb: url, label, url };
+  return { type: "link", key: url, label, url };
+}
+
+function stageMarkup(items, active) {
+  const current = items.find((item) => item.key === active) || items[0];
+  const main = current.type === "video"
+    ? `<button class="stage-play" type="button" data-play="${escapeHtml(current.youtube)}" aria-label="play ${escapeHtml(current.label)}"><img src="${escapeHtml(current.thumb)}" alt="" referrerpolicy="no-referrer"><span class="play-mark">▶</span></button>`
+    : current.type === "image"
+      ? `<a href="${escapeHtml(current.url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(current.url)}" alt="${escapeHtml(current.label)}" referrerpolicy="no-referrer"></a>`
+      : `<a class="stage-link" href="${escapeHtml(current.url)}" target="_blank" rel="noreferrer">open ↗<small>${escapeHtml(current.url)}</small></a>`;
+  const thumb = (item) => `<button type="button" class="stage-thumb" data-stage="${escapeHtml(item.key)}" aria-pressed="${item.key === current.key}" title="${escapeHtml(item.label)}">${item.thumb ? `<img src="${escapeHtml(item.thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : "↗"}${item.type === "video" ? '<span class="play-mark small">▶</span>' : ""}</button>`;
+  return `<figure class="stage-main" data-key="${escapeHtml(current.key)}">${main}<figcaption>${escapeHtml(current.label)}</figcaption></figure>
+    ${items.length > 1 ? `<div class="stage-thumbs">${items.map(thumb).join("")}</div>` : ""}`;
+}
+
+/**
+ * The artwork side of the visual panel: the stores' media, led by the
+ * link saved with (or being typed into) the grade on show. A track
+ * with no MV gets a YouTube search instead, and a pointer to where its
+ * album art is graded.
+ */
+function createVisualStage(data, stage) {
+  const entryId = data.entry.id;
+  let media = mediaCache.get(entryId) || null;
+  let failure = null;
+  let extra = "";
+  let active = null;
+  const searchTerms = [data.entry.title, data.relations.find((relation) => relation.label === "Contributors")?.other.title, "MV"].filter(Boolean).join(" ");
+  const paint = () => {
+    if (!stage.isConnected) return;
+    if (!media && !failure) {
+      stage.innerHTML = `<p class="loading">Looking for artwork…</p>`;
+      return;
+    }
+    const items = [
+      ...(extra ? [linkItem(extra, "linked with this grade")] : []),
+      ...(media?.videos || []).map((video) => linkItem(`https://youtu.be/${video.youtube}`, video.label)),
+      ...(media?.images || []).map((image) => ({ type: "image", key: image.url, thumb: image.url, label: image.label, url: image.url })),
+    ].filter((item, index, all) => all.findIndex((other) => other.key === item.key) === index);
+    const track = data.entry.kind === "track";
+    const albums = media?.albums?.length
+      ? `<p class="stage-note dim">Album art is graded on ${media.albums.map((album) => `<a href="${pathForEntry(album.id)}" data-link>${escapeHtml(album.title)}</a>`).join(", ")}.</p>`
+      : "";
+    const search = `<a href="https://www.youtube.com/results?search_query=${encodeURIComponent(searchTerms)}" target="_blank" rel="noreferrer">search YouTube ↗</a>`;
+    stage.innerHTML = items.length
+      ? `${stageMarkup(items, active)}${track && !items.some((item) => item.type === "video") ? `<p class="stage-note dim">No MV here — ${search}</p>` : ""}${albums}`
+      : `<div class="stage-empty"><p class="empty">${track ? "No MV in the stores." : "No artwork from the stores."}</p>
+          ${track ? `<p>${search}, then paste its link beside the grade.</p>` : ""}
+          ${failure ? `<small class="dim">${escapeHtml(failure)}</small>` : media?.warnings?.length ? `<small class="dim">${escapeHtml(media.warnings.join(" · "))}</small>` : ""}
+        </div>${albums}`;
+    // A dead cover link (no Cover Art Archive scan, an expired CDN URL)
+    // just drops out.
+    stage.querySelectorAll("img").forEach((img) => img.addEventListener("error", () => {
+      const thumb = img.closest(".stage-thumb");
+      if (thumb) thumb.remove();
+      else img.closest(".stage-main")?.classList.add("broken");
+    }, { once: true }));
+  };
+  stage.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("button") : null;
+    if (!(target instanceof HTMLButtonElement)) return;
+    const play = target.getAttribute("data-play");
+    if (play) {
+      target.outerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${encodeURIComponent(play)}?autoplay=1" title="video" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>`;
+      return;
+    }
+    const key = target.getAttribute("data-stage");
+    if (key) {
+      active = key;
+      paint();
+    }
+  });
+  if (!media) {
+    panelJson(`/api/v1/entries/${encodeURIComponent(entryId)}/media`)
+      .then((body) => {
+        media = body;
+        mediaCache.set(entryId, body);
+      })
+      .catch((error) => {
+        failure = `Couldn't load artwork: ${error?.message || String(error)}`;
+      })
+      .finally(paint);
+  }
+  paint();
+  return {
+    /** Shows `url` first: the link of the grade on show. */
+    setLink(url) {
+      const next = (url || "").trim();
+      if (next === extra) return;
+      extra = next;
+      active = null;
+      paint();
+    },
+  };
+}
+
+async function visualGrades(kind) {
+  if (!visualGradeCache.has(kind)) {
+    visualGradeCache.set(kind, panelJson(`/api/v1/visual-grades?kind=${encodeURIComponent(kind)}`).catch((error) => {
+      visualGradeCache.delete(kind);
+      throw error;
+    }));
+  }
+  return visualGradeCache.get(kind);
+}
+
+/** Where `score` lands among `grades`: its rank and nearest neighbours. */
+function ladderMarkup(grades, score, kind) {
+  if (!grades.length) return `<p class="dim ladder-empty">No other ${escapeHtml(entryKinds[kind] || kind)} has a visual grade yet.</p>`;
+  const above = grades.filter((grade) => grade.score > score);
+  const below = grades.filter((grade) => grade.score <= score);
+  const row = (grade) => `<li><a href="${pathForEntry(grade.entry)}" data-link>${escapeHtml(grade.title)}</a>
+    <span class="ladder-params mono" title="kind · quality · uniqueness">${Number(grade.visual_kind)} · ${Number(grade.base).toFixed(2)} · ${Number(grade.unique).toFixed(2)}</span>
+    <span class="ladder-score mono">${grade.score.toFixed(2)}</span></li>`;
+  return `<p class="ladder-rank">#${above.length + 1} of ${grades.length + 1} ${escapeHtml(entryKinds[kind] || kind)} visuals</p>
+    <ol class="ladder">
+      ${above.slice(-3).map(row).join("")}
+      <li class="ladder-self"><span>this entry</span><span class="ladder-score mono">${score.toFixed(2)}</span></li>
+      ${below.slice(0, 3).map(row).join("")}
+    </ol>`;
+}
+
+/**
+ * The grader: one tab per visual impact (an MV and its album art are
+ * two), plus a new one. Saves through the same endpoints as the kind
+ * editor.
+ */
+function bindVisualGrader(data, host, stage) {
+  const entryId = data.entry.id;
+  const kind = data.entry.kind;
+  const visuals = data.impacts.filter((impact) => impact.kind === "visual");
+  const slot = data.checks.profile.find((item) => item.kind === "visual");
+  const defaults = Object.fromEntries(slot?.defaults || []);
+  const number = (value, fallback) => Number.isFinite(Number(value)) && value !== "" && value != null ? Number(value) : fallback;
+  const fromImpact = (impact) => ({
+    impact,
+    visual_kind: number(impact?.params?.visual_kind, number(defaults.visual_kind, 1)),
+    base: number(impact?.params?.base, 0.5),
+    unique: number(impact?.params?.unique, 0.5),
+    media_url: impact?.params?.media_url || "",
+  });
+  let tab = 0;
+  let state = fromImpact(visuals[0] || null);
+  let saved = { ...state };
+  const tabs = [...visuals, null];
+
+  const dirty = () => ["visual_kind", "base", "unique", "media_url"].some((key) => state[key] !== saved[key]);
+  const paint = () => {
+    stage?.setLink(state.media_url);
+    const score = visualScore(state.visual_kind, state.base, state.unique);
+    host.innerHTML = `
+      ${tabs.length > 1 ? `<div class="visual-tabs" role="tablist">${tabs.map((impact, index) => `<button type="button" role="tab" data-tab="${index}" aria-selected="${index === tab}">${impact ? `${escapeHtml(visualKindLabel(number(impact.params?.visual_kind, 1)))} <small>${visualScore(number(impact.params?.visual_kind, 1), number(impact.params?.base, 0), number(impact.params?.unique, 0)).toFixed(2)}</small>` : "+ new"}</button>`).join("")}</div>` : ""}
+      <div class="visual-kinds" role="radiogroup" aria-label="visual kind">
+        ${visualKinds.map(([value, label]) => `<button type="button" role="radio" data-visual-kind="${value}" aria-checked="${Number(value) === state.visual_kind}" title="${escapeHtml(label)}">${escapeHtml(label)}<small>${value}</small></button>`).join("")}
+      </div>
+      <label class="visual-slider"><span>quality <output>${state.base.toFixed(2)}</output></span>
+        <input type="range" min="0" max="1" step="0.05" value="${state.base}" data-param="base"></label>
+      <label class="visual-slider"><span>uniqueness <output>${state.unique.toFixed(2)}</output></span>
+        <input type="range" min="0" max="1" step="0.05" value="${state.unique}" data-param="unique"></label>
+      <label class="visual-link"><span>${data.entry.kind === "track" ? "MV link" : "artwork / MV link"} <small class="dim">optional, kept with the grade</small></span>
+        <input type="url" value="${escapeHtml(state.media_url)}" data-media placeholder="https://youtu.be/…"></label>
+      <div class="visual-score"><span class="dim">visual impact</span> <strong class="mono">${score.toFixed(2)}</strong>${state.impact?.shared ? ' <small class="dim">shared — values apply to every member</small>' : ""}</div>
+      <div class="visual-ladder"><p class="loading">Loading other grades…</p></div>
+      <div class="visual-actions"></div>`;
+    paintActions();
+    paintLadder();
+  };
+  const paintActions = () => {
+    const actions = host.querySelector(".visual-actions");
+    if (!(actions instanceof HTMLElement)) return;
+    actions.innerHTML = `<button class="button primary" type="button" data-save ${dirty() || !state.impact ? "" : "disabled"}>${state.impact ? "save" : "add visual impact"}</button>
+      ${dirty() && state.impact ? '<button class="button" type="button" data-reset>reset</button>' : ""}
+      <span class="dim">${dirty() ? "unsaved" : ""}</span>`;
+  };
+  const paintLadder = async () => {
+    const target = host.querySelector(".visual-ladder");
+    try {
+      const grades = (await visualGrades(kind)).filter((grade) => grade.impact !== state.impact?.id);
+      if (target?.isConnected) target.innerHTML = ladderMarkup(grades, visualScore(state.visual_kind, state.base, state.unique), kind);
+    } catch (error) {
+      if (target) target.innerHTML = `<p class="dim">${escapeHtml(error?.message || String(error))}</p>`;
+    }
+  };
+  // Slider drags only touch the readouts, so the thumb isn't repainted
+  // out from under the pointer.
+  host.addEventListener("input", (event) => {
+    const input = event.target;
+    if (input instanceof HTMLInputElement && input.hasAttribute("data-media")) {
+      state.media_url = input.value.trim();
+      stage?.setLink(state.media_url);
+      paintActions();
+      return;
+    }
+    if (!(input instanceof HTMLInputElement) || !input.dataset.param) return;
+    state[input.dataset.param] = Number(input.value);
+    const output = input.closest("label")?.querySelector("output");
+    if (output) output.value = Number(input.value).toFixed(2);
+    const strong = host.querySelector(".visual-score strong");
+    if (strong) strong.textContent = visualScore(state.visual_kind, state.base, state.unique).toFixed(2);
+    paintActions();
+    paintLadder();
+  });
+  host.addEventListener("click", async (event) => {
+    const target = event.target instanceof Element ? event.target.closest("button") : null;
+    if (!(target instanceof HTMLButtonElement)) return;
+    if (target.dataset.tab != null) {
+      if (dirty() && !confirm("Discard the unsaved grade?")) return;
+      tab = Number(target.dataset.tab);
+      state = fromImpact(tabs[tab]);
+      saved = { ...state };
+      paint();
+    } else if (target.dataset.visualKind != null) {
+      state.visual_kind = Number(target.dataset.visualKind);
+      paint();
+    } else if (target.hasAttribute("data-reset")) {
+      state = { ...saved };
+      paint();
+    } else if (target.hasAttribute("data-save")) {
+      target.disabled = true;
+      const values = { kind: "visual", visual_kind: String(state.visual_kind), base: String(state.base), unique: String(state.unique), media_url: state.media_url };
+      const impact = state.impact;
+      try {
+        if (impact) {
+          await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts/${encodeURIComponent(impact.id)}`, "PUT", {
+            ...impact.params,
+            ...values,
+            source: impact.params?.source || entryId,
+            dah_factor: String(impact.contributor_share ?? 1),
+            note: impact.note || impact.source_comment || "",
+          });
+        } else {
+          await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/impacts`, "POST", { ...values, source: entryId, dah_factor: "1" });
+        }
+        visualGradeCache.delete(kind);
+        await refreshEntry(entryId);
+        showToast(impact ? "Visual saved" : "Visual impact added");
+      } catch (error) {
+        target.disabled = false;
+        showToast(error?.message || String(error), "error");
+      }
+    }
+  });
+  paint();
+}
+
+function visualKindLabel(value) {
+  return visualKinds.find(([kind]) => Number(kind) === value)?.[1] || `kind ${value}`;
+}
+
+function bindVisualPanel(data) {
+  const panel = app.querySelector("[data-visual]");
+  if (!(panel instanceof HTMLElement)) return;
+  const stage = panel.querySelector(".visual-stage");
+  const grader = panel.querySelector(".visual-grader");
+  const controls = stage instanceof HTMLElement ? createVisualStage(data, stage) : null;
+  if (grader instanceof HTMLElement) bindVisualGrader(data, grader, controls);
 }
 
 function closeEditor(action) {
@@ -2944,6 +3264,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <h2>Score</h2>
         <p class="loading">Scoring…</p>
       </section>
+      ${visualPanelMarkup(data)}
       <section class="page-section">
         <h2>Impacts <span class="count">${data.impacts.length}</span></h2>
         <p class="section-lead">What this entry did, why it mattered, and which feeling or craft anchor carried it.</p>
@@ -2960,6 +3281,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
       </section>`;
     bindKindSelect(data);
     bindProfileCheck(data);
+    bindVisualPanel(data);
     bindInlineSplits(data);
     bindTracklist(data);
     bindRelated(data);

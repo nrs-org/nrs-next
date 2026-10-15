@@ -1,10 +1,13 @@
 //! Versioned JSON API for the dependency-free browser client.
 
 mod adopt;
+mod media;
 mod progress;
 
 pub(crate) use adopt::{
     entry_adopt, entry_related, entry_related_add, store_discover, stores_search,
+};
+pub(crate) use media::{entry_media, visual_grades
 };
 pub(crate) use progress::{progress_clear, progress_get, progress_list, progress_set, progress_step};
 
