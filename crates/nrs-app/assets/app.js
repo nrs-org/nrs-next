@@ -2395,7 +2395,9 @@ async function openProgressFinish(data, progress, status, host) {
   } else if (progress.unit !== "minute" && params.duration_minutes && progress.current) {
     unitMinutes = Number(params.duration_minutes) / progress.current;
   }
-  const current = status === "completed" && progress.total != null ? Math.max(progress.current, progress.total) : progress.current;
+  // The count so far, not the total: a total can be a still-airing
+  // show's planned count, and counting unwatched episodes inflates the score.
+  const current = progress.current;
   const unitLabel = progressUnits[progress.unit]?.[0] || progress.unit;
   const fields = {
     current: formatCount(current),
@@ -2415,7 +2417,7 @@ async function openProgressFinish(data, progress, status, host) {
       ${progress.unit === "minute" ? "" : textField(fields, "unit_minutes", `minutes per ${unitLabel}`, "", "number", 'step="any" min="0"')}
     </div>
     <label class="form-check"><input type="checkbox" name="score" checked> score it (write the consumed impact)</label>`;
-  showEditor(host, status === "dropped" ? "Drop" : "Finish", body, async (payload) => {
+  const editor = showEditor(host, status === "dropped" ? "Drop" : "Finish", body, async (payload) => {
     const request = progressPayload(progress, {
       status,
       current: Number(payload.current),
@@ -2427,6 +2429,15 @@ async function openProgressFinish(data, progress, status, host) {
     showToast(status === "dropped" ? "Dropped" : "Finished");
     await refreshEntry(entryId);
   });
+  const total = progress.total;
+  const input = editor?.querySelector('input[name="current"]');
+  if (status === "completed" && total && current < total && input instanceof HTMLInputElement) {
+    const hint = document.createElement("small");
+    hint.className = "store-hint";
+    hint.innerHTML = `of ${escapeHtml(formatCount(total))} <button class="link-button" type="button">all ${escapeHtml(formatCount(total))}</button>`;
+    hint.querySelector("button")?.addEventListener("click", () => { input.value = formatCount(total); });
+    input.closest(".form-field")?.append(hint);
+  }
 }
 
 async function renderProgress() {
