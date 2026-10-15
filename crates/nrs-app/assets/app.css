@@ -971,3 +971,15 @@ input[type="range"] { accent-color: var(--brass); }
 .stage-thumb { color: var(--brass); }
 .visual-link { display: grid; gap: .3rem; font-size: .78rem; color: var(--bone-300); }
 .visual-link input { width: 100%; padding: .4rem .55rem; border: 1px solid var(--ink-600); background: var(--ink-900); color: var(--bone-100); font: .74rem Plex Mono, monospace; }
+
+/* Lists: MAL/AniList login and export preview. */
+.list-site .form-grid { margin-top: .9rem; }
+.list-redirect { overflow-wrap: anywhere; color: var(--bone-300); font-size: .78rem; }
+.list-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.list-plan .data-table td.mono { white-space: normal; }
+.list-report { margin-top: .8rem; }
+.list-report summary { cursor: pointer; color: var(--bone-500); }
+.list-sync h3 { margin-top: 1.4rem; }
+.list-job { margin-top: .8rem; }
+.list-run p { margin: .3rem 0; }
+@media (max-width: 640px) { .list-site .form-grid { grid-template-columns: minmax(0, 1fr); } }

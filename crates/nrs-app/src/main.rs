@@ -17,6 +17,7 @@
 //! API under `/api/v1`.
 
 mod api;
+mod lists;
 mod checks;
 mod score_filter;
 
@@ -241,6 +242,14 @@ async fn main() {
         )
         .route("/entries/{entry_id}/progress/step", post(api::progress_step))
         .route("/progress", get(api::progress_list))
+        .route("/lists", get(api::lists_status))
+        .route("/lists/mal/connect", post(api::mal_connect))
+        .route("/lists/mal/callback", get(api::mal_callback))
+        .route("/lists/anilist/token", post(api::anilist_token))
+        .route("/lists/sync", get(api::lists_sync_state).post(api::lists_sync_start))
+        .route("/lists/{site}", axum::routing::delete(api::lists_disconnect))
+        .route("/lists/{site}/plan", get(api::lists_plan))
+        .route("/lists/{site}/push", post(api::lists_push))
         .route("/entries/{entry_id}/tracklist", get(api::entry_tracklist))
         .route("/entries/{entry_id}/score", get(api::entry_score))
         .route(

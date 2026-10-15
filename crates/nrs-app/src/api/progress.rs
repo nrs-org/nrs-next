@@ -125,8 +125,17 @@ fn invalid(error: nrs_store::StoreError) -> ApiErr {
     }
 }
 
+/// Every progress write ends here, so it's also where a written row is
+/// queued for MyAnimeList/AniList (`lists::live`; dropped when neither
+/// is connected).
 fn write(store: &mut TrackedStore, progress: &Progress) -> Result<(), ApiErr> {
-    store.set_progress(progress, None).map_err(invalid)
+    store.set_progress(progress, None).map_err(invalid)?;
+    if let Ok(entries) = store.list_entries() {
+        if let Some(entry) = entries.iter().find(|entry| entry.id == progress.entry) {
+            crate::lists::live::enqueue(crate::lists::plan::row(entry, progress.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// Validates, brings the impacts in line, then saves the row (whose links

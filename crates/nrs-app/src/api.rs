@@ -2,12 +2,16 @@
 
 mod adopt;
 mod media;
+mod lists;
 mod progress;
 
 pub(crate) use adopt::{
     entry_adopt, entry_related, entry_related_add, store_discover, stores_search,
 };
-pub(crate) use media::{entry_media, visual_grades
+pub(crate) use media::{entry_media, visual_grades};
+pub(crate) use lists::{
+    anilist_token, lists_disconnect, lists_plan, lists_push, lists_status, lists_sync_start,
+    lists_sync_state, mal_callback, mal_connect,
 };
 pub(crate) use progress::{progress_clear, progress_get, progress_list, progress_set, progress_step};
 

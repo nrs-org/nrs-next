@@ -248,7 +248,7 @@ app.addEventListener("toggle", (event) => {
 
 function setActiveNav() {
   const segment = location.pathname.split("/")[1];
-  const active = ["palette", "calibrate", "kfeat", "review", "entries", "seasons", "progress"].includes(segment)
+  const active = ["palette", "calibrate", "kfeat", "review", "entries", "seasons", "progress", "lists"].includes(segment)
     ? segment
     : "scores";
   document.querySelectorAll(".rail nav a[data-nav]").forEach((anchor) => {
@@ -3460,6 +3460,262 @@ function seasonCard(show, index, progress) {
   </article>`;
 }
 
+// ---------------------------------------------------------------
+// Lists: MyAnimeList / AniList login and the progress export.
+// ---------------------------------------------------------------
+
+const ANILIST_CLIENT_KEY = "nrs.anilistClient";
+
+function storedItem(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function storeItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Remembering the client ID is only a convenience.
+  }
+}
+
+const listSites = {
+  mal: {
+    name: "MyAnimeList",
+    register: 'Use the app at <a href="https://myanimelist.net/apiconfig" target="_blank" rel="noopener">myanimelist.net/apiconfig</a> (the anime store\'s <code>MAL_CLIENT_ID</code> works) and add this as its redirect URL.',
+  },
+  anilist: {
+    name: "AniList",
+    register: 'Create a client at <a href="https://anilist.co/settings/developer" target="_blank" rel="noopener">anilist.co/settings/developer</a> with this as its redirect URL.',
+  },
+};
+
+function listSiteMarkup(key, status) {
+  const site = listSites[key];
+  const state = status.connected
+    ? `connected as ${escapeHtml(status.user || "?")} · token good for ${status.days_left} more days`
+    : status.days_left !== null ? "token expired" : "not connected";
+  const limited = status.rate_limited_until ? ` · rate limited until ${new Date(status.rate_limited_until * 1000).toLocaleTimeString()}` : "";
+  const secret = key === "mal"
+    ? `<label class="form-field"><span>client secret</span><input name="client_secret" type="password" autocomplete="off" placeholder="${status.has_secret ? "saved; leave blank to keep" : "only for “web” apps"}"></label>`
+    : "";
+  return `<section class="page-section list-site" data-site="${key}">
+    <h2>${site.name} <span class="count">${state}${limited}</span></h2>
+    <form class="form-grid list-connect">
+      <label class="form-field"><span>client ID</span><input name="client_id" autocomplete="off" required value="${escapeHtml(status.client_id || "")}"></label>
+      ${secret}
+      <div class="form-field full"><span>redirect URL</span><code class="mono list-redirect">${escapeHtml(status.redirect_url)}</code><small>${site.register}</small></div>
+      <div class="form-field full list-actions">
+        <button class="button primary" type="submit">${status.connected ? "reconnect" : "connect"}</button>
+        ${status.connected ? `<button class="button" type="button" data-list-plan>preview sync</button><button class="button" type="button" data-list-disconnect>disconnect</button>` : ""}
+      </div>
+    </form>
+    <div class="list-plan"></div>
+  </section>`;
+}
+
+function listPlanMarkup(plan) {
+  const added = plan.changes.filter((change) => change.action === "add").length;
+  const rows = plan.changes.map((change) => `<tr>
+      <td><a href="${pathForEntry(change.entry)}" data-link>${escapeHtml(change.title)}</a> <span class="dim">${change.action}</span></td>
+      <td class="mono">${escapeHtml(change.description)}</td>
+      <td><button class="link-button" type="button" data-list-push="${escapeHtml(change.url)}">push</button></td>
+    </tr>`).join("");
+  const titled = (label, titles) => titles.length
+    ? `<details class="list-report"><summary>${titles.length} ${label}</summary><p class="muted">${titles.map(escapeHtml).join(" · ")}</p></details>`
+    : "";
+  return `
+    ${plan.note ? `<p class="muted">${escapeHtml(plan.note)}</p>` : ""}
+    <p class="muted">${added} to add, ${plan.changes.length - added} to update, ${plan.in_sync} in sync. Nothing is saved until you push.</p>
+    ${rows ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>entry</th><th>change</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}
+    ${titled(`not on ${plan.site}`, plan.unknown)}
+    ${titled("bound to the same entry as another row (skipped)", plan.duplicates)}
+    ${titled(`on your ${plan.site} list but not tracked in NRS (left alone)`, plan.untracked)}
+    ${plan.unbound ? `<p class="dim">${plan.unbound} progress rows have no MAL/AniList URL and are skipped.</p>` : ""}
+    <p class="dim">Push one entry and check it on ${plan.site} first; “sync now” below saves all of these.</p>`;
+}
+
+function listTime(seconds) {
+  return seconds ? new Date(seconds * 1000).toLocaleString() : "";
+}
+
+function listJobMarkup(job) {
+  if (!job.started_at) return `<p class="dim">No full sync since the app started.</p>`;
+  const when = job.running ? `running since ${listTime(job.started_at)}` : `finished ${listTime(job.finished_at)}`;
+  const site = (run) => `<div class="list-run">
+      <p><strong>${escapeHtml(run.site)}</strong> <span class="dim">${escapeHtml(run.stage)}${job.running && run.rate_limited_until ? `, rate limited until ${new Date(run.rate_limited_until * 1000).toLocaleTimeString()}` : ""}</span>
+        <span class="mono muted">${run.saved}/${run.changes} saved · ${run.failed} failed · ${run.in_sync} in sync · ${run.unknown} not on the site</span></p>
+      ${run.note ? `<p class="dim">${escapeHtml(run.note)}</p>` : ""}
+      ${run.errors.length ? `<details class="list-report"><summary class="error">${run.errors.length} errors</summary><p class="muted">${run.errors.map(escapeHtml).join("<br>")}</p></details>` : ""}
+    </div>`;
+  return `<p class="muted">${when}</p>${job.sites.map(site).join("")}`;
+}
+
+function listLiveMarkup(live) {
+  if (!live.length) return `<p class="dim">No live pushes since the app started.</p>`;
+  const rows = live.map((push) => `<tr>
+      <td class="mono dim">${escapeHtml(listTime(push.at))}</td>
+      <td>${escapeHtml(push.site)}</td>
+      <td><a href="${pathForEntry(push.entry)}" data-link>${escapeHtml(push.title)}</a></td>
+      <td class="mono ${push.ok ? "" : "error"}">${escapeHtml(push.outcome)}</td>
+    </tr>`).join("");
+  return `<div class="data-table-wrap"><table class="data-table"><tbody>${rows}</tbody></table></div>`;
+}
+
+async function renderLists() {
+  currentEntryData = null;
+  document.title = "Lists — NRS";
+  const lead = `<h1>lists</h1><p class="muted">Send progress and 1–10 scores (nrs-impl's base-anime scale) to MyAnimeList and AniList. NRS wins: status, counts, dates and scores there are overwritten; nothing is deleted.</p>`;
+  app.innerHTML = `${lead}<p class="loading">Loading…</p>`;
+  const version = routeVersion;
+  // AniList's implicit grant lands here with the token in the fragment.
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (fragment.has("access_token")) {
+    history.replaceState(null, "", "/lists");
+    try {
+      const { user } = await sendJson("/api/v1/lists/anilist/token", "POST", {
+        access_token: fragment.get("access_token"),
+        expires_in: Number(fragment.get("expires_in")) || null,
+        client_id: storedItem(ANILIST_CLIENT_KEY),
+      });
+      showToast(`Connected to AniList as ${user}`);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+  const query = new URLSearchParams(location.search);
+  const failure = query.get("error");
+  if (query.get("connected") === "mal") showToast("Connected to MyAnimeList");
+  if (query.has("error") || query.has("connected")) history.replaceState(null, "", "/lists");
+  let status;
+  try {
+    status = await getJson("/api/v1/lists");
+  } catch (error) {
+    renderError(error);
+    return;
+  }
+  if (version !== routeVersion) return;
+  app.innerHTML = `${lead}
+    ${failure ? `<p class="error">${escapeHtml(failure)}</p>` : ""}
+    <div class="lists-page">${listSiteMarkup("mal", status.mal)}${listSiteMarkup("anilist", status.anilist)}
+      <section class="page-section list-sync">
+        <h2>Sync</h2>
+        <p class="muted">Progress changes push on their own, a moment after you make them (progress only). A full sync also sends every score; schedule it with <code>curl -X POST '${escapeHtml(location.origin)}/api/v1/lists/sync?wait=true'</code>.</p>
+        <div class="list-actions"><button class="button primary" type="button" data-list-sync ${status.mal.connected || status.anilist.connected ? "" : "disabled"}>sync now</button></div>
+        <div class="list-job">${listJobMarkup(status.job)}</div>
+        <h3>Live pushes</h3>
+        <div class="list-live">${listLiveMarkup(status.live)}</div>
+      </section>
+    </div>
+    <p class="dim">Tokens are saved to <code>${escapeHtml(status.tokens_path)}</code>.</p>`;
+  const page = app.querySelector(".lists-page");
+  let poll = null;
+  const refresh = async () => {
+    try {
+      const latest = await sendJson("/api/v1/lists", "GET");
+      if (version !== routeVersion) return;
+      const job = app.querySelector(".list-job");
+      const live = app.querySelector(".list-live");
+      if (job) job.innerHTML = listJobMarkup(latest.job);
+      if (live) live.innerHTML = listLiveMarkup(latest.live);
+      if (!latest.job.running && poll) {
+        clearInterval(poll);
+        poll = null;
+        const button = app.querySelector("[data-list-sync]");
+        if (button instanceof HTMLButtonElement) button.disabled = false;
+      }
+    } catch {
+      // The next tick tries again.
+    }
+  };
+  const watch = () => {
+    if (!poll) poll = setInterval(refresh, 2000);
+  };
+  pageTeardown = () => {
+    if (poll) clearInterval(poll);
+  };
+  if (status.job.running) watch();
+  page?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const key = form.closest("[data-site]")?.getAttribute("data-site");
+    const fields = new FormData(form);
+    const clientId = String(fields.get("client_id") || "").trim();
+    if (key === "anilist") {
+      storeItem(ANILIST_CLIENT_KEY, clientId);
+      location.href = `https://anilist.co/api/v2/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=token`;
+      return;
+    }
+    const button = form.querySelector('button[type="submit"]');
+    if (button instanceof HTMLButtonElement) button.disabled = true;
+    try {
+      const { url } = await sendJson("/api/v1/lists/mal/connect", "POST", {
+        client_id: clientId,
+        client_secret: String(fields.get("client_secret") || ""),
+      });
+      location.href = url;
+    } catch (error) {
+      showToast(error.message, "error");
+      if (button instanceof HTMLButtonElement) button.disabled = false;
+    }
+  });
+  page?.addEventListener("click", async (event) => {
+    if (!(event.target instanceof Element)) return;
+    const section = event.target.closest("[data-site]");
+    const key = section?.getAttribute("data-site");
+    const output = section?.querySelector(".list-plan");
+    const button = event.target.closest("button");
+    if (!(button instanceof HTMLButtonElement)) return;
+    if (button.hasAttribute("data-list-sync")) {
+      button.disabled = true;
+      try {
+        const job = await sendJson("/api/v1/lists/sync", "POST");
+        const output = app.querySelector(".list-job");
+        if (output) output.innerHTML = listJobMarkup(job);
+        watch();
+      } catch (error) {
+        button.disabled = false;
+        showToast(error.message, "error");
+      }
+      return;
+    }
+    if (!key) return;
+    if (button.hasAttribute("data-list-disconnect")) {
+      try {
+        await sendJson(`/api/v1/lists/${key}`, "DELETE");
+        route();
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    } else if (button.hasAttribute("data-list-plan") && output instanceof HTMLElement) {
+      button.disabled = true;
+      output.innerHTML = `<p class="loading">Reading your ${listSites[key].name} list… entries not on it yet are looked up too, which can take a minute.</p>`;
+      try {
+        const plan = await sendJson(`/api/v1/lists/${key}/plan`, "GET");
+        output.innerHTML = listPlanMarkup(plan);
+      } catch (error) {
+        output.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+      } finally {
+        button.disabled = false;
+      }
+    } else if (button.hasAttribute("data-list-push")) {
+      button.disabled = true;
+      try {
+        const { saved } = await sendJson(`/api/v1/lists/${key}/push`, "POST", { url: button.dataset.listPush });
+        button.textContent = saved ? "pushed" : "in sync";
+        showToast(saved ? `Saved: ${saved}` : "Already in sync");
+      } catch (error) {
+        button.disabled = false;
+        showToast(error.message, "error");
+      }
+    }
+  });
+}
+
 function route() {
   routeVersion++;
   pageTeardown?.();
@@ -3477,6 +3733,8 @@ function route() {
     renderSeasons();
   } else if (/^\/progress\/?$/.test(location.pathname)) {
     renderProgress();
+  } else if (/^\/lists\/?$/.test(location.pathname)) {
+    renderLists();
   } else if (/^\/palette\/?$/.test(location.pathname)) {
     renderPalette();
   } else if (/^\/calibrate\/?$/.test(location.pathname)) {
