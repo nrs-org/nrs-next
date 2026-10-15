@@ -2454,9 +2454,11 @@ function openProgressEditor(data, progress, host) {
 async function openProgressFinish(data, progress, status, host) {
   const entryId = data.entry.id;
   const unitMinutes = progress.unit_minutes ?? await defaultUnitMinutes(entryId, progress.unit);
-  // The count so far, not the total: a total can be a still-airing
-  // show's planned count, and counting unwatched episodes inflates the score.
-  const current = progress.current;
+  // Nothing counted yet (started, then finished straight away): all of
+  // it. Otherwise the count so far, not the total: a total can be a
+  // still-airing show's planned count, and counting unwatched episodes
+  // inflates the score.
+  const current = status === "completed" && !progress.current && progress.total ? progress.total : progress.current;
   const unitLabel = progressUnits[progress.unit]?.[0] || progress.unit;
   const fields = {
     current: formatCount(current),
