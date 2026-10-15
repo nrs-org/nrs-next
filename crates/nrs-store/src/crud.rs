@@ -182,6 +182,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// `(entry, dah_kind, dah_params)` for every impact as scoring sees
+    /// it: an ordinary impact under its target, a shared one under each
+    /// of its members.
+    pub fn impact_kinds_by_entry(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(m.contributor, i.target), i.dah_kind, i.dah_params \
+             FROM impact i LEFT JOIN impact_member m ON m.impact = i.id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
     /// Stores what kind of work `id` is; `None` clears it back to
     /// inference.
     pub fn set_entry_kind(&mut self, id: &EntryId, kind: Option<&str>) -> Result<()> {

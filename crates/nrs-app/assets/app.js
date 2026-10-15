@@ -282,7 +282,7 @@ function scoreRow(row, comparing, filtered) {
   return `<tr data-id="${escapeHtml(row.id)}" data-kind="${escapeHtml(row.kind)}">
     <td class="col-rank">${rank}</td>
     ${comparing ? `<td class="col-delta">${delta}</td>` : ""}
-    <td class="col-title"><a href="${pathForEntry(row.id)}" data-link>${escapeHtml(row.title || row.id)}</a></td>
+    <td class="col-title"><a href="${pathForEntry(row.id)}" data-link>${escapeHtml(row.title || row.id)}</a>${row.issues.length ? ` <span class="issue-badge" title="${escapeHtml(row.issues.map(ruleLabel).join(" · "))}">${row.issues.length}</span>` : ""}</td>
     <td class="col-type">${kindTag(row.kind)}</td>
     <td class="col-store">${escapeHtml(row.store)}</td>
     <td class="col-value">${Number(row.value).toFixed(4)}</td>
@@ -352,6 +352,7 @@ async function renderScores() {
           <dt><code>store:mal</code></dt><dd>store contains it</dd>
           <dt><code>v>10</code> <code>rank<=100</code></dt><dd>compare with <code>&gt; &gt;= &lt; &lt;= =</code></dd>
           <dt><code>delta>=5</code> <code>is:up</code> <code>is:down</code> <code>is:moved</code></dt><dd>rank changes since the compared run (after an edit or a rerun)</dd>
+          <dt><code>is:incomplete</code> <code>issue:writing</code></dt><dd>entries missing a profile impact or breaking another check; <code>issue:</code> matches part of a rule name</dd>
         </dl>
       </div></details>
     </div>
@@ -447,7 +448,8 @@ async function renderScores() {
     kinds = page.kinds;
     const present = new Set(termsOf(view.q));
     chips.innerHTML = kinds.map(({ kind, count, state }) => `<button class="kind-chip" type="button" data-kind="${escapeHtml(kind)}" data-state="${state || ""}" ${count || state ? "" : "disabled"} title="click: only ${escapeHtml(entryKinds[kind] || kind)} · shift-click: hide it">${escapeHtml(entryKinds[kind] || kind)}<small>${count}</small></button>`).join("")
-      + (comparing ? `<span class="chip-divider"></span>${statusTerms.map(([term, label]) => `<button class="status-chip" type="button" data-term="${term}" data-state="${present.has(term) ? "include" : ""}">${label}</button>`).join("")}` : "");
+      + (comparing ? `<span class="chip-divider"></span>${statusTerms.map(([term, label]) => `<button class="status-chip" type="button" data-term="${term}" data-state="${present.has(term) ? "include" : ""}">${label}</button>`).join("")}` : "")
+      + (page.incomplete || present.has("is:incomplete") ? `<span class="chip-divider"></span><button class="status-chip incomplete-chip" type="button" data-term="is:incomplete" data-state="${present.has("is:incomplete") ? "include" : ""}" title="entries missing profile impacts or breaking another check">incomplete<small>${page.incomplete}</small></button>` : "");
     warnings.hidden = !page.warnings.length;
     warnings.textContent = page.warnings.join(" · ");
   }
@@ -2088,8 +2090,7 @@ function progressBasis(entryId) {
  * XML that leaves them out): blank fields are filled, and a field that
  * differs from the store shows the store's value with a "use" link.
  */
-async function bindProgressBasis(root, entryId) {
-  const kind = root.closest(".impact-form")?.querySelector('select[name="kind"]')?.value;
+async function bindProgressBasis(root, entryId, kind = root.closest(".impact-form")?.querySelector('select[name="kind"]')?.value) {
   const targets = {
     music_consumed_progress: [["duration_minutes", "length_minutes", formatDurationInput]],
     anime_consumed: [
@@ -2126,6 +2127,133 @@ async function bindProgressBasis(root, entryId) {
     input.closest(".form-field")?.append(hint);
     sync();
   }
+}
+
+/** A `checks` rule's name without the `dah-` prefix. */
+function ruleLabel(rule) {
+  return rule.replace(/^dah-/, "");
+}
+
+/**
+ * The entry's profile (the impacts its kind is expected to carry) as a
+ * row of slots, the rules it breaks, and the waivers excusing it.
+ */
+function profileCheckMarkup(checks) {
+  if (!checks.profile.length && !checks.issues.length && !checks.waivers.length) return "";
+  const missing = new Set(checks.issues.map((issue) => issue.slot).filter(Boolean));
+  const slot = (item) => {
+    const state = item.count ? "filled" : item.waived ? "waived" : missing.has(item.kind) ? "missing" : !item.rule ? "optional" : "owed-later";
+    const mark = { filled: "✓", waived: "⊘", missing: "✗", optional: "+", "owed-later": "·" }[state];
+    const title = {
+      filled: `${item.count} impact${item.count === 1 ? "" : "s"}`,
+      waived: `waived: ${item.rule}`,
+      missing: item.via_progress ? "missing — follows progress" : "missing",
+      optional: "optional",
+      "owed-later": "not owed until finished",
+    }[state];
+    return `<span class="profile-slot" data-state="${state}" title="${escapeHtml(title)}">${mark} ${escapeHtml(item.label)}${item.count > 1 ? `<small>${item.count}</small>` : ""}</span>`;
+  };
+  const fillable = checks.profile.filter((item) => !item.via_progress && !item.count && !item.waived);
+  const needsProgress = checks.profile.some((item) => item.via_progress && missing.has(item.kind));
+  const issues = checks.issues.map((issue) => `<li data-state="issue"><span class="rule-name">${escapeHtml(ruleLabel(issue.rule))}</span> ${escapeHtml(issue.message)}
+    <button class="link-button" type="button" data-waive="${escapeHtml(issue.rule)}">waive</button></li>`);
+  const waivers = checks.waivers.map((waiver) => {
+    const note = !waiver.checked ? "legacy rule, not checked here" : waiver.unused ? "no longer needed" : "";
+    return `<li data-state="${waiver.checked && !waiver.unused ? "waived" : "stale"}"><span class="rule-name">${escapeHtml(ruleLabel(waiver.rule))}</span> waived${waiver.reason ? ` — ${escapeHtml(waiver.reason)}` : ""}${note ? ` <small>(${note})</small>` : ""}
+      <button class="link-button" type="button" data-unwaive="${escapeHtml(waiver.rule)}">remove</button></li>`;
+  });
+  return `<div class="profile-check" data-complete="${checks.issues.length ? "false" : "true"}">
+    ${checks.profile.length ? `<div class="profile-slots"><span class="profile-caption">profile</span>${checks.profile.map(slot).join("")}</div>` : ""}
+    ${issues.length || waivers.length ? `<ul class="check-list">${issues.join("")}${waivers.join("")}</ul>` : ""}
+    ${fillable.length || needsProgress ? `<div class="profile-actions">
+      ${fillable.length ? `<button class="button primary" type="button" data-action="fill-profile">fill profile <small>${fillable.map((item) => escapeHtml(item.label.toLowerCase())).join(" · ")}</small></button>` : ""}
+      ${needsProgress ? `<button class="button" type="button" data-action="goto-progress">set progress</button>` : ""}
+    </div>` : ""}
+  </div>`;
+}
+
+/** Fields of one profile slot's fieldset, as the kind editor submits them. */
+function slotPayload(fieldset) {
+  const payload = { kind: fieldset.getAttribute("data-slot") || "" };
+  fieldset.querySelectorAll("[name]").forEach((input) => {
+    if (!(input instanceof HTMLInputElement || input instanceof HTMLSelectElement || input instanceof HTMLTextAreaElement)) return;
+    if (input instanceof HTMLInputElement && input.type === "checkbox" && !input.checked) return;
+    payload[input.name] = input.value;
+  });
+  return payload;
+}
+
+/**
+ * One form for every profile slot still empty: required ones open,
+ * optional ones behind a checkbox. Saved together by `profile_fill`.
+ */
+function openProfileEditor(data, action) {
+  const entryId = data.entry.id;
+  const slots = data.checks.profile.filter((item) => !item.via_progress && !item.count && !item.waived);
+  const body = `<p class="form-note editor-intro">Every ${escapeHtml(entryKinds[data.entry.kind] || data.entry.kind)} gets these. Each section saves as its own impact.</p>
+    ${slots.map((item) => {
+      const fields = { source: entryId, ...Object.fromEntries(item.defaults) };
+      const included = item.rule != null;
+      return `<fieldset class="profile-fieldset" data-slot="${escapeHtml(item.kind)}" ${included ? "" : "disabled"}>
+        <legend><label><input type="checkbox" data-include ${included ? "checked" : ""}> ${escapeHtml(item.label)}${item.rule ? "" : ' <small class="dim">optional</small>'}</label></legend>
+        <div class="form-grid">${impactKindFields(item.kind, fields)}</div>
+      </fieldset>`;
+    }).join("")}`;
+  const editor = showEditor(action.closest(".profile-check") || action, "Fill profile", body, async () => {
+    const impacts = [...editor.querySelectorAll(".profile-fieldset")]
+      .filter((fieldset) => fieldset instanceof HTMLFieldSetElement && !fieldset.disabled)
+      .map(slotPayload);
+    if (!impacts.length) throw new Error("nothing selected");
+    await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/profile`, "POST", { impacts });
+    await refreshEntry(entryId);
+    showToast(`${impacts.length} impact${impacts.length === 1 ? "" : "s"} added`);
+  });
+  if (!editor) return;
+  editor.querySelectorAll(".profile-fieldset").forEach((fieldset) => {
+    if (!(fieldset instanceof HTMLFieldSetElement)) return;
+    // The checkbox sits in the legend, which a disabled fieldset leaves
+    // enabled.
+    const include = fieldset.querySelector("[data-include]");
+    include?.addEventListener("change", () => {
+      fieldset.disabled = !(include instanceof HTMLInputElement && include.checked);
+    });
+    const grid = fieldset.querySelector(".form-grid");
+    if (grid instanceof HTMLElement) bindProgressBasis(grid, entryId, fieldset.getAttribute("data-slot") || "");
+  });
+}
+
+function openWaiverEditor(data, rule, action) {
+  const entryId = data.entry.id;
+  const body = `<p class="form-note editor-intro">Stop flagging <span class="mono">${escapeHtml(rule)}</span> on this entry.</p>
+    ${field("why", `<input name="reason" type="text" placeholder="e.g. no visuals to speak of">`)}`;
+  showEditor(action.closest(".profile-check") || action, "Waive rule", body, async (payload) => {
+    await sendJson(`/api/v1/entries/${encodeURIComponent(entryId)}/waivers/${encodeURIComponent(rule)}`, "PUT", { reason: payload.reason || null });
+    await refreshEntry(entryId);
+    showToast(`${ruleLabel(rule)} waived`);
+  });
+}
+
+function bindProfileCheck(data) {
+  const panel = app.querySelector(".profile-check");
+  if (!(panel instanceof HTMLElement)) return;
+  panel.addEventListener("click", async (event) => {
+    const target = event.target instanceof Element ? event.target.closest("button") : null;
+    if (!(target instanceof HTMLButtonElement) || !panel.contains(target)) return;
+    const action = target.getAttribute("data-action");
+    if (action === "fill-profile") openProfileEditor(data, target);
+    else if (action === "goto-progress") app.querySelector("[data-progress]")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    else if (target.hasAttribute("data-waive")) openWaiverEditor(data, target.getAttribute("data-waive") || "", target);
+    else if (target.hasAttribute("data-unwaive")) {
+      const rule = target.getAttribute("data-unwaive") || "";
+      try {
+        await sendJson(`/api/v1/entries/${encodeURIComponent(data.entry.id)}/waivers/${encodeURIComponent(rule)}`, "DELETE");
+        await refreshEntry(data.entry.id);
+        showToast(`${ruleLabel(rule)} checked again`);
+      } catch (error) {
+        showToast(error?.message || String(error), "error");
+      }
+    }
+  });
 }
 
 function openImpactEditor(impact = null, action) {
@@ -2819,6 +2947,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
       <section class="page-section">
         <h2>Impacts <span class="count">${data.impacts.length}</span></h2>
         <p class="section-lead">What this entry did, why it mattered, and which feeling or craft anchor carried it.</p>
+        ${profileCheckMarkup(data.checks)}
         ${data.impacts.length ? impactSections(data.impacts) : `<p class="empty">No impacts yet.</p>`}
         <div class="section-actions"><button class="button primary" type="button" data-action="add-impact">add impact</button></div>
       </section>
@@ -2830,6 +2959,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
         <div class="section-actions"><button class="button primary" type="button" data-action="add-relation">add relation</button></div>
       </section>`;
     bindKindSelect(data);
+    bindProfileCheck(data);
     bindInlineSplits(data);
     bindTracklist(data);
     bindRelated(data);

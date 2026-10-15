@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::score_filter::{Candidate, ScoreFilter};
 use super::{
-    build_impact_atoms, build_relation, dah_factor_field, dah_params_json, entry_display_name,
+    build_impact_atoms, checks, build_relation, dah_factor_field, dah_params_json, entry_display_name,
     entry_kind, entry_kind_slug, impact_anchor_mix, impact_kind_presentation,
     impact_period_summary, impact_primary_metric, impact_section, inferred_kind,
     normalize_duration_fields, normalize_period_fields, parsed_dah_params, rows, used_anchors,
@@ -231,6 +231,8 @@ pub(super) struct Scored {
     haystack: String,
     value: f32,
     rank: usize,
+    /// The `checks` rules the entry breaks.
+    issues: Vec<&'static str>,
 }
 
 /// The last few rankings computed: the current one, the ones before the
@@ -259,6 +261,22 @@ fn current(
     }
 }
 
+/// What `checks` needs about every entry, from the store.
+fn entry_facts(
+    store: &TrackedStore,
+) -> Result<HashMap<String, checks::Facts>, (StatusCode, Json<ApiError>)> {
+    let impacts = store
+        .impact_kinds_by_entry()
+        .map_err(|error| store_error("load impact kinds", error))?;
+    let progress = store
+        .list_progress()
+        .map_err(|error| store_error("load progress", error))?;
+    let waivers = store
+        .waivers()
+        .map_err(|error| store_error("load waivers", error))?;
+    Ok(checks::facts_by_entry(impacts, progress, waivers))
+}
+
 /// A full ranking, if it could be produced.
 type MaybeRanking = Option<Arc<Vec<Scored>>>;
 
@@ -270,18 +288,36 @@ fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode,
     if let Some(hit) = cached_ranking(state, key) {
         return Ok(Some(hit));
     }
-    let rank = |snapshot: &nrs_core::Snapshot, k_feat, hints: KindHints| -> Vec<Scored> {
-        rows(snapshot, SortBy::Value, SortDir::Desc, k_feat, key.time(), key.sign)
+    let no_facts = checks::Facts::default();
+    let rank = |snapshot: &nrs_core::Snapshot,
+                k_feat,
+                hints: KindHints,
+                facts: HashMap<String, checks::Facts>|
+     -> Vec<Scored> {
+        rows(
+            snapshot,
+            SortBy::Value,
+            SortDir::Desc,
+            k_feat,
+            key.time(),
+            key.sign,
+        )
             .into_iter()
             .enumerate()
-            .map(|(index, row)| Scored {
-                id: row.id.0.clone(),
-                title: row.title.to_string(),
-                store: row.store.to_string(),
-                kind: entry_kind(&row.id.0, row.store, &hints),
-                haystack: format!("{} {} {}", row.title, row.id.0, row.store).to_lowercase(),
-                value: row.value,
-                rank: index + 1,
+            .map(|(index, row)| {
+                let kind = entry_kind(&row.id.0, row.store, &hints);
+                let issues = checks::issues(kind, facts.get(&row.id.0).unwrap_or(&no_facts));
+                Scored {
+                    id: row.id.0.clone(),
+                    title: row.title.to_string(),
+                    store: row.store.to_string(),
+                    kind,
+                    haystack: format!("{} {} {}", row.title, row.id.0, row.store)
+                        .to_lowercase(),
+                    value: row.value,
+                    rank: index + 1,
+                    issues: issues.into_iter().map(|issue| issue.rule).collect(),
+                }
             })
             .collect()
     };
@@ -298,15 +334,17 @@ fn scored(state: &AppState, key: ScoresKey) -> Result<MaybeRanking, (StatusCode,
         let stored = store
             .entry_kinds()
             .map_err(|error| store_error("load entry kinds", error))?;
+        let facts = entry_facts(&store)?;
         drop(store);
         let hints = KindHints::new(&snapshot).with_stored(stored);
-        rank(&snapshot, params.k_feat, hints)
+        rank(&snapshot, params.k_feat, hints, facts)
     } else {
         let hints = KindHints::new(&state.snapshot);
         rank(
             &state.snapshot,
             state.snapshot.palette.k_feat.clone(),
             hints,
+            HashMap::new(),
         )
     };
 
@@ -423,6 +461,7 @@ impl ScoresView {
                 value: row.value,
                 rank: row.rank,
                 delta: self.delta(row),
+                issues: &row.issues,
             };
             if !self.filter.matches(&candidate, true) {
                 continue;
@@ -530,6 +569,8 @@ pub(super) struct ScoreRow {
     /// `rank` and `delta` among this filter's matches only.
     filtered_rank: usize,
     filtered_delta: Option<i64>,
+    /// The `checks` rules the entry breaks.
+    issues: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -553,6 +594,9 @@ pub(super) struct ScoresPage {
     offset: usize,
     limit: usize,
     kinds: Vec<KindCount>,
+    /// Entries in the whole ranking that break a `checks` rule
+    /// (`is:incomplete`).
+    incomplete: usize,
     /// Filter terms that were dropped, and why.
     warnings: Vec<String>,
 }
@@ -584,6 +628,7 @@ pub(super) async fn scores(
                 delta: view.delta(row),
                 filtered_rank: local[&index].rank,
                 filtered_delta: local[&index].delta,
+                issues: row.issues.clone(),
             }
         })
         .collect();
@@ -600,6 +645,11 @@ pub(super) async fn scores(
         offset,
         limit,
         kinds,
+        incomplete: view
+            .ranking
+            .iter()
+            .filter(|row| !row.issues.is_empty())
+            .count(),
         warnings: view.filter.warnings,
     }))
 }
@@ -1602,6 +1652,64 @@ pub(super) struct EntryResponse {
     kind_stored: bool,
     impacts: Vec<Impact>,
     relations: Vec<Relation>,
+    checks: EntryChecks,
+}
+
+/// The entry's profile and the `checks` rules it breaks.
+#[derive(Serialize)]
+struct EntryChecks {
+    profile: Vec<ProfileSlot>,
+    issues: Vec<checks::Issue>,
+    waivers: Vec<WaiverView>,
+    /// Every rule name, for waiving one that isn't firing yet.
+    rules: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct ProfileSlot {
+    #[serde(flatten)]
+    slot: checks::Slot,
+    /// Impacts filling it.
+    count: usize,
+    /// Its rule is waived.
+    waived: bool,
+}
+
+#[derive(Serialize)]
+struct WaiverView {
+    rule: String,
+    reason: Option<String>,
+    /// The rule would pass without it.
+    unused: bool,
+    /// The app runs this rule; legacy waivers for the validator's other
+    /// rules are kept but excuse nothing.
+    checked: bool,
+}
+
+fn entry_checks(kind: &str, facts: &checks::Facts) -> EntryChecks {
+    let unused = checks::unused_waivers(kind, facts);
+    EntryChecks {
+        profile: checks::profile(kind)
+            .iter()
+            .map(|slot| ProfileSlot {
+                slot: *slot,
+                count: facts.count(slot.kind),
+                waived: slot.rule.is_some_and(|rule| facts.waived(rule)),
+            })
+            .collect(),
+        issues: checks::issues(kind, facts),
+        waivers: facts
+            .waivers
+            .iter()
+            .map(|waiver| WaiverView {
+                rule: waiver.rule.clone(),
+                reason: waiver.reason.clone(),
+                unused: unused.contains(waiver.rule.as_str()),
+                checked: checks::is_checked(&waiver.rule),
+            })
+            .collect(),
+        rules: checks::RULES,
+    }
 }
 
 pub(super) async fn entry_detail(
@@ -1644,6 +1752,7 @@ pub(super) async fn entry_detail(
             )
         })?;
     let hints = kind_hints(&state, &store)?;
+    let facts = entry_facts(&store)?.remove(&entry_id).unwrap_or_default();
     drop(store);
 
     let lookup: HashMap<&str, &Entry> = entries
@@ -1689,6 +1798,7 @@ pub(super) async fn entry_detail(
             .map(|impact| impact_response(impact, &lookup, &hints))
             .collect(),
         relations: relation_responses,
+        checks: entry_checks(entry_kind(&entry.id.0, &entry.store, &hints), &facts),
     }))
 }
 
@@ -2115,6 +2225,129 @@ pub(super) async fn impact_add(
     Ok(Json(MutationResponse {
         ok: true,
         id: Some(id.0),
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ProfileFill {
+    /// One kind-editor form per slot to fill, each with its `kind`.
+    impacts: Vec<HashMap<String, String>>,
+}
+
+/// Adds several profile impacts at once (the entry page's "fill
+/// profile"). Each must be a slot of the entry's profile that isn't
+/// kept by progress; every form is checked before any is saved.
+pub(super) async fn profile_fill(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Json(fill): Json<ProfileFill>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "impact writes require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    let entry = store
+        .list_entries()
+        .map_err(|error| store_error("load entries", error))?
+        .into_iter()
+        .find(|entry| entry.id.0 == entry_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "entry not found"))?;
+    let hints = kind_hints(&state, &store)?;
+    let kind = entry_kind(&entry.id.0, &entry.store, &hints);
+    let profile = checks::profile(kind);
+    if fill.impacts.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "nothing to fill"));
+    }
+    let mut prepared = Vec::with_capacity(fill.impacts.len());
+    for fields in fill.impacts {
+        let impact_kind = fields.get("kind").map(String::as_str).unwrap_or("");
+        match profile.iter().find(|slot| slot.kind == impact_kind) {
+            None => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("{impact_kind:?} is not part of the {kind} profile"),
+                ))
+            }
+            Some(slot) if slot.via_progress => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("{impact_kind:?} follows the entry's progress; set that instead"),
+                ))
+            }
+            Some(_) => prepared.push(prepare_impact(&entry_id, fields)?),
+        }
+    }
+    let mut last = None;
+    for (impact_kind, atoms, note, factor, fields) in prepared {
+        let id = store
+            .add_impact(&EntryId(entry_id.clone()), &atoms, note.as_deref())
+            .map_err(|error| store_error("add impact", error))?;
+        if let Err(error) = store.set_impact_dah(&id, &impact_kind, &dah_params_json(&fields), factor) {
+            let _ = store.delete_impact(&id);
+            return Err(store_error("save impact metadata", error));
+        }
+        last = Some(id.0);
+    }
+    Ok(Json(MutationResponse { ok: true, id: last }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct WaiverUpdate {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Exempts the entry from one `checks` rule.
+pub(super) async fn waiver_set(
+    State(state): State<Arc<AppState>>,
+    Path((entry_id, rule)): Path<(String, String)>,
+    Json(update): Json<WaiverUpdate>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entry writes require database mode",
+        )
+    })?;
+    let reason = update
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?
+        .set_waiver(&EntryId(entry_id.clone()), &rule, reason)
+        .map_err(|error| store_error("set waiver", error))?;
+    Ok(Json(MutationResponse {
+        ok: true,
+        id: Some(entry_id),
+    }))
+}
+
+pub(super) async fn waiver_remove(
+    State(state): State<Arc<AppState>>,
+    Path((entry_id, rule)): Path<(String, String)>,
+) -> ApiResult<MutationResponse> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entry writes require database mode",
+        )
+    })?;
+    store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?
+        .remove_waiver(&EntryId(entry_id.clone()), &rule)
+        .map_err(|error| store_error("remove waiver", error))?;
+    Ok(Json(MutationResponse {
+        ok: true,
+        id: Some(entry_id),
     }))
 }
 

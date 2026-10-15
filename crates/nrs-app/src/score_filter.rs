@@ -7,6 +7,9 @@
 //! - `v>10`, `rank<=100`, `delta>=5`, with `>` `>=` `<` `<=` `=`
 //! - `is:moved`, `is:up`, `is:down` -- rank changes, only meaningful
 //!   while comparing two runs
+//! - `is:incomplete` -- breaks a `checks` rule (a missing writing or
+//!   visual impact, ...); `issue:writing` narrows to rules whose name
+//!   contains the word
 //! - a leading `-` negates any term
 //!
 //! Unrecognized `key:value` terms are plain words, since titles like
@@ -54,6 +57,9 @@ enum Test {
     Moved,
     Up,
     Down,
+    Incomplete,
+    /// Lowercased; matched against the rule names a row breaks.
+    Issue(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,6 +81,8 @@ pub(crate) struct Candidate<'a> {
     /// Places gained since the compared run; `None` when not comparing,
     /// or for an entry the compared run didn't have.
     pub(crate) delta: Option<i64>,
+    /// The `checks` rules the entry breaks.
+    pub(crate) issues: &'a [&'static str],
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +148,10 @@ impl ScoreFilter {
                     };
                 }
                 "store" | "s" => return Some(Test::Store(value.to_lowercase())),
+                "issue" => return Some(Test::Issue(value.to_lowercase())),
+                "is" if value.eq_ignore_ascii_case("incomplete") => {
+                    return Some(Test::Incomplete);
+                }
                 "is" => {
                     let test = match value.to_lowercase().as_str() {
                         "moved" => Test::Moved,
@@ -248,6 +260,8 @@ fn test(test: &Test, candidate: &Candidate<'_>) -> bool {
         Test::Moved => candidate.delta != Some(0),
         Test::Up => candidate.delta.is_some_and(|delta| delta > 0),
         Test::Down => candidate.delta.is_some_and(|delta| delta < 0),
+        Test::Incomplete => !candidate.issues.is_empty(),
+        Test::Issue(word) => candidate.issues.iter().any(|rule| rule.contains(word.as_str())),
     }
 }
 
@@ -305,6 +319,7 @@ mod tests {
             value,
             rank,
             delta,
+            issues: &[],
         }
     }
 
@@ -354,6 +369,17 @@ mod tests {
         assert!(ScoreFilter::parse("delta<0 is:down is:moved", true).matches(&row, false));
         assert!(!ScoreFilter::parse("is:up", true).matches(&row, false));
         assert!(ScoreFilter::parse("-rank<10", true).matches(&row, false));
+    }
+
+    #[test]
+    fn issue_terms_match_broken_rules() {
+        let mut row = candidate("x", "anime", 1.0, 1, None);
+        assert!(!ScoreFilter::parse("is:incomplete", false).matches(&row, false));
+        row.issues = &["dah-no-writing-impact"];
+        assert!(ScoreFilter::parse("is:incomplete", false).matches(&row, false));
+        assert!(ScoreFilter::parse("issue:writing", false).matches(&row, false));
+        assert!(!ScoreFilter::parse("issue:visual", false).matches(&row, false));
+        assert!(!ScoreFilter::parse("-is:incomplete", false).matches(&row, false));
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! API under `/api/v1`.
 
 mod api;
+mod checks;
 mod score_filter;
 
 use std::collections::HashMap;
@@ -217,6 +218,11 @@ async fn main() {
         .route("/stores/{store}/discover", get(api::store_discover))
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
+        .route("/entries/{entry_id}/profile", post(api::profile_fill))
+        .route(
+            "/entries/{entry_id}/waivers/{rule}",
+            put(api::waiver_set).delete(api::waiver_remove),
+        )
         .route("/entries/{entry_id}/impacts", post(api::impact_add))
         .route(
             "/entries/{entry_id}/progress-basis",
