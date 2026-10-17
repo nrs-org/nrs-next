@@ -1,5 +1,7 @@
 /target
 /.direnv
+/.dev-stack/
+/scripts/__pycache__/
 *.db
 *.db-journal
 *.db-wal

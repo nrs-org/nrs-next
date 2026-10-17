@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+nrs_stack_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "${1:-}" == help || "${1:-}" == --help || "${1:-}" == -h ]]; then
+  cat <<'EOF'
+Usage: ./dev [command]
+
+  up [-D]                 Build and start the stack (default); -D runs detached
+  attach                  Open the running stack's terminal UI
+  status                  List services and health
+  logs SERVICE            Show a service's logs
+  restart SERVICE         Rebuild and restart a service
+  down                    Stop the managed stack
+  check                   Validate the process-compose configuration
+
+Other arguments are passed to process-compose. Nix supplies all tools.
+Set NRS_DB_PATH to choose another existing NRS database (default: nrs-strip.db).
+See README.md for repository, port, and database overrides.
+EOF
+  exit 0
+fi
+
+if [[ "${NRS_STACK_NIX:-}" != 1 ]]; then
+  exec nix develop "$nrs_stack_root" -c "$nrs_stack_root/dev" "$@"
+fi
+
+cd -- "$nrs_stack_root"
+export NRS_STACK_ROOT="$nrs_stack_root"
+export NRS_STACK_STATE_DIR="${NRS_STACK_STATE_DIR:-$nrs_stack_root/.dev-stack}"
+export NRS_DB_PATH="${NRS_DB_PATH:-$nrs_stack_root/nrs-strip.db}"
+export NRS_ANIME_STORE_DIR="${NRS_ANIME_STORE_DIR:-$nrs_stack_root/../nrs-anime-store-go}"
+export NRS_MUSICLIB_DIR="${NRS_MUSICLIB_DIR:-$nrs_stack_root/../musiclib-rs}"
+export NRS_APP_PORT="${NRS_APP_PORT:-3737}"
+export NRS_ANIME_STORE_PORT="${NRS_ANIME_STORE_PORT:-3738}"
+export NRS_MUSIC_STORE_PORT="${NRS_MUSIC_STORE_PORT:-4600}"
+export NRS_YTDLP_PORT="${NRS_YTDLP_PORT:-3000}"
+export NRS_YTMUSICAPI_PORT="${NRS_YTMUSICAPI_PORT:-9001}"
+mkdir -p -- "$NRS_STACK_STATE_DIR"
+export NRS_STACK_STATE_DIR="$(cd -- "$NRS_STACK_STATE_DIR" && pwd)"
+# Detached services outlive nix develop's temporary shell directory. Keep
+# compiler temporary files in a directory that remains valid on later restarts.
+export TMPDIR="$NRS_STACK_STATE_DIR/tmp"
+mkdir -p -- "$TMPDIR"
+
+if [[ $# == 0 ]]; then set -- up; fi
+case "$1" in
+  status) shift; set -- process list --output wide "$@" ;;
+  logs) shift; set -- process logs "$@" ;;
+  restart) shift; set -- process restart "$@" ;;
+  check) shift; set -- up --dry-run "$@" ;;
+esac
+
+if [[ "$1" == up && " $* " != *" --dry-run "* ]]; then
+  python3 scripts/dev-stack.py preflight
+fi
+
+pc_config_args=()
+pc_log_file="$NRS_STACK_STATE_DIR/process-compose-client.log"
+case "$1" in
+  up|run|graph|info) pc_config_args=(--config "$nrs_stack_root/process-compose.yaml") ;;
+esac
+case "$1" in
+  up|run) pc_log_file="$NRS_STACK_STATE_DIR/process-compose.log" ;;
+esac
+
+exec process-compose \
+  "${pc_config_args[@]}" \
+  --use-uds --unix-socket "$NRS_STACK_STATE_DIR/process-compose.sock" \
+  --log-file "$pc_log_file" \
+  --ordered-shutdown "$@"

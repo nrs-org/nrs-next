@@ -1,0 +1,106 @@
+version: "0.5"
+is_strict: true
+
+processes:
+  anime-store:
+    description: Anime, manga, novel, and visual-novel metadata
+    working_dir: ${NRS_STACK_ROOT}
+    command: exec python3 scripts/dev-stack.py anime-store
+    log_location: ${NRS_STACK_STATE_DIR}/anime-store.log
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 3
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: ${NRS_ANIME_STORE_PORT}
+        path: /nrs-store/v1/capabilities
+      period_seconds: 2
+      timeout_seconds: 2
+      # Allow a cold build to finish before declaring startup unhealthy.
+      failure_threshold: 900
+
+  ytmusicapi:
+    description: YouTube Music metadata helper (Nix-pinned Python dependencies)
+    working_dir: ${NRS_STACK_ROOT}
+    command: exec python3 scripts/dev-stack.py ytmusicapi
+    log_location: ${NRS_STACK_STATE_DIR}/ytmusicapi.log
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 3
+    readiness_probe:
+      # Neither helper has a health route. Their root returns 404 locally,
+      # which checks HTTP readiness without making an upstream provider call.
+      exec:
+        command: >-
+          test "$(curl --silent --max-time 2 --output /dev/null
+          --write-out '%{http_code}' http://127.0.0.1:${NRS_YTMUSICAPI_PORT}/)" = 404
+      period_seconds: 2
+      timeout_seconds: 2
+      failure_threshold: 900
+
+  ytdlp:
+    description: yt-dlp metadata helper
+    working_dir: ${NRS_STACK_ROOT}
+    command: exec python3 scripts/dev-stack.py ytdlp
+    log_location: ${NRS_STACK_STATE_DIR}/ytdlp.log
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 3
+    readiness_probe:
+      exec:
+        command: >-
+          test "$(curl --silent --max-time 2 --output /dev/null
+          --write-out '%{http_code}' http://127.0.0.1:${NRS_YTDLP_PORT}/)" = 404
+      period_seconds: 2
+      timeout_seconds: 2
+      failure_threshold: 900
+
+  musiclib:
+    description: Music library and NRS music store
+    working_dir: ${NRS_STACK_ROOT}
+    command: exec python3 scripts/dev-stack.py musiclib
+    log_location: ${NRS_STACK_STATE_DIR}/musiclib.log
+    depends_on:
+      ytdlp:
+        condition: process_healthy
+      ytmusicapi:
+        condition: process_healthy
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 3
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: ${NRS_MUSIC_STORE_PORT}
+        path: /nrs-store/v1/capabilities
+      period_seconds: 2
+      timeout_seconds: 2
+      failure_threshold: 900
+
+  nrs-app:
+    description: NRS browser UI
+    working_dir: ${NRS_STACK_ROOT}
+    command: exec python3 scripts/dev-stack.py nrs-app
+    log_location: ${NRS_STACK_STATE_DIR}/nrs-app.log
+    depends_on:
+      anime-store:
+        condition: process_healthy
+      musiclib:
+        condition: process_healthy
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 3
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: ${NRS_APP_PORT}
+        path: /
+      period_seconds: 2
+      timeout_seconds: 2
+      failure_threshold: 900
