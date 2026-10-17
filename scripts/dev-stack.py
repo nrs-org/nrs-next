@@ -77,6 +77,7 @@ def run(service):
         subprocess.run(["go", "build", "-o", binary, "."], check=True)
         command = [binary]
     elif service == "ytmusicapi":
+        os.environ["HOST"] = "127.0.0.1"
         os.environ["PORT"] = PORTS[service]
         command = ["python3", "-u", "src/bin/ytmusicapi_server.py"]
     elif service == "ytdlp":
