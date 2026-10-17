@@ -35,7 +35,54 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
-        "nixpkgs-go": "nixpkgs-go"
+        "nixpkgs-go": "nixpkgs-go",
+        "yt-dlp-ejs-whl": "yt-dlp-ejs-whl",
+        "yt-dlp-src": "yt-dlp-src",
+        "ytmusicapi-src": "ytmusicapi-src"
+      }
+    },
+    "yt-dlp-ejs-whl": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-beO5uEiaZI35ZrLHx3k0wqW+VIqk11UulCjgEmyPoCs=",
+        "type": "file",
+        "url": "https://files.pythonhosted.org/packages/py3/y/yt-dlp-ejs/yt_dlp_ejs-0.8.0-py3-none-any.whl"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://files.pythonhosted.org/packages/py3/y/yt-dlp-ejs/yt_dlp_ejs-0.8.0-py3-none-any.whl"
+      }
+    },
+    "yt-dlp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791666952,
+        "narHash": "sha256-BiCa0iQA4jLZxBxOxGpcuCXH13cSt+2iOFqCeLlwI3k=",
+        "owner": "yt-dlp",
+        "repo": "yt-dlp",
+        "rev": "897341241f2bfb2439fe0367f4c7c9ccd29a3828",
+        "type": "github"
+      },
+      "original": {
+        "owner": "yt-dlp",
+        "repo": "yt-dlp",
+        "type": "github"
+      }
+    },
+    "ytmusicapi-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791799450,
+        "narHash": "sha256-aSjaCSdY0nnjqXPGe6KwI9hTIByvaCjjOWkcyq62I8E=",
+        "owner": "sigma67",
+        "repo": "ytmusicapi",
+        "rev": "4da34b68e68d33356860fbf5d4f0245655969b08",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sigma67",
+        "repo": "ytmusicapi",
+        "type": "github"
       }
     }
   },

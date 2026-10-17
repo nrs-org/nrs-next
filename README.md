@@ -69,6 +69,22 @@ come from Nix, so starting helpers needs no separate Python installation or
 `uv` download. Go is pinned separately at the anime store's compatible nixpkgs
 revision without changing this project's Rust toolchain.
 
+yt-dlp and ytmusicapi track their upstream branches, because YouTube changes
+break them more often than the toolchain pin is updated. `nix/scrapers.nix`
+builds them from source inputs on the main nixpkgs pin, so updates download
+only their source. The yt-dlp-ejs input must match the exact version that
+yt-dlp pins; evaluation fails with a message if they differ. yt-dlp is built
+without ffmpeg and other extras, because musiclib's helper only reads metadata.
+Update both tools and check them against YouTube:
+
+```sh
+scripts/update-scrapers.py
+./dev down
+nix develop -c ./dev up -D
+```
+
+`scripts/update-scrapers.py --no-update` runs only the checks.
+
 Overrides are environment variables. Launcher paths resolve from `nrs-next`;
 `ANIME_STORE_DB` follows the anime store's working directory:
 
