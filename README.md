@@ -8,6 +8,15 @@ per `../INFRA.md`.
 `direnv allow` (or `nix develop`) picks up `flake.nix` — rustc/cargo/clippy/
 rustfmt/rust-analyzer, pinned to this machine's nixos-unstable revision.
 
+## Package
+
+`nix build` builds `nrs-app` (`packages.default`). The package installs the
+browser client under `share/nrs-app/assets` and serves it from there. Source
+builds serve `crates/nrs-app/assets` from the checkout instead. Run it as
+`nrs-app <database> [port]`. Set the store URLs with `NRS_ANIME_STORE_URL` and
+`NRS_MUSIC_STORE_URL`. The anime store and musiclib are packaged in their own
+repositories.
+
 ## Crates
 
 - `nrs-core` — pure scoring engine (INFRA.md §4). No I/O, no store deps.

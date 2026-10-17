@@ -199,7 +199,10 @@ async fn main() {
         kind_hints: Default::default(),
         entry_index: Default::default(),
     });
-    let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
+    // Packages set NRS_APP_ASSETS_DIR at build time to their installed copy;
+    // source builds serve the checkout, so asset edits need only a refresh.
+    let assets_dir = option_env!("NRS_APP_ASSETS_DIR")
+        .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
     let api = Router::new()
         .route("/scores", get(api::scores))
         .route("/scores.csv", get(api::scores_csv))

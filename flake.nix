@@ -8,6 +8,7 @@
   # The anime store requires Go 1.26.7; keep the existing Rust environment
   # pinned while taking Go and the supervisor build from this newer revision.
   inputs.nixpkgs-go.url = "github:NixOS/nixpkgs/b1b875982b17dabde9b4a37f3e229e74913e6db3";
+  inputs.crane.url = "github:ipetkov/crane";
   # yt-dlp and ytmusicapi follow YouTube changes, so nix/scrapers.nix builds
   # them from upstream source on the main pin. scripts/update-scrapers.py
   # updates these inputs and keeps the yt-dlp-ejs wheel at yt-dlp's pin.
@@ -19,7 +20,7 @@
   };
 
   outputs =
-    { self, nixpkgs, nixpkgs-go, yt-dlp-src, ytmusicapi-src, yt-dlp-ejs-whl }:
+    { self, nixpkgs, nixpkgs-go, crane, yt-dlp-src, ytmusicapi-src, yt-dlp-ejs-whl }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
@@ -40,7 +41,9 @@
       });
     in
     {
-      packages.${system} = {
+      packages.${system} = rec {
+        nrs-app = pkgs.callPackage ./nix/nrs-app.nix { craneLib = crane.mkLib pkgs; };
+        default = nrs-app;
         inherit (scrapers) yt-dlp ytmusicapi-python;
       };
 
