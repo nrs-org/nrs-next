@@ -86,6 +86,8 @@ def run(service):
     elif service == "musiclib":
         os.environ["YTDLP_SERVER_URL"] = f"http://127.0.0.1:{PORTS['ytdlp']}"
         os.environ["YTMUSICAPI_SERVER_URL"] = f"http://127.0.0.1:{PORTS['ytmusicapi']}"
+        # The player's shuffle mix reads NRS scores on demand.
+        os.environ["NRS_APP_URL"] = f"http://127.0.0.1:{PORTS['nrs-app']}"
         # match.rhai loads the learned matcher through the ffi module; without
         # it soft-dedup still runs but scores every pair DISTINCT.
         command = cargo + ["--features", "ffi-system", "--bin", "server",
