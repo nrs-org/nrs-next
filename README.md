@@ -55,7 +55,8 @@ profile for faster compilation.
 ```
 
 The launcher defaults to the existing `nrs-strip.db`, the anime store's
-`anime.db`, and musiclib's normal platform data/config/cache directories. It
+`~/.local/share/nrs-anime-store/anime.db`, and musiclib's normal platform
+data/config/cache directories. It
 refuses to create a missing NRS database or take over occupied service ports;
 stop separately launched servers before the first managed start. Logs, the
 supervisor socket, and the Go executable live in the ignored `.dev-stack/`.
@@ -76,8 +77,9 @@ Overrides are environment variables. Launcher paths resolve from `nrs-next`;
 | `NRS_DB_PATH` | `nrs-strip.db` (must exist) |
 | `NRS_ANIME_STORE_DIR` | `../nrs-anime-store-go` |
 | `NRS_MUSICLIB_DIR` | `../musiclib-rs` |
-| `ANIME_STORE_DB` | Anime store's existing configuration, otherwise `anime.db` in its checkout |
-| `NRS_MUSIC_STORE_DB` | Musiclib's normal data directory |
+| `ANIME_STORE_DB` | Anime store's existing configuration, otherwise `$XDG_DATA_HOME/nrs-anime-store/anime.db` |
+| `NRS_MUSIC_STORE_DB` | `musiclib.db` in musiclib's data directory |
+| `MUSICLIB_CONFIG_DIR`, `MUSICLIB_CACHE_DIR`, `MUSICLIB_DATA_DIR` | Musiclib's platform directories; passed to musiclib unchanged |
 | `NRS_BUILD_PROFILE` | `release` (use `dev` for faster Rust builds) |
 | `NRS_APP_PORT` | `3737` |
 | `NRS_ANIME_STORE_PORT` | `3738` |
