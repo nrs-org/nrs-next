@@ -5,6 +5,7 @@
 pub enum EventKind {
     EntryAdd,
     EntryEdit,
+    EntryMerge,
     ImpactAdd,
     ImpactEdit,
     ImpactDelete,
@@ -29,6 +30,7 @@ impl EventKind {
         match self {
             EventKind::EntryAdd => "entry.add",
             EventKind::EntryEdit => "entry.edit",
+            EventKind::EntryMerge => "entry.merge",
             EventKind::ImpactAdd => "impact.add",
             EventKind::ImpactEdit => "impact.edit",
             EventKind::ImpactDelete => "impact.delete",

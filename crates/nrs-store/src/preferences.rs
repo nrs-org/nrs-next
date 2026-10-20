@@ -49,7 +49,15 @@ impl Store {
         Ok(())
     }
 
+    /// Every recorded preference, with entries merged away since read as
+    /// the entries they were merged into.
     pub fn load_preferences(&self) -> Result<Vec<Preference>> {
+        let merged = self.merged_into()?;
+        let follow = |id: &mut EntryId| {
+            if let Some(into) = merged.get(&id.0) {
+                id.0 = into.clone();
+            }
+        };
         let mut preferences = Vec::new();
         for event in self.event_log()? {
             if event.kind != EventKind::PreferenceRecord.as_str() {
@@ -58,7 +66,10 @@ impl Store {
             let Some(after) = event.after else {
                 continue;
             };
-            preferences.push(serde_json::from_str(&after)?);
+            let mut preference: Preference = serde_json::from_str(&after)?;
+            follow(&mut preference.winner);
+            follow(&mut preference.loser);
+            preferences.push(preference);
         }
         Ok(preferences)
     }

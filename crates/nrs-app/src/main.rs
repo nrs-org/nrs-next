@@ -225,6 +225,7 @@ async fn main() {
         .route("/stores/{store}/discover", get(api::store_discover))
         .route("/entries/{entry_id}", get(api::entry_detail))
         .route("/entries/{entry_id}/kind", put(api::entry_kind_set))
+        .route("/entries/{entry_id}/merge", post(api::entry_merge))
         .route("/entries/{entry_id}/profile", post(api::profile_fill))
         .route("/entries/{entry_id}/media", get(api::entry_media))
         .route("/visual-grades", get(api::visual_grades))

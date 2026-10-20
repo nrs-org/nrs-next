@@ -219,6 +219,7 @@ document.addEventListener("click", (event) => {
       if (relation) openRelationEditor(relation, action);
     }
     if (name === "delete-relation") deleteRelation(action.dataset.id);
+    if (name === "merge-entry") openMergeEditor(action);
     if (name === "close-editor") closeEditor(action);
     return;
   }
@@ -3131,6 +3132,47 @@ function openRelationEditor(relation = null, action) {
   });
 }
 
+// What a merge plan moves and drops, one line per non-empty part.
+function mergeSummary(plan) {
+  const count = (items, one, many = `${one}s`) => `${items.length} ${items.length === 1 ? one : many}`;
+  return [
+    plan.impacts.length && `move ${count(plan.impacts, "impact")}`,
+    plan.relations.length && `move ${count(plan.relations, "relation")}`,
+    plan.members.length && `move ${count(plan.members, "shared-impact share")}${plan.combined_members.length ? ` (${plan.combined_members.length} added to the kept entry's own share)` : ""}`,
+    plan.dropped_relations.length && `drop ${count(plan.dropped_relations, "relation")} between the two`,
+    plan.waivers.length && `move waivers: ${plan.waivers.join(", ")}`,
+    plan.duplicate_waivers.length && `keep the kept entry's waivers: ${plan.duplicate_waivers.join(", ")}`,
+    plan.progress_moved && "move progress",
+    plan.kind && `set kind to ${plan.kind}`,
+  ].filter(Boolean);
+}
+
+// Merges this entry into another: everything on it moves over as is
+// (impacts are not deduplicated), and this entry goes away.
+function openMergeEditor(action) {
+  if (!currentEntryData) return;
+  const entry = currentEntryData.entry;
+  const body = `
+  <p class="form-note editor-intro">Everything on <strong>${escapeHtml(entry.title)}</strong> moves to the entry you pick, which keeps its own binding and title; this entry is then removed. Impacts are kept as they are, so remove any that now repeat afterwards.</p>
+  <div class="form-grid">
+    ${entryPickerField("into", "merge into", "", "")}
+    ${field("note", `<input name="note" type="text" placeholder="why (optional)">`)}
+  </div>`;
+  const editor = showEditor(action.closest(".header-actions") || action, "Merge entry", body, async (payload) => {
+    const path = `/api/v1/entries/${encodeURIComponent(entry.id)}/merge`;
+    const request = { into: payload.into, note: payload.note || null };
+    const plan = await sendJson(path, "POST", { ...request, apply: false });
+    if (plan.conflicts.length) throw new Error(plan.conflicts.join("; "));
+    const lines = mergeSummary(plan);
+    const question = `Merge "${plan.from.title_cache || plan.from.id}" into "${plan.into.title_cache || plan.into.id}"?\n\n${lines.length ? lines.map((line) => `• ${line}`).join("\n") : "Nothing else names this entry."}`;
+    if (!confirm(question)) throw new Error("merge cancelled");
+    await sendJson(path, "POST", { ...request, apply: true });
+    showToast("Entries merged");
+    navigate(pathForEntry(plan.into.id));
+  });
+  if (editor) bindEntryPickers(editor);
+}
+
 async function renderPalette() {
   currentEntryData = null;
   document.title = "Palette — NRS";
@@ -3255,6 +3297,7 @@ async function renderEntry(id, { quiet = false, keepEditorFor = null } = {}) {
       <header class="entry-header">
         <h1>${escapeHtml(data.entry.title)}</h1>
         <p class="muted mono">${kindSelect(data)} ${escapeHtml(data.entry.store)}:${escapeHtml(data.entry.store_id)}</p>
+        <div class="header-actions"><button class="button" type="button" data-action="merge-entry">merge into…</button></div>
       </header>
       <section class="page-section progress-panel" data-progress>
         <h2>Progress</h2>

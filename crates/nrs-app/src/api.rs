@@ -2196,6 +2196,44 @@ pub(super) async fn entry_kind_set(
 }
 
 #[derive(Deserialize)]
+pub(super) struct MergeRequest {
+    /// The entry that stays; the one in the path goes away.
+    into: String,
+    /// Without it, only the plan is returned and nothing is written.
+    #[serde(default)]
+    apply: bool,
+    note: Option<String>,
+}
+
+/// Merges the path's entry into `into` (see `nrs_store::MergePlan`), or
+/// with `apply` unset, previews what that would do.
+pub(super) async fn entry_merge(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Json(request): Json<MergeRequest>,
+) -> ApiResult<nrs_store::MergePlan> {
+    let store = state.store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entry writes require database mode",
+        )
+    })?;
+    let mut store = store
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "store lock poisoned"))?;
+    let (from, into) = (EntryId(entry_id), EntryId(request.into));
+    let result = if request.apply {
+        store.merge_entries(&from, &into, request.note.as_deref())
+    } else {
+        store.plan_merge(&from, &into)
+    };
+    result.map(Json).map_err(|error| match error {
+        nrs_store::StoreError::Invalid(message) => api_error(StatusCode::CONFLICT, message),
+        error => store_error("merge entries", error),
+    })
+}
+
+#[derive(Deserialize)]
 pub(super) struct RawImpactUpdate {
     note: String,
     atoms: Vec<nrs_core::Atom>,
@@ -3051,6 +3089,33 @@ mod tests {
             b.0,
             impact.0,
         )
+    }
+
+    #[tokio::test]
+    async fn merge_previews_then_applies() {
+        let (state, a, b, impact) = test_state();
+        let merge = |apply| {
+            entry_merge(
+                State(state.clone()),
+                Path(a.clone()),
+                Json(MergeRequest {
+                    into: b.clone(),
+                    apply,
+                    note: None,
+                }),
+            )
+        };
+        let preview = merge(false).await.unwrap().0;
+        assert_eq!(preview.impacts, vec![impact.clone()]);
+        assert!(state.store.as_ref().unwrap().lock().unwrap().generation == 0);
+        let applied = merge(true).await.unwrap().0;
+        assert_eq!(applied, preview);
+        {
+            let store = state.store.as_ref().unwrap().lock().unwrap();
+            assert_eq!(store.impacts_for_entry(&EntryId(b.clone())).unwrap().len(), 1);
+        }
+        // `a` is gone now.
+        assert_eq!(merge(false).await.err().unwrap().0, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

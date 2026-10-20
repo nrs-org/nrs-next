@@ -123,7 +123,7 @@ fn main() {
     let store_warnings =
         nrs_import::resolve_binds(&mut doc, &sources).unwrap_or_else(|e| fail("store lookup", e));
     doc.warnings.extend(store_warnings);
-    let (snapshot, extras, conversion_warnings) = nrs_import::build_snapshot(&doc);
+    let (mut snapshot, extras, conversion_warnings) = nrs_import::build_snapshot(&doc);
     let warnings = doc.warnings.len() + conversion_warnings.len();
     if args.verbose {
         for w in doc.warnings.iter().chain(&conversion_warnings) {
@@ -142,7 +142,12 @@ fn main() {
         }
     );
 
-    let extras = nrs_import::import_extras(&extras);
+    let mut extras = nrs_import::import_extras(&extras);
+    // Entries merged in the app since are read as their survivors, not
+    // added back.
+    store
+        .follow_merges(&mut snapshot, &mut extras)
+        .unwrap_or_else(|e| fail("failed to read merges", e));
     let mut plan = store
         .plan_resync(&snapshot, &extras)
         .unwrap_or_else(|e| fail("failed to plan resync", e));
