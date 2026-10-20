@@ -1,5 +1,6 @@
 """Service commands for ./dev. Process Compose owns their process groups."""
 
+import json
 import os
 from pathlib import Path
 import socket
@@ -61,6 +62,30 @@ def preflight():
     print(f"Starting NRS at http://127.0.0.1:{PORTS['nrs-app']} (database: {DB})", flush=True)
 
 
+def music_binary(profile, binary):
+    """Build a musiclib binary in musiclib's dev environment; return its path.
+
+    Building musiclib from a single shell keeps the toolchain and the
+    environment that build scripts track identical between the stack and
+    direct work in that checkout, so both reuse one target/ cache. Both
+    binaries use the same features so they share one library build.
+    """
+    build = subprocess.run(
+        ["nix", "develop", f"{MUSIC}#build", "-c", "cargo", "build", "--locked",
+         "--profile", profile, "--features", "ffi-system", "--bin", binary,
+         "--message-format=json-render-diagnostics"],
+        stdout=subprocess.PIPE, text=True, check=True)
+    # Skip anything other than Cargo's JSON messages on stdout.
+    for line in build.stdout.splitlines():
+        if line.startswith("{"):
+            message = json.loads(line)
+            if (message.get("reason") == "compiler-artifact"
+                    and message["target"]["name"] == binary
+                    and message.get("executable")):
+                return message["executable"]
+    sys.exit(f"Cargo did not report an executable for {binary}")
+
+
 def run(service):
     repo = ANIME if service == "anime-store" else ROOT if service == "nrs-app" else MUSIC
     os.chdir(repo)
@@ -83,7 +108,7 @@ def run(service):
     elif service == "ytdlp":
         os.environ["PROVIDER_SERVER_ADDR"] = f"127.0.0.1:{PORTS[service]}"
         os.environ.setdefault("RUST_LOG", "info")
-        command = cargo + ["--bin", "ytdlp_server"]
+        command = [music_binary(profile, "ytdlp_server")]
     elif service == "musiclib":
         os.environ["YTDLP_SERVER_URL"] = f"http://127.0.0.1:{PORTS['ytdlp']}"
         os.environ["YTMUSICAPI_SERVER_URL"] = f"http://127.0.0.1:{PORTS['ytmusicapi']}"
@@ -91,8 +116,8 @@ def run(service):
         os.environ["NRS_APP_URL"] = f"http://127.0.0.1:{PORTS['nrs-app']}"
         # match.rhai loads the learned matcher through the ffi module; without
         # it soft-dedup still runs but scores every pair DISTINCT.
-        command = cargo + ["--features", "ffi-system", "--bin", "server",
-                           "--", "--listen", f"127.0.0.1:{PORTS[service]}"]
+        command = [music_binary(profile, "server"),
+                   "--listen", f"127.0.0.1:{PORTS[service]}"]
         if "NRS_MUSIC_STORE_DB" in os.environ:
             command += ["--db", str(path_setting("NRS_MUSIC_STORE_DB", ""))]
     elif service == "nrs-app":

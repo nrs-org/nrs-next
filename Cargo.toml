@@ -11,3 +11,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# Full debug info dominated binary size and link time in incremental builds.
+# Split it out of the linked binary, and keep only line tables (enough for
+# backtraces) for dependencies.
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"

@@ -7,6 +7,8 @@ per `../INFRA.md`.
 
 `direnv allow` (or `nix develop`) picks up `flake.nix` — rustc/cargo/clippy/
 rustfmt/rust-analyzer, pinned to this machine's nixos-unstable revision.
+`../musiclib-rs` pins the same revision. Both shells link with mold, and
+dependencies build with line tables only, to keep incremental builds fast.
 
 ## Package
 
@@ -44,6 +46,9 @@ Failed services restart up to three times, with a three-second backoff.
 Readiness checks use local HTTP responses and do not fetch provider metadata.
 The first start may take several minutes to fetch Nix packages and compile;
 subsequent starts reuse Cargo and Go caches. Services rebuild when restarted.
+Musiclib's binaries build in its own `devShells.build` environment (its
+development shell without the git hook installer), so the stack and direct
+`cargo` use in that checkout share one target cache.
 NRS frontend asset edits only require a browser refresh. Musiclib's player
 HTML is embedded in release builds, so run `./dev restart musiclib` and then
 refresh after editing it; musiclib's `dev` builds read the HTML on each request.

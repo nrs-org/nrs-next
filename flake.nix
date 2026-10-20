@@ -62,6 +62,7 @@
           openssl
           # musiclib's `ffi-system` feature links this prebuilt libffi.
           libffi
+          mold
           uv
           goPkgs.go
           processCompose
@@ -71,6 +72,10 @@
         ];
 
         NRS_STACK_NIX = "1";
+        # Link with mold; GNU ld spent most of an incremental rebuild linking
+        # debug info. ../musiclib-rs's dev shell sets the same flags.
+        "CARGO_TARGET_${pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS" =
+          "-C link-arg=-fuse-ld=mold";
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       };
